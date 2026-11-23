@@ -536,6 +536,9 @@ fn ssh_invocation(
         }
         _ => {
             let mut argv = vec![ssh_program.to_owned()];
+            if matches!(dial.service, Service::ReceivePack) {
+                ssh_identity::disable_connection_sharing(&mut argv);
+            }
             if let Some(port) = dial.port {
                 argv.push("-p".to_owned());
                 argv.push(port.to_string());

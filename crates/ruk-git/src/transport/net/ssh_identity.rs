@@ -198,24 +198,35 @@ pub(super) fn check_push_client(
     command: Option<&str>,
     variant: Option<&str>,
 ) -> Result<(), GitError> {
-    if variant.is_some_and(|variant| !variant.is_empty() && variant != "ssh") {
+    if variant.is_some_and(|variant| !matches!(variant, "" | "auto" | "ssh")) {
         return Err(unsupported_probe());
     }
-    openssh_words(program, command).map(|_| ())
+    let words = openssh_words(program, command)?;
+    push_options(&words[1..]).map(|_| ())
 }
 
 fn unsupported_probe() -> GitError {
     GitError::Unsupported {
-        command: "push SSH requires a direct OpenSSH command whose destination options can be pinned; shell expansions and custom clients are unsupported".to_owned(),
+        command: "push SSH requires a direct OpenSSH command with supported options and literal arguments or ~/ paths".to_owned(),
     }
 }
 
 fn openssh_words(program: &str, command: Option<&str>) -> Result<Vec<String>, GitError> {
+    let home = std::env::var("HOME").ok();
+    openssh_words_with_home(program, command, home.as_deref())
+}
+
+fn openssh_words_with_home(
+    program: &str,
+    command: Option<&str>,
+    home: Option<&str>,
+) -> Result<Vec<String>, GitError> {
     let mut words = if let Some(command) = command.filter(|command| !command.is_empty()) {
         if command.bytes().any(|byte| {
             matches!(
                 byte,
-                b'\n'
+                b'\0'
+                    | b'\n'
                     | b'\r'
                     | b'$'
                     | b'\x60'
@@ -231,7 +242,7 @@ fn openssh_words(program: &str, command: Option<&str>) -> Result<Vec<String>, Gi
         }) {
             return Err(unsupported_probe());
         }
-        shlex::split(command).ok_or_else(unsupported_probe)?
+        shlex::split(&expand_command_home(command, home)?).ok_or_else(unsupported_probe)?
     } else {
         vec![program.to_owned()]
     };
@@ -248,12 +259,126 @@ fn openssh_words(program: &str, command: Option<&str>) -> Result<Vec<String>, Gi
     Ok(words)
 }
 
+#[derive(Clone, Copy)]
+enum ShellQuote {
+    Unquoted,
+    Single,
+    Double,
+}
+
+fn expand_command_home(command: &str, home: Option<&str>) -> Result<String, GitError> {
+    let mut expanded = String::with_capacity(command.len());
+    let mut chars = command.chars().peekable();
+    let mut quote = ShellQuote::Unquoted;
+    let mut escaped = false;
+    let mut word_start = true;
+    while let Some(ch) = chars.next() {
+        if escaped {
+            expanded.push(ch);
+            escaped = false;
+            continue;
+        }
+        match (quote, ch) {
+            (ShellQuote::Single, '\'') => quote = ShellQuote::Unquoted,
+            (ShellQuote::Single, _) => {}
+            (ShellQuote::Double, '"') => quote = ShellQuote::Unquoted,
+            (ShellQuote::Double, '\\') => escaped = true,
+            (ShellQuote::Double, _) => {}
+            (ShellQuote::Unquoted, '\\') => {
+                escaped = true;
+                word_start = false;
+            }
+            (ShellQuote::Unquoted, '\'') => {
+                quote = ShellQuote::Single;
+                word_start = false;
+            }
+            (ShellQuote::Unquoted, '"') => {
+                quote = ShellQuote::Double;
+                word_start = false;
+            }
+            (ShellQuote::Unquoted, ch) if ch.is_ascii_whitespace() => word_start = true,
+            (ShellQuote::Unquoted, '~') if word_start => {
+                let next = chars.peek().copied();
+                if next.is_none_or(|ch| ch == '/' || ch.is_ascii_whitespace()) {
+                    let home = home
+                        .filter(|home| !home.is_empty())
+                        .ok_or_else(unsupported_probe)?;
+                    expanded.push_str(&super::shell_quote(home));
+                    word_start = false;
+                    continue;
+                }
+                if !matches!(next, Some('\'' | '"' | '\\')) {
+                    return Err(unsupported_probe());
+                }
+                word_start = false;
+            }
+            (ShellQuote::Unquoted, _) => word_start = false,
+        }
+        expanded.push(ch);
+    }
+    Ok(expanded)
+}
+
+fn push_options(words: &[String]) -> Result<Vec<String>, GitError> {
+    let mut options = Vec::with_capacity(words.len());
+    let mut index = 0;
+    while let Some(word) = words.get(index) {
+        let flags = word.strip_prefix('-').ok_or_else(unsupported_probe)?;
+        if flags.is_empty() || flags == "-" {
+            return Err(unsupported_probe());
+        }
+        for (offset, flag) in flags.char_indices() {
+            if "BDEFIJLPRSbceilmopw".contains(flag) {
+                let attached = &flags[offset + flag.len_utf8()..];
+                let value = if attached.is_empty() {
+                    index += 1;
+                    words.get(index).ok_or_else(unsupported_probe)?.as_str()
+                } else {
+                    attached
+                };
+                if flag != 'S' {
+                    options.extend([format!("-{flag}"), value.to_owned()]);
+                }
+                break;
+            }
+            if !"246ACKMTXYagkqvxy".contains(flag) {
+                return Err(unsupported_probe());
+            }
+            if flag != 'M' {
+                options.push(format!("-{flag}"));
+            }
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+pub(super) fn disable_connection_sharing(argv: &mut Vec<String>) {
+    argv.extend(
+        [
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "ControlPersist=no",
+            "-S",
+            "none",
+        ]
+        .map(str::to_owned),
+    );
+}
+
 pub(super) fn pinned_openssh_command(
     dial: &SshDial<'_>,
     command: &str,
 ) -> Result<Vec<String>, GitError> {
     let mut words = openssh_words("ssh", Some(command))?;
-    let flags = words.split_off(1);
+    let mut flags = words.split_off(1);
+    if matches!(dial.service, Service::ReceivePack) {
+        flags = push_options(&flags)?;
+        disable_connection_sharing(&mut words);
+    }
     if let Some(port) = dial.port {
         words.extend(["-p".to_owned(), port.to_string()]);
     }
@@ -275,6 +400,7 @@ fn probe_invocation(dial: &SshDial<'_>, program: &str, command: Option<&str>) ->
         pinned_openssh_command(dial, command).expect("probe command was validated")
     } else {
         let mut argv = vec![program.to_owned()];
+        disable_connection_sharing(&mut argv);
         if let Some(port) = dial.port {
             argv.extend(["-p".to_owned(), port.to_string()]);
         }
@@ -502,6 +628,7 @@ mod tests {
     fn only_recognized_ssh_commands_are_probed() {
         for (program, command, variant) in [
             ("ssh", None, None),
+            ("ssh", None, Some("auto")),
             ("/usr/bin/ssh", None, Some("ssh")),
             ("ignored", Some("ssh -F '/tmp/config with spaces'"), None),
             ("ignored", Some("exec /usr/bin/ssh -i /tmp/key"), None),
@@ -510,6 +637,7 @@ mod tests {
         }
         for (program, command, variant) in [
             ("plink", None, None),
+            ("plink", None, Some("auto")),
             ("custom-wrapper", None, Some("ssh")),
             ("ssh", None, Some("simple")),
             ("ignored", Some("sh /tmp/custom-ssh"), None),
@@ -522,6 +650,69 @@ mod tests {
                 Err(GitError::Unsupported { .. }),
             ));
         }
+    }
+
+    #[test]
+    fn command_prefixes_cannot_replace_the_destination_or_hide_pin_flags() {
+        for command in [
+            "ssh other-host",
+            "ssh --",
+            "ssh -",
+            "ssh -F",
+            "ssh -vM -S",
+            "ssh -9",
+            "ssh -W other-host:22",
+            "ssh -G",
+            "ssh -Q cipher",
+            "ssh -O check",
+            "ssh -N",
+            "ssh -V",
+            "ssh -Z",
+            "ssh -f",
+            "ssh -n",
+            "ssh -s",
+            "ssh -tt",
+        ] {
+            assert!(
+                matches!(
+                    check_push_client("ssh", Some(command), Some("auto")),
+                    Err(GitError::Unsupported { .. }),
+                ),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_home_expansion_preserves_shell_quoting() {
+        let home = "/tmp/home with ' quote";
+        for (command, expected) in [
+            ("ssh -F ~/.ssh/work", format!("{home}/.ssh/work")),
+            ("ssh -F '~/.ssh/work'", "~/.ssh/work".to_owned()),
+            ("ssh -F \"~/.ssh/work\"", "~/.ssh/work".to_owned()),
+            ("ssh -F \\~/.ssh/work", "~/.ssh/work".to_owned()),
+            ("ssh -F ~/'ssh config'", format!("{home}/ssh config")),
+            ("ssh -F ~\"/ssh config\"", "~/ssh config".to_owned()),
+            ("ssh -F ~", home.to_owned()),
+        ] {
+            let words = openssh_words_with_home("ssh", Some(command), Some(home))
+                .expect("supported home expansion");
+            assert_eq!(words, vec!["ssh".to_owned(), "-F".to_owned(), expected]);
+        }
+        assert!(openssh_words_with_home("ssh", Some("ssh -F ~/config"), None).is_err());
+        assert!(
+            openssh_words_with_home("ssh", Some("ssh -F ~another/config"), Some(home)).is_err()
+        );
+        assert_eq!(
+            openssh_words_with_home("ssh", Some("ssh -F '~another/config'"), Some(home))
+                .expect("quoted user prefix stays literal"),
+            vec!["ssh", "-F", "~another/config"],
+        );
+        assert_eq!(
+            openssh_words_with_home("ssh", Some("ssh -F~/.ssh/work"), Some(home))
+                .expect("tilde inside an argument stays literal"),
+            vec!["ssh", "-F~/.ssh/work"],
+        );
     }
 
     #[test]
@@ -541,6 +732,14 @@ mod tests {
             SshInvocation::Exec(vec![
                 "ssh".to_owned(),
                 "-G".to_owned(),
+                "-o".to_owned(),
+                "ControlMaster=no".to_owned(),
+                "-o".to_owned(),
+                "ControlPath=none".to_owned(),
+                "-o".to_owned(),
+                "ControlPersist=no".to_owned(),
+                "-S".to_owned(),
+                "none".to_owned(),
                 "-o".to_owned(),
                 "HostKeyAlias=HostAlias".to_owned(),
                 "-o".to_owned(),
@@ -764,6 +963,97 @@ mod tests {
             transport.insert(1, "-G".to_owned());
             assert_eq!(probe, SshInvocation::Exec(transport));
         }
+        std::fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frozen_push_disables_configured_and_command_line_connection_sharing() {
+        use std::net::TcpListener;
+        use std::os::unix::net::UnixListener;
+
+        let root = Path::new("/tmp").join(format!(
+            "ruk-ssh-unshared-{}",
+            ruk_core::change::PlanId::generate(),
+        ));
+        std::fs::create_dir(&root).expect("short unique scratch directory");
+        let socket_path = root.join("old-master");
+        let old_master = UnixListener::bind(&socket_path).expect("old control socket");
+        old_master
+            .set_nonblocking(true)
+            .expect("nonblocking control socket");
+        let destination = TcpListener::bind("127.0.0.1:0").expect("new destination");
+        destination
+            .set_nonblocking(true)
+            .expect("nonblocking destination");
+        let address = destination.local_addr().expect("new destination address");
+        let config = root.join("config");
+        std::fs::write(
+            &config,
+            format!(
+                "Host *\n  User alice\n  Port {}\n  ControlMaster auto\n  ControlPath {}\n  ControlPersist yes\n",
+                address.port(),
+                super::super::shell_quote(socket_path.to_str().expect("UTF-8 socket")),
+            ),
+        )
+        .expect("multiplexing configuration");
+        let dial = pinned_dial(
+            &address,
+            "127.0.0.1",
+            Some(address.port()),
+            Some("alice"),
+            Service::ReceivePack,
+            "relative/repo.git",
+        )
+        .expect("pinned destination");
+        let socket = super::super::shell_quote(socket_path.to_str().expect("UTF-8 socket"));
+        let mut transport = None;
+        for flags in [
+            String::new(),
+            format!("-M -S {socket}"),
+            format!("-oControlMaster=yes -oControlPath={socket} -oControlPersist=yes"),
+            format!("-vvMS{socket}"),
+        ] {
+            let command = format!(
+                "ssh -F {} -o ConnectTimeout=1 -o BatchMode=yes {flags}",
+                super::super::shell_quote(config.to_str().expect("UTF-8 configuration")),
+            );
+            check_push_client("ssh", Some(&command), Some("auto")).expect("OpenSSH options parse");
+            let output = run_probe(
+                probe_invocation(&dial, "ssh", Some(&command)),
+                Instant::now() + Duration::from_secs(2),
+                &Interrupt::none(),
+            )
+            .expect("OpenSSH evaluates pinned configuration");
+            let output = std::str::from_utf8(&output).expect("configuration output");
+            assert!(output.lines().any(|line| line == "controlmaster false"));
+            assert!(output.lines().any(|line| line == "controlpersist no"));
+            assert!(
+                output
+                    .lines()
+                    .all(|line| !line.starts_with("controlpath ") || line == "controlpath none")
+            );
+            transport = Some(super::super::ssh_invocation(&dial, "ssh", Some(&command)));
+        }
+        let result = run_probe(
+            transport.expect("transport invocation"),
+            Instant::now() + Duration::from_secs(2),
+            &Interrupt::none(),
+        );
+        assert!(matches!(
+            result,
+            Err(GitError::Io { .. } | GitError::Invalid { .. })
+        ));
+        assert!(
+            matches!(old_master.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        let (connected, peer) = destination
+            .accept()
+            .expect("SSH dialed the frozen endpoint");
+        assert!(peer.ip().is_loopback());
+        drop(connected);
+        drop(destination);
+        drop(old_master);
         std::fs::remove_dir_all(root).expect("scratch cleanup");
     }
 
