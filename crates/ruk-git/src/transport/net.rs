@@ -1275,6 +1275,19 @@ mod tests {
         ruk_core::ids::Oid::from_hex(hex).expect("hex")
     }
 
+    fn shell_path(path: &std::path::Path) -> String {
+        let path = path.to_str().expect("UTF-8 path");
+        if cfg!(windows) {
+            shell_quote(&path.replace('\\', "/"))
+        } else {
+            shell_quote(path)
+        }
+    }
+
+    fn fake_ssh_command(script: &std::path::Path) -> String {
+        format!("exec sh {}", shell_path(script))
+    }
+
     #[test]
     fn archive_session_flows_over_fake_ssh() {
         // The fake server speaks `upload-archive` on stdin/stdout: it
@@ -1293,7 +1306,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("scratch");
-        let script = dir.join("fake-ssh-archive.sh");
+        let script = dir.join("fake ssh 'archive'.sh");
         std::fs::write(
             &script,
             format!(
@@ -1301,13 +1314,7 @@ mod tests {
             ),
         )
         .expect("script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script).expect("meta").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script, perms).expect("chmod");
-        }
+        let command = fake_ssh_command(&script);
         // Local endpoints route to the store, never to a stream.
         assert!(
             open_archive_stream(
@@ -1343,8 +1350,8 @@ mod tests {
             None,
             Service::UploadArchive,
             "/srv/a.git",
-            script.to_str().expect("utf8"),
-            None,
+            "ssh",
+            Some(&command),
         )
         .expect("spawn");
         let tar = fetch_archive_stream(stream, rev).expect("archive");
@@ -1619,18 +1626,12 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nport=\"\"\nwhile [ $# -gt 0 ]; do\n    if [ \"$1\" = \"-p\" ]; then\n        port=\"$2\"\n        shift 2\n    else\n        shift\n    fi\ndone\nif [ \"$port\" = \"{closed_port}\" ]; then\n    echo \"ssh: connect to host 127.0.0.1 port {closed_port}: Connection refused\" >&2\n    exit 255\nfi\ncat \"{}\"\n",
-                adv_path.display()
+                "#!/bin/sh\nport=\"\"\nwhile [ $# -gt 0 ]; do\n    if [ \"$1\" = \"-p\" ]; then\n        port=\"$2\"\n        shift 2\n    else\n        shift\n    fi\ndone\nif [ \"$port\" = \"{closed_port}\" ]; then\n    echo \"ssh: connect to host 127.0.0.1 port {closed_port}: Connection refused\" >&2\n    exit 255\nfi\ncat {}\n",
+                shell_path(&adv_path)
             ),
         )
         .expect("script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script).expect("meta").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script, perms).expect("chmod");
-        }
+        let command = fake_ssh_command(&script);
 
         let refused_addr: SocketAddr = format!("127.0.0.1:{closed_port}").parse().expect("addr");
         let serving_addr: SocketAddr = format!("127.0.0.1:{serving_port}").parse().expect("addr");
@@ -1647,7 +1648,7 @@ mod tests {
                 Service::UploadPack,
                 "/srv/a.git",
             )?;
-            let stream = ssh_spawn(&dial, script.to_str().expect("utf8"), None)?;
+            let stream = ssh_spawn(&dial, "ssh", Some(&command))?;
             ssh_verify_connection(
                 stream,
                 label,
@@ -1683,19 +1684,10 @@ mod tests {
         let script = dir.join("fake-ssh-pin.sh");
         std::fs::write(
             &script,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
-                seen.display()
-            ),
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", shell_path(&seen)),
         )
         .expect("script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script).expect("meta").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script, perms).expect("chmod");
-        }
+        let command = fake_ssh_command(&script);
         let addr: SocketAddr = "93.184.216.34:22".parse().expect("addr");
         let dial = pinned_dial(
             &addr,
@@ -1707,7 +1699,7 @@ mod tests {
         )
         .expect("pinned dial");
         assert_eq!(dial.login, "git@example.com");
-        let stream = ssh_spawn(&dial, script.to_str().expect("utf8"), None).expect("spawn");
+        let stream = ssh_spawn(&dial, "ssh", Some(&command)).expect("spawn");
         drop(stream);
         let lines: Vec<String> = std::fs::read_to_string(&seen)
             .expect("argv log")
@@ -1833,16 +1825,10 @@ mod tests {
         let script = dir.join("fake-ssh.sh");
         std::fs::write(
             &script,
-            format!("#!/bin/sh\ncat \"{}\"\n", dir.join("adv.bin").display()),
+            format!("#!/bin/sh\ncat {}\n", shell_path(&dir.join("adv.bin"))),
         )
         .expect("script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script).expect("meta").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script, perms).expect("chmod");
-        }
+        let command = fake_ssh_command(&script);
         let stream = ssh_connect_with(
             "far.test",
             None,
@@ -1850,7 +1836,7 @@ mod tests {
             Service::UploadPack,
             "/srv/a.git",
             "ssh",
-            Some(script.to_str().expect("utf8")),
+            Some(&command),
         )
         .expect("spawn");
         let refs =
@@ -1883,19 +1869,13 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\ncat > \"{}\"\necho done > \"{}\"\n",
-                out.display(),
-                flag.display()
+                "#!/bin/sh\ncat > {}\necho done > {}\n",
+                shell_path(&out),
+                shell_path(&flag)
             ),
         )
         .expect("script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script).expect("meta").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script, perms).expect("chmod");
-        }
+        let command = fake_ssh_command(&script);
         let mut stream = ssh_connect_with(
             "far.test",
             None,
@@ -1903,7 +1883,7 @@ mod tests {
             Service::UploadPack,
             "/srv/a.git",
             "ssh",
-            Some(script.to_str().expect("utf8")),
+            Some(&command),
         )
         .expect("spawn");
         stream.write_all(b"hello").expect("stdin");
@@ -1938,19 +1918,13 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\ncat > \"{}\"\ni=0\nwhile [ $i -lt 32 ]; do\n    head -c 16384 /dev/zero | tr '\\0' 'A'\n    i=$((i + 1))\ndone\necho done > \"{}\"\n",
-                out.display(),
-                flag.display()
+                "#!/bin/sh\ncat > {}\ni=0\nwhile [ $i -lt 32 ]; do\n    head -c 16384 /dev/zero | tr '\\0' 'A'\n    i=$((i + 1))\ndone\necho done > {}\n",
+                shell_path(&out),
+                shell_path(&flag)
             ),
         )
         .expect("script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script).expect("meta").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script, perms).expect("chmod");
-        }
+        let command = fake_ssh_command(&script);
         let mut stream = ssh_connect_with(
             "far.test",
             None,
@@ -1958,7 +1932,7 @@ mod tests {
             Service::ReceivePack,
             "/srv/a.git",
             "ssh",
-            Some(script.to_str().expect("utf8")),
+            Some(&command),
         )
         .expect("spawn");
         stream.write_all(b"hello").expect("stdin");
