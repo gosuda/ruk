@@ -146,7 +146,11 @@ fn coordinator_rendezvous_does_not_claim_an_unserved_store() {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     for stale in [false, true] {
-        let base = temp_base("coord");
+        let id = NEXT_TEMP.fetch_add(1, Ordering::SeqCst);
+        let base =
+            PathBuf::from("/tmp").join(format!("ruk-coord-probe-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("short socket directory");
         let store_dir = base.join(".ruk");
         drop(
             Store::create(
