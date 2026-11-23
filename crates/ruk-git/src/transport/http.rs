@@ -364,18 +364,33 @@ fn parse_url(url: &str) -> Result<Url, GitError> {
     // `rsplit` always yields one item; the empty host fails below.
     let hostport: &str = authority.rsplit('@').next().unwrap_or_default();
     let default_port = if secure { 443 } else { 80 };
-    let (host, port) = if let Some(bracketed) = hostport.strip_prefix('[') {
+    let (host, port, authority) = if let Some(bracketed) = hostport.strip_prefix('[') {
         let end = bracketed.find(']').ok_or_else(|| invalid("bad ipv6"))?;
         let port = match bracketed[end + 1..].strip_prefix(':') {
-            Some(text) => text.parse::<u16>().map_err(|_| invalid("bad port"))?,
+            Some(text) => {
+                if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(invalid("bad port"));
+                }
+                text.parse::<u16>().map_err(|_| invalid("bad port"))?
+            }
             None if end + 1 == bracketed.len() => default_port,
             None => return Err(invalid("bad ipv6")),
         };
         let host = &bracketed[..end];
-        if host.parse::<std::net::Ipv6Addr>().is_err() {
+        let address = match host.split_once('%') {
+            Some((address, zone)) => {
+                if zone.is_empty() {
+                    return Err(invalid("empty ipv6 zone"));
+                }
+                address
+            }
+            None => host,
+        };
+        if address.parse::<std::net::Ipv6Addr>().is_err() {
             return Err(invalid("bad ipv6"));
         }
-        (host.to_owned(), port)
+        let authority = format!("[{address}]{}", &bracketed[end + 1..]);
+        (host.to_owned(), port, authority)
     } else if let Some((host, port_text)) = hostport.rsplit_once(':') {
         if host.is_empty() {
             return Err(invalid("empty host"));
@@ -387,9 +402,9 @@ fn parse_url(url: &str) -> Result<Url, GitError> {
             return Err(invalid("bad port"));
         }
         let port = port_text.parse::<u16>().map_err(|_| invalid("bad port"))?;
-        (host.to_owned(), port)
+        (host.to_owned(), port, hostport.to_owned())
     } else {
-        (hostport.to_owned(), default_port)
+        (hostport.to_owned(), default_port, hostport.to_owned())
     };
     if host.is_empty() {
         return Err(invalid("empty host"));
@@ -397,7 +412,7 @@ fn parse_url(url: &str) -> Result<Url, GitError> {
     Ok(Url {
         secure,
         host,
-        authority: hostport.to_owned(),
+        authority,
         port,
         path,
     })
@@ -1886,6 +1901,13 @@ mod tests {
             ),
             ("https://host.test:443/repo", "host.test:443", "/repo", 443),
             ("http://[::1]/repo", "[::1]", "/repo", 80),
+            ("http://[fe80::1%3]/repo", "[fe80::1]", "/repo", 80),
+            (
+                "http://[fe80::1%eth0]:8080/repo",
+                "[fe80::1]:8080",
+                "/repo",
+                8080,
+            ),
             (
                 "https://[2001:db8::1]:8443/repo?token=a%23b#local",
                 "[2001:db8::1]:8443",
@@ -1919,6 +1941,16 @@ mod tests {
                 assert!(head.starts_with(&expected), "{head:?}");
                 assert!(!head.contains("secret"), "{head:?}");
             }
+        }
+    }
+
+    #[test]
+    fn scoped_ipv6_keeps_the_zone_for_resolution() {
+        for host in ["fe80::1%3", "fe80::1%eth0"] {
+            let parsed = parse_url(&format!("http://[{host}]:8080/repo")).expect("scoped IPv6");
+            assert_eq!(parsed.host, host);
+            assert_eq!(parsed.port, 8080);
+            assert_eq!(parsed.authority, "[fe80::1]:8080");
         }
     }
 
@@ -1964,6 +1996,8 @@ mod tests {
             "http://host.test/\x7f",
             "http://[bogus]/",
             "http://::1/",
+            "http://[::1]:+80/",
+            "http://[fe80::1%]/",
         ] {
             assert!(matches!(parse_url(url), Err(GitError::Invalid { .. })));
         }
