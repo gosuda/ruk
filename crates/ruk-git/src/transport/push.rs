@@ -140,6 +140,19 @@ fn scrub_outcomes(outcomes: Vec<RefOutcome>) -> Vec<RefOutcome> {
         .collect()
 }
 
+/// Keeps the SSH login identity needed to reconnect, while removing passwords.
+/// Other labels retain the general userinfo sanitizer without URL normalization.
+fn scrub_plan_remote(remote: &[u8]) -> Vec<u8> {
+    if let Ok(mut url) = gix_url::parse(remote)
+        && url.scheme == gix_url::Scheme::Ssh
+        && !url.serialize_alternative_form
+    {
+        url.password = None;
+        return url.to_bstring().into();
+    }
+    super::credentials::scrub_userinfo_bytes(remote)
+}
+
 /// A durable push plan: state machine plus its `push_plans` row codec.
 ///
 /// Row layout, versioned: `01 | state:u8 | hash:u8 | atomic:u8 |
@@ -152,7 +165,7 @@ fn scrub_outcomes(outcomes: Vec<RefOutcome>) -> Vec<RefOutcome> {
 pub struct PushPlanRecord {
     /// Plan identity; the `push_plans` key is these 16 bytes.
     pub id: PlanId,
-    /// Remote name the plan pushes to.
+    /// Remote destination, retaining SSH usernames but no passwords.
     pub remote: Vec<u8>,
     /// Whether the push is all-or-nothing.
     pub atomic: bool,
@@ -170,7 +183,7 @@ impl PushPlanRecord {
     pub fn prepare(id: PlanId, remote: Vec<u8>, atomic: bool, updates: Vec<PushUpdate>) -> Self {
         Self {
             id,
-            remote: super::credentials::scrub_userinfo_bytes(&remote),
+            remote: scrub_plan_remote(&remote),
             atomic,
             state: PushState::Prepared,
             updates,
@@ -325,7 +338,7 @@ impl PushPlanRecord {
         }
         Ok(Self {
             id,
-            remote: super::credentials::scrub_userinfo_bytes(remote),
+            remote: scrub_plan_remote(remote),
             atomic: *atomic != 0,
             state,
             updates,
@@ -1384,6 +1397,53 @@ mod tests {
         let text = String::from_utf8_lossy(&encoded);
         assert!(!text.contains("CANARY-s3cret"), "{text:?}");
         assert!(text.contains("https://host.x refused"), "{text:?}");
+    }
+
+    #[test]
+    fn plan_rows_preserve_ssh_destinations_without_passwords() {
+        use crate::transport::net::parse_endpoint;
+
+        for remote in [
+            "ssh://alice@host.x/r.git",
+            "ssh://alice:CANARY-s3cret@host.x:2222/my%20repo.git",
+            "ssh://al%69ce:CANARY-s3cret@[2001:db8::1]:2222/~git/r.git",
+            "ssh://alice:CANARY-s3cret@host.x/a%2Fb%252Fc.git?literal#path",
+            "alice@host.x:relative/repo.git",
+            "alice@[2001:db8::1]:/absolute/repo.git",
+        ] {
+            let expected = parse_endpoint(remote).expect("SSH endpoint parses");
+            let plan = PushPlanRecord::prepare(
+                PlanId::generate(),
+                remote.as_bytes().to_vec(),
+                false,
+                Vec::new(),
+            );
+            let stored = std::str::from_utf8(&plan.remote).expect("stored remote is UTF-8");
+            assert_eq!(
+                parse_endpoint(stored).expect("stored endpoint parses"),
+                expected,
+                "{remote}",
+            );
+            assert!(
+                gix_url::parse(stored)
+                    .expect("stored URL parses")
+                    .password
+                    .is_none()
+            );
+            let encoded = plan.encode(HashKind::Sha1).expect("plan encodes");
+            assert!(!String::from_utf8_lossy(&encoded).contains("CANARY-s3cret"));
+            let decoded =
+                PushPlanRecord::decode(plan.id, HashKind::Sha1, &encoded).expect("plan decodes");
+            assert_eq!(decoded, plan);
+
+            let mut legacy = plan.clone();
+            legacy.remote = remote.as_bytes().to_vec();
+            let dirty = legacy.encode(HashKind::Sha1).expect("legacy plan encodes");
+            let decoded =
+                PushPlanRecord::decode(plan.id, HashKind::Sha1, &dirty).expect("legacy plan decodes");
+            assert_eq!(decoded, plan, "legacy SSH identity survives decoding");
+        }
+        assert_eq!(scrub_plan_remote(b"UPPER:repo.git"), b"UPPER:repo.git");
     }
 
     #[test]
