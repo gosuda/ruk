@@ -409,9 +409,9 @@ pub(crate) fn unified_patch(
         out.extend_from_slice(
             format!(
                 "@@ -{},{} +{},{} @@\n",
-                old_base + 1,
+                old_base + usize::from(old_count != 0),
                 old_count,
-                new_base + 1,
+                new_base + usize::from(new_count != 0),
                 new_count
             )
             .as_bytes(),
@@ -1145,6 +1145,49 @@ mod tests {
         assert_eq!(err.code, ErrorCode::ELimit);
         let edge: Vec<&[u8]> = vec![line; 1_023];
         lcs_align(&edge, &edge).expect("1024x1024 cells fit the bound");
+    }
+
+    #[test]
+    fn unified_patch_positions_empty_ranges() {
+        for (old_bytes, new_bytes, expected) in [
+            (
+                "",
+                "first\nsecond\n",
+                "--- a/f\n+++ b/f\n@@ -0,0 +1,2 @@\n+first\n+second\n",
+            ),
+            (
+                "first\nsecond\n",
+                "",
+                "--- a/f\n+++ b/f\n@@ -1,2 +0,0 @@\n-first\n-second\n",
+            ),
+            ("", "", "--- a/f\n+++ b/f\n"),
+            (
+                "first\n",
+                "first\nsecond\n",
+                "--- a/f\n+++ b/f\n@@ -1,1 +1,2 @@\n first\n+second\n",
+            ),
+            (
+                "first\nsecond\n",
+                "first\n",
+                "--- a/f\n+++ b/f\n@@ -1,2 +1,1 @@\n first\n-second\n",
+            ),
+            (
+                "",
+                "first",
+                "--- a/f\n+++ b/f\n@@ -0,0 +1,1 @@\n+first\n\\ No newline at end of file\n",
+            ),
+            (
+                "first",
+                "",
+                "--- a/f\n+++ b/f\n@@ -1,1 +0,0 @@\n-first\n\\ No newline at end of file\n",
+            ),
+        ] {
+            let old = split_lines(old_bytes.as_bytes());
+            let new = split_lines(new_bytes.as_bytes());
+            let ops = lcs_align(&old, &new).expect("align");
+            let patch = unified_patch("a/f", "b/f", &old, &new, &ops);
+            assert_eq!(patch, expected.as_bytes(), "{old_bytes:?} -> {new_bytes:?}");
+        }
     }
 
     #[test]
