@@ -135,9 +135,9 @@ fn parse_extra_header(line: &str) -> Option<(String, String)> {
 
 fn validate_header(name: &str, value: &str) -> Result<(), GitError> {
     if name.is_empty()
-        || !name.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
-        })
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
     {
         return Err(GitError::Invalid {
             detail: format!("invalid header name {name:?}"),
@@ -337,7 +337,10 @@ fn parse_url(url: &str) -> Result<Url, GitError> {
     let invalid = |why: &str| GitError::Invalid {
         detail: format!("bad http url {url:?}: {why}"),
     };
-    if url.bytes().any(|byte| byte.is_ascii_control() || byte == b' ') {
+    if url
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte == b' ')
+    {
         return Err(invalid("space or control byte"));
     }
     let (scheme, rest) = url.split_once("://").ok_or_else(|| invalid("no scheme"))?;
@@ -1875,7 +1878,12 @@ mod tests {
     fn request_heads_preserve_url_authority() {
         for (url, authority, target, port) in [
             ("http://host.test/repo", "host.test", "/repo", 80),
-            ("http://host.test:8080/repo", "host.test:8080", "/repo", 8080),
+            (
+                "http://host.test:8080/repo",
+                "host.test:8080",
+                "/repo",
+                8080,
+            ),
             ("https://host.test:443/repo", "host.test:443", "/repo", 443),
             ("http://[::1]/repo", "[::1]", "/repo", 80),
             (
@@ -2190,7 +2198,10 @@ mod tests {
             head.starts_with("POST /info/lfs/objects/batch HTTP/1.1\r\n"),
             "{head:?}"
         );
-        assert!(head.contains(&format!("Host: 127.0.0.1:{port}\r\n")), "{head:?}");
+        assert!(
+            head.contains(&format!("Host: 127.0.0.1:{port}\r\n")),
+            "{head:?}"
+        );
         assert!(head.contains("Authorization: Bearer tok"), "{head:?}");
         assert!(
             head.contains(&format!("Content-Type: {LFS_JSON}")),
@@ -2667,8 +2678,9 @@ mod tests {
     #[test]
     fn chunked_body_stops_after_write_or_flush_failure() {
         struct RecoveringWriter {
-            fail_write: bool,
+            fail_after: Option<usize>,
             fail_flush: bool,
+            accepted: Vec<u8>,
             writes: usize,
             flushes: usize,
         }
@@ -2676,10 +2688,20 @@ mod tests {
         impl Write for RecoveringWriter {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                 self.writes += 1;
-                if std::mem::take(&mut self.fail_write) {
-                    return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
-                }
-                Ok(bytes.len())
+                let count = match self.fail_after {
+                    Some(0) => {
+                        self.fail_after = None;
+                        return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                    }
+                    Some(remaining) => {
+                        let count = bytes.len().min(remaining);
+                        self.fail_after = Some(remaining - count);
+                        count
+                    }
+                    None => bytes.len(),
+                };
+                self.accepted.extend_from_slice(&bytes[..count]);
+                Ok(count)
             }
 
             fn flush(&mut self) -> std::io::Result<()> {
@@ -2691,10 +2713,17 @@ mod tests {
             }
         }
 
-        for (fail_write, size) in [(true, CHUNK_WINDOW), (true, 7), (false, 7)] {
+        for (fail_after, size, expected) in [
+            (Some(0), CHUNK_WINDOW, b"".as_slice()),
+            (Some(0), 7, b"".as_slice()),
+            (Some(9), CHUNK_WINDOW, b"10000\r\nxx".as_slice()),
+            (Some(4), 7, b"7\r\nx".as_slice()),
+            (None, 7, b"7\r\nxxxxxxx\r\n".as_slice()),
+        ] {
             let mut writer = RecoveringWriter {
-                fail_write,
-                fail_flush: !fail_write,
+                fail_after,
+                fail_flush: fail_after.is_none(),
+                accepted: Vec::new(),
                 writes: 0,
                 flushes: 0,
             };
@@ -2706,11 +2735,13 @@ mod tests {
                 result.expect_err("first operation fails").kind(),
                 std::io::ErrorKind::BrokenPipe
             );
+            assert_eq!(writer.accepted, expected);
             let calls = (writer.writes, writer.flushes);
             assert!(body.write(&mut writer, b"more").is_err());
             assert!(body.flush(&mut writer).is_err());
             assert!(body.finish(&mut writer).is_err());
             assert_eq!((writer.writes, writer.flushes), calls);
+            assert_eq!(writer.accepted, expected);
         }
     }
 
