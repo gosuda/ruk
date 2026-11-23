@@ -551,24 +551,53 @@ pub fn reconcile(
         .filter(|update| seen.insert(update.name.as_slice()))
         .map(|update| {
             let at = current.get(update.name.as_slice()).copied().flatten();
-            let observation = if update.new == zero {
-                match at {
-                    None => RefObservation::EqualNew,
-                    Some(oid) if oid == update.old => RefObservation::EqualOld,
-                    current => RefObservation::Moved { current },
-                }
-            } else {
-                match at {
-                    Some(oid) if oid == update.new => RefObservation::EqualNew,
-                    None if update.old == zero => RefObservation::EqualOld,
-                    Some(oid) if oid == update.old => RefObservation::EqualOld,
-                    current => RefObservation::Moved { current },
-                }
-            };
+            let observation = compare_update(update, zero, at);
             ReconciledRef {
                 name: update.name.clone(),
                 observation,
             }
+        })
+        .collect()
+}
+
+fn compare_update(update: &PushUpdate, zero: Oid, at: Option<Oid>) -> RefObservation {
+    if update.new == zero {
+        match at {
+            None => RefObservation::EqualNew,
+            Some(oid) if oid == update.old => RefObservation::EqualOld,
+            current => RefObservation::Moved { current },
+        }
+    } else {
+        match at {
+            Some(oid) if oid == update.new => RefObservation::EqualNew,
+            None if update.old == zero => RefObservation::EqualOld,
+            Some(oid) if oid == update.old => RefObservation::EqualOld,
+            current => RefObservation::Moved { current },
+        }
+    }
+}
+
+/// Compares every reported alternative with its own pins, preserving its order.
+#[must_use]
+pub fn reconcile_reported(
+    plan: &PushPlanRecord,
+    kind: HashKind,
+    observed: &[(Vec<u8>, Option<Oid>)],
+) -> Vec<ReconciledRef> {
+    let current: HashMap<&[u8], Option<Oid>> = observed
+        .iter()
+        .map(|(name, oid)| (name.as_slice(), *oid))
+        .collect();
+    let zero = kind.zero_oid();
+    plan.reported_updates
+        .iter()
+        .map(|update| ReconciledRef {
+            name: update.name.clone(),
+            observation: compare_update(
+                update,
+                zero,
+                current.get(update.name.as_slice()).copied().flatten(),
+            ),
         })
         .collect()
 }

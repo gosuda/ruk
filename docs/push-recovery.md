@@ -14,7 +14,7 @@ method's arguments:
 
 Replace the example identifier with the plan from the `E_PUSH_UNCERTAIN`
 error. Use the normal authenticated request envelope, session, and request
-identifier. A successful reconciliation records the observation and
+identifier. A completed reconciliation records the observation and
 releases that plan's guard. It does not send a push. Check the returned
 ref names, observed OIDs, and verdicts before you create another push.
 
@@ -64,3 +64,40 @@ request and leaves the push uncertain. Reconciliation observes both the
 requested and reported refs. A reply with `rewritten: true` requires a
 decision about the reported result before another send. Reconciliation
 does not turn that result into confirmation of the original request.
+
+
+## Large recovery results
+
+A response contains at most 1,000 observations across `observations` and
+`reported_observations`. Large results include a `next` cursor. Pass it
+as `cursor` with the same plan and a new request identifier:
+
+```json
+{
+  "plan":"00000000-0000-4000-8000-000000000001",
+  "cursor":{
+    "session":"00000000-0000-4000-8000-000000000002",
+    "request":"00000000-0000-4000-8000-000000000003",
+    "page":1
+  }
+}
+```
+
+Use the cursor returned by Ruk, not these example values. Omit
+`original_remote` and `original_ssh` from continuation requests.
+Each page comes from the same saved observation snapshot. A restart does
+not require another network observation. An outstanding guard remains until the last
+page commits and `next` is null. Retrying an earlier page's request
+identifier replays that page and does not complete the recovery.
+
+The totals in each list describe the entire snapshot, not just that
+page. Collect both lists until `next` is null. If the plan or snapshot
+changes, Ruk returns `E_STALE`; start a new reconciliation without a
+cursor. Starting again replaces the previous snapshot and invalidates
+its unfinished cursors.
+
+`observations` preserves the comparisons against the requested pins.
+`reported_observations` exposes each reported alternative's old and new
+OIDs, observed value, and separate verdict. A same-ref OID rewrite can
+therefore be `moved` relative to the request and `equal_new` relative to
+the reported result. It still requires a decision before another send.

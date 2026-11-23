@@ -31,7 +31,7 @@
 
 use core::fmt;
 use core::hash::Hash;
-use core::num::NonZeroU32;
+use core::num::{NonZeroU16, NonZeroU32};
 use std::borrow::Cow;
 use std::collections::HashSet;
 
@@ -625,6 +625,16 @@ pub struct BoundedList<T> {
     pub total: u64,
     pub items: Vec<T>,
     pub truncated: bool,
+}
+
+impl<T> Default for BoundedList<T> {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            items: Vec::new(),
+            truncated: false,
+        }
+    }
 }
 
 impl<T> BoundedList<T> {
@@ -2191,6 +2201,21 @@ pub struct PushReply {
     pub refs: BoundedList<PushRefOutcome>,
 }
 
+/// The verified SSH account and port of one destination.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PushSshIdentity {
+    pub user: String,
+    pub port: NonZeroU16,
+}
+
+/// The next page of one durable reconciliation snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PushReconcileCursor {
+    pub session: SessionId,
+    pub request: RequestId,
+    pub page: u32,
+}
+
 /// `push.reconcile`: observes the remote's current refs for an uncertain plan.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PushReconcileArgs {
@@ -2199,12 +2224,22 @@ pub struct PushReconcileArgs {
     /// A current remote alias or changed mirror configuration does not establish it.
     #[serde(default)]
     pub original_remote: Option<String>,
+    /// Verified historical SSH settings; supplied only with `original_remote`.
+    #[serde(default)]
+    pub original_ssh: Option<PushSshIdentity>,
+    /// Continue the same committed observation snapshot without contacting the remote.
+    #[serde(default)]
+    pub cursor: Option<PushReconcileCursor>,
 }
 
 impl PushReconcileArgs {
     pub(crate) fn to_digest_postcard(&self) -> Result<Vec<u8>, postcard::Error> {
-        if self.original_remote.is_none() {
-            postcard::to_allocvec(&self.plan)
+        if self.original_ssh.is_none() && self.cursor.is_none() {
+            if self.original_remote.is_none() {
+                postcard::to_allocvec(&self.plan)
+            } else {
+                postcard::to_allocvec(&(self.plan, &self.original_remote))
+            }
         } else {
             postcard::to_allocvec(self)
         }
@@ -2228,6 +2263,16 @@ pub struct ReconcileObservation {
     pub verdict: ReconcileVerdict,
 }
 
+/// An observation compared with the pins reported by the server.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReportedReconcileObservation {
+    pub remote_ref: RefName,
+    pub old: Option<Oid>,
+    pub new: Option<Oid>,
+    pub observed: Option<Oid>,
+    pub verdict: ReconcileVerdict,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PushReconcileReply {
     pub outcome: MutationOutcome,
@@ -2238,6 +2283,10 @@ pub struct PushReconcileReply {
     #[serde(default)]
     pub rewritten: bool,
     pub observations: BoundedList<ReconcileObservation>,
+    #[serde(default)]
+    pub reported_observations: BoundedList<ReportedReconcileObservation>,
+    #[serde(default)]
+    pub next: Option<PushReconcileCursor>,
 }
 
 /// `land.prepare`: freezes an exact candidate; it never moves a ref.
@@ -2907,7 +2956,6 @@ no_invariants!(
     SnapshotArgs,
     EditArgs,
     ClaimReleaseArgs,
-    PushReconcileArgs,
     LandPrepareArgs,
     LandExecuteArgs,
     UndoArgs,
@@ -3304,6 +3352,31 @@ impl Validate for PushUpdate {
                 "pushing a deletion of `{}` cannot expect the ref to be absent",
                 show_bytes(self.remote_ref.as_bytes())
             )));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for PushReconcileArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        if let Some(cursor) = self.cursor {
+            if cursor.page == 0 {
+                return Err(invalid("a reconciliation continuation starts after page zero"));
+            }
+            if self.original_remote.is_some() || self.original_ssh.is_some() {
+                return Err(invalid("a reconciliation continuation cannot bind a destination"));
+            }
+        }
+        if let Some(identity) = &self.original_ssh {
+            if self.original_remote.is_none() {
+                return Err(invalid("original_ssh requires original_remote"));
+            }
+            if identity.user.is_empty()
+                || identity.user.len() > 1024
+                || identity.user.bytes().any(|byte| byte.is_ascii_control())
+            {
+                return Err(invalid("SSH user must contain 1..=1024 bytes without controls"));
+            }
         }
         Ok(())
     }
@@ -6261,6 +6334,8 @@ mod tests {
         let mut args: PushReconcileArgs =
             sonic_rs::from_value(&legacy_args).expect("old args decode");
         assert_eq!(args.original_remote, None);
+        assert_eq!(args.original_ssh, None);
+        assert_eq!(args.cursor, None);
         assert_eq!(
             args.to_digest_postcard().expect("digest encodes"),
             postcard::to_allocvec(&plan).expect("old digest encodes")
@@ -6281,6 +6356,22 @@ mod tests {
         let unbound = args.to_digest_postcard().expect("unbound digest");
         args.original_remote = Some("https://host.x/historical.git".to_owned());
         assert_ne!(args.to_digest_postcard().expect("bound digest"), unbound);
+        let previous_args =
+            postcard::to_allocvec(&(plan, &args.original_remote)).expect("previous bound args");
+        assert_eq!(
+            args.to_digest_postcard().expect("bound digest"),
+            previous_args
+        );
+        let mut previous_digest = Vec::new();
+        push_field(&mut previous_digest, DIGEST_DOMAIN_V1).expect("domain fits");
+        push_field(&mut previous_digest, b"push.reconcile").expect("method fits");
+        push_field(&mut previous_digest, &previous_args).expect("args fit");
+        assert_eq!(
+            Request::PushReconcile(mutation(1, args.clone()))
+                .digest_input_v1()
+                .expect("previous bound request digest"),
+            Some(previous_digest)
+        );
         let packed = postcard::to_allocvec(&args).expect("bound args encode");
         assert_eq!(
             postcard::from_bytes::<PushReconcileArgs>(&packed).expect("bound args decode"),
@@ -6293,6 +6384,8 @@ mod tests {
         let legacy_reply: PushReconcileReply =
             sonic_rs::from_value(&reply).expect("old reply decodes");
         assert!(!legacy_reply.rewritten);
+        assert_eq!(legacy_reply.reported_observations, BoundedList::default());
+        assert_eq!(legacy_reply.next, None);
         reply["rewritten"] = json!(true);
         assert!(
             sonic_rs::from_value::<PushReconcileReply>(&reply)
@@ -6301,6 +6394,183 @@ mod tests {
         );
         reply["rewritten"] = json!("true");
         assert!(sonic_rs::from_value::<PushReconcileReply>(&reply).is_err());
+    }
+
+    #[test]
+    fn reconciliation_digest_binds_identity_and_snapshot_coordinates() {
+        let plan = PlanId::from_bytes([7; 16]);
+        let unbound = PushReconcileArgs {
+            plan,
+            original_remote: None,
+            original_ssh: None,
+            cursor: None,
+        };
+        let mut historical = unbound.clone();
+        historical.original_remote = Some("ssh://mirror.example/repo.git".to_owned());
+        let mut ssh = historical.clone();
+        ssh.original_ssh = Some(PushSshIdentity {
+            user: "alice".to_owned(),
+            port: NonZeroU16::new(2222).expect("nonzero port"),
+        });
+        let mut other_user = ssh.clone();
+        other_user.original_ssh.as_mut().expect("identity").user = "bob".to_owned();
+        let mut other_port = ssh.clone();
+        other_port.original_ssh.as_mut().expect("identity").port =
+            NonZeroU16::new(2223).expect("nonzero port");
+        let cursor = PushReconcileCursor {
+            session: session(),
+            request: request_id(2),
+            page: 1,
+        };
+        let mut continuation = unbound.clone();
+        continuation.cursor = Some(cursor);
+        let mut other_page = continuation.clone();
+        other_page.cursor.as_mut().expect("cursor").page = 2;
+        let mut other_session = continuation.clone();
+        other_session.cursor.as_mut().expect("cursor").session =
+            SessionId::from_bytes([9; 16]);
+        let mut other_request = continuation.clone();
+        other_request.cursor.as_mut().expect("cursor").request = request_id(3);
+        let mut digests = HashSet::new();
+        for args in [
+            unbound,
+            historical,
+            ssh,
+            other_user,
+            other_port,
+            continuation,
+            other_page,
+            other_session,
+            other_request,
+        ] {
+            let request = Request::PushReconcile(mutation(1, args));
+            request.validate().expect("valid recovery request");
+            let digest = request
+                .digest_input_v1()
+                .expect("request digest")
+                .expect("mutation digest");
+            assert!(digests.insert(digest), "each recovery scope has its own digest");
+        }
+    }
+
+    #[test]
+    fn reconciliation_continuations_and_ssh_identity_validate_at_the_boundary() {
+        let plan = PlanId::from_bytes([7; 16]);
+        let identity = PushSshIdentity {
+            user: "alice".to_owned(),
+            port: NonZeroU16::new(2222).expect("nonzero port"),
+        };
+        let historical = PushReconcileArgs {
+            plan,
+            original_remote: Some("ssh://mirror.example/repo.git".to_owned()),
+            original_ssh: Some(identity.clone()),
+            cursor: None,
+        };
+        historical.validate().expect("explicit historical SSH identity");
+        let mut max_user = historical.clone();
+        max_user.original_ssh.as_mut().expect("identity").user = "u".repeat(1024);
+        max_user.validate().expect("maximum user length");
+        for user in [String::new(), "u\n".to_owned(), "u\u{7f}".to_owned(), "u".repeat(1025)] {
+            let mut args = historical.clone();
+            args.original_ssh.as_mut().expect("identity").user = user;
+            assert_eq!(
+                Request::PushReconcile(mutation(1, args))
+                    .validate()
+                    .expect_err("malformed SSH account refuses")
+                    .code,
+                ErrorCode::EInvalid
+            );
+        }
+        let mut unbound_identity = historical.clone();
+        unbound_identity.original_remote = None;
+        assert_eq!(
+            unbound_identity
+                .validate()
+                .expect_err("historical SSH identity requires its destination")
+                .code,
+            ErrorCode::EInvalid
+        );
+        for port in [0, -1, 65536] {
+            let encoded = json!({ "user": "alice", "port": port });
+            assert!(sonic_rs::from_value::<PushSshIdentity>(&encoded).is_err());
+        }
+        let cursor = PushReconcileCursor {
+            session: session(),
+            request: request_id(2),
+            page: 1,
+        };
+        let continuation = PushReconcileArgs {
+            plan,
+            original_remote: None,
+            original_ssh: None,
+            cursor: Some(cursor),
+        };
+        continuation.validate().expect("first continuation");
+        let mut zero = continuation.clone();
+        zero.cursor.as_mut().expect("cursor").page = 0;
+        assert_eq!(
+            zero.validate().expect_err("page zero is not a continuation").code,
+            ErrorCode::EInvalid
+        );
+        for (remote, ssh) in [
+            (historical.original_remote.clone(), None),
+            (None, Some(identity.clone())),
+            (historical.original_remote, Some(identity)),
+        ] {
+            let args = PushReconcileArgs {
+                original_remote: remote,
+                original_ssh: ssh,
+                ..continuation.clone()
+            };
+            assert_eq!(
+                args.validate()
+                    .expect_err("continuation cannot rebind a destination")
+                    .code,
+                ErrorCode::EInvalid
+            );
+        }
+    }
+
+    #[test]
+    fn reconciliation_schema_exposes_typed_recovery_extensions() {
+        let doc = model_value();
+        for (definition, fields) in [
+            (
+                "PushReconcileArgs",
+                &["plan", "original_remote", "original_ssh", "cursor"][..],
+            ),
+            ("PushSshIdentity", &["user", "port"][..]),
+            ("PushReconcileCursor", &["session", "request", "page"][..]),
+            (
+                "ReportedReconcileObservation",
+                &["remote_ref", "old", "new", "observed", "verdict"][..],
+            ),
+            (
+                "PushReconcileReply",
+                &["observations", "rewritten", "reported_observations", "next"][..],
+            ),
+        ] {
+            let properties = doc["$defs"][definition]["properties"]
+                .as_object()
+                .expect("typed recovery properties");
+            for field in fields {
+                assert!(
+                    properties.contains_key(field),
+                    "{definition} must expose {field}"
+                );
+            }
+        }
+        assert_eq!(
+            doc["$defs"]["PushSshIdentity"]["properties"]["port"]["minimum"].as_f64(),
+            Some(1.0)
+        );
+        let required = doc["$defs"]["PushReconcileArgs"]["required"]
+            .as_array()
+            .expect("required recovery fields");
+        assert!(required.iter().any(|field| field.as_str() == Some("plan")));
+        for optional in ["original_remote", "original_ssh", "cursor"] {
+            assert!(!required.iter().any(|field| field.as_str() == Some(optional)));
+        }
     }
 
     #[test]

@@ -70,6 +70,17 @@ jobs:
         with:
           tool: cargo-nextest@0.9.148
       - run: cargo nextest run --workspace --locked
+      - name: Export the model for dependent clients
+        id: export_model
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: cargo run --locked -p ruk -- model --format json > "$RUNNER_TEMP/ruk-model.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ !cancelled() && steps.export_model.outcome == 'success' }}
+        with:
+          name: ruk-model-${{ github.sha }}
+          path: ${{ runner.temp }}/ruk-model.json
+          if-no-files-found: error
+          retention-days: 7
 
   test:
     name: test-${{ matrix.os }}

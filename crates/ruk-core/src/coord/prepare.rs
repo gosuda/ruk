@@ -5510,6 +5510,8 @@ mod tests {
             args: PushReconcileArgs {
                 plan: PlanId::generate(),
                 original_remote: None,
+                original_ssh: None,
+                cursor: None,
             },
         }));
         let err = prepare_mutation_with(&ctx, reconcile)

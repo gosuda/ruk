@@ -33,6 +33,7 @@
 //! one send attempt: no retries inside the job, the client retries under
 //! its idempotency key.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,7 +48,7 @@ use ruk_core::protocol::{
     BoundedList, ChangeRef, ErrorDetail, ErrorReply, Method, MutationOutcome, PushAtomicity,
     PushReconcileReply, PushRefOutcome, PushRefStatus, PushReply, PushSource, PushState,
     ReceiptRef, ReconcileObservation, ReconcileVerdict, RemoteExpect, RemoteSpec, Reply,
-    ReplyEnvelope, Request, RequestDigest, Timestamp,
+    ReplyEnvelope, ReportedReconcileObservation, Request, RequestDigest, Timestamp,
 };
 use ruk_core::records::Records;
 use ruk_core::refdata::{RefName, RefTarget};
@@ -72,6 +73,8 @@ use super::registry::{PushKeyClaim, PushKeyWorkerHalf, Registry};
 use super::{ConnectionRefs, InvocationOpen, decode_request_args};
 use crate::cli::state::is_ancestor;
 use crate::daemon::ipc;
+
+mod reconcile_pages;
 
 /// The shared handles of one hosted push invocation.
 pub(crate) struct PushJob<'a> {
@@ -302,51 +305,63 @@ impl<'a> PushJob<'a> {
             })?;
         let mut plan = PushPlanRecord::decode(plan_id, kind, &encoded).map_err(to_core)?;
         if let Some(reply) = self.replay_committed(&request)? {
-            if plan.destination_is_known() {
+            if reconcile_pages::can_release_receipt(store, &plan, &reply)? {
                 self.release_reconciliation_guard(&plan)?;
             }
             return encode_reply(Some(request_id), reply);
         }
-        let rebound = !plan.destination_is_known();
-        let bridge = CancelBridge::arm(self.cancel, open, self.refs.registry.egress_policy());
-        let remote = match (rebound, args.args.original_remote.as_deref()) {
-            (true, None) => return Err(legacy_destination_required(plan_id)),
-            (false, Some(_)) => {
-                return Err(CoreError::new(
-                    ErrorCode::EInvalid,
-                    format!(
-                        "push plan {plan_id} already has a known destination; original_remote cannot rebind it"
-                    ),
-                ));
-            }
-            (true, Some(remote)) => {
+        let prepared = if let Some(cursor) = args.args.cursor {
+            reconcile_pages::next(&self, &plan, cursor, request_id)?
+        } else {
+            let rebound = !plan.destination_is_known();
+            let bridge = CancelBridge::arm(self.cancel, open, self.refs.registry.egress_policy());
+            let remote = match (rebound, args.args.original_remote.as_deref()) {
+                (true, None) => return Err(legacy_destination_required(plan_id)),
+                (false, Some(_)) => {
+                    return Err(CoreError::new(
+                        ErrorCode::EInvalid,
+                        format!(
+                            "push plan {plan_id} already has a known destination; original_remote cannot rebind it"
+                        ),
+                    ));
+                }
+                (true, Some(remote)) => {
+                    refuse_url_userinfo(remote, &bridge.auth).map_err(to_core)?;
+                    plan.bind_original_remote(remote.as_bytes().to_vec())
+                        .map_err(to_core)?;
+                    remote.as_bytes().to_vec()
+                }
+                (false, None) => plan.remote.clone(),
+            };
+            if let Ok(remote) = std::str::from_utf8(&remote) {
                 refuse_url_userinfo(remote, &bridge.auth).map_err(to_core)?;
-                plan.bind_original_remote(remote.as_bytes().to_vec())
-                    .map_err(to_core)?;
-                remote.as_bytes().to_vec()
             }
-            (false, None) => plan.remote.clone(),
+            let job = self.snapshot();
+            let (observations, reported, observed_plan) = self
+                .refs
+                .transport
+                .run(move || {
+                    let advertised = job.discover_for_reconcile(&remote, &bridge)?;
+                    let observations = map_observations(kind, &plan, &advertised)?;
+                    let reported = map_reported_observations(kind, &plan, &advertised)?;
+                    Ok::<_, CoreError>((observations, reported, plan))
+                })
+                .await??;
+            plan = observed_plan;
+            reconcile_pages::first(
+                &self,
+                &plan,
+                observations,
+                reported,
+                request_id,
+                rebound,
+            )?
         };
-        if let Ok(remote) = std::str::from_utf8(&remote) {
-            refuse_url_userinfo(remote, &bridge.auth).map_err(to_core)?;
-        }
-        let job = self.snapshot();
-        let (observations, plan) = self
-            .refs
-            .transport
-            .run(move || {
-                let advertised = job.discover_for_reconcile(&remote, &bridge)?;
-                map_observations(kind, &plan, &advertised).map(|observations| (observations, plan))
-            })
-            .await??;
-
-        let reply = Reply::PushReconcile(Box::new(PushReconcileReply {
-            outcome: pending_outcome(self.session, request_id),
-            plan: plan_id,
-            state: wire_state(plan.state),
-            rewritten: !plan.reported_updates.is_empty(),
-            observations: BoundedList::complete(observations)?,
-        }));
+        let reconcile_pages::PreparedPage {
+            reply,
+            mut facts,
+        } = prepared;
+        facts.push(plan.persist_mutation(kind, Some(encoded)).map_err(to_core)?);
         let stored = self
             .coordinator
             .submit_prepared(
@@ -355,13 +370,9 @@ impl<'a> PushJob<'a> {
                     session: self.session,
                     request_id,
                     request,
-                    reply: reply.clone(),
+                    reply,
                     objects: Vec::new(),
-                    facts: vec![
-                        plan.persist_mutation(kind, Some(encoded))
-                            .map_err(to_core)?,
-                        reconciliation_marker_fact(store, plan_id)?,
-                    ],
+                    facts,
                     workspace_fence: None,
                     ref_transaction: None,
                     ref_dependencies: Vec::new(),
@@ -370,7 +381,9 @@ impl<'a> PushJob<'a> {
                 self.cancel,
             )
             .await?;
-        self.release_reconciliation_guard(&plan)?;
+        if reconcile_pages::can_release_receipt(store, &plan, &stored)? {
+            self.release_reconciliation_guard(&plan)?;
+        }
         encode_reply(Some(request_id), stored)
     }
 
@@ -1147,6 +1160,10 @@ fn map_observations(
             (entry.name.clone(), tip)
         })
         .collect();
+    let mut pins = HashMap::with_capacity(plan.updates.len() + plan.reported_updates.len());
+    for update in plan.updates.iter().chain(&plan.reported_updates) {
+        pins.entry(update.name.as_slice()).or_insert(update);
+    }
     let mut out = Vec::new();
     for reconciled in push::reconcile(plan, kind, &observed) {
         let remote_ref = RefName::new(reconciled.name.clone()).map_err(|_| {
@@ -1157,18 +1174,16 @@ fn map_observations(
         })?;
         // EqualNew/EqualOld reaffirm the plan's own pins; only a move
         // reports the remote's divergent value.
-        let wire = plan
-            .updates
-            .iter()
-            .chain(&plan.reported_updates)
-            .find(|update| update.name == reconciled.name);
+        let wire = pins
+            .get(reconciled.name.as_slice())
+            .expect("the reconciler returns a recorded update");
         let (observed, verdict) = match reconciled.observation {
             RefObservation::EqualNew => (
-                wire.map(|update| update.new).filter(|oid| *oid != zero),
+                Some(wire.new).filter(|oid| *oid != zero),
                 ReconcileVerdict::EqualNew,
             ),
             RefObservation::EqualOld => (
-                wire.map(|update| update.old).filter(|oid| *oid != zero),
+                Some(wire.old).filter(|oid| *oid != zero),
                 ReconcileVerdict::EqualOld,
             ),
             RefObservation::Moved { current } => (current, ReconcileVerdict::Moved),
@@ -1180,6 +1195,51 @@ fn map_observations(
         });
     }
     Ok(out)
+}
+
+fn map_reported_observations(
+    kind: HashKind,
+    plan: &PushPlanRecord,
+    advertised: &[AdvertisedLocalRef],
+) -> Result<Vec<ReportedReconcileObservation>, CoreError> {
+    let zero = kind.zero_oid();
+    let observed: Vec<_> = advertised
+        .iter()
+        .map(|entry| {
+            let tip = match &entry.target {
+                RefTarget::Direct(oid) => Some(*oid),
+                RefTarget::Symbolic(_) => None,
+            };
+            (entry.name.clone(), tip)
+        })
+        .collect();
+    push::reconcile_reported(plan, kind, &observed)
+        .into_iter()
+        .zip(&plan.reported_updates)
+        .map(|(reconciled, update)| {
+            let remote_ref = RefName::new(reconciled.name).map_err(|_| {
+                CoreError::new(ErrorCode::ECorrupt, "stored report carries an invalid ref")
+            })?;
+            let (observed, verdict) = match reconciled.observation {
+                RefObservation::EqualNew => (
+                    Some(update.new).filter(|oid| *oid != zero),
+                    ReconcileVerdict::EqualNew,
+                ),
+                RefObservation::EqualOld => (
+                    Some(update.old).filter(|oid| *oid != zero),
+                    ReconcileVerdict::EqualOld,
+                ),
+                RefObservation::Moved { current } => (current, ReconcileVerdict::Moved),
+            };
+            Ok(ReportedReconcileObservation {
+                remote_ref,
+                old: Some(update.old).filter(|oid| *oid != zero),
+                new: Some(update.new).filter(|oid| *oid != zero),
+                observed,
+                verdict,
+            })
+        })
+        .collect()
 }
 
 /// A placeholder outcome header: the lane overwrites the receipt plus the
@@ -1808,9 +1868,13 @@ mod tests {
                             args: PushReconcileArgs {
                                 plan,
                                 original_remote: None,
+                                original_ssh: None,
+                                cursor: None,
                             },
                         })),
                         reply: Reply::PushReconcile(Box::new(PushReconcileReply {
+                            reported_observations: BoundedList::default(),
+                            next: None,
                             outcome: pending_outcome(session, request_id),
                             plan,
                             state: PushState::Uncertain,
@@ -1951,6 +2015,8 @@ mod tests {
             error
         );
         let reconciled = Reply::PushReconcile(Box::new(PushReconcileReply {
+            reported_observations: BoundedList::default(),
+            next: None,
             outcome: pending_outcome(SessionId::generate(), RequestId::generate()),
             plan,
             state: PushState::Rejected,
