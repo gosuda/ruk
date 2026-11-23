@@ -2097,12 +2097,7 @@ mod tests {
         }
     }
 
-    /// Reads one request head plus its body from `socket`, returning the
-    /// head text and the raw body bytes. A chunked framing drains through
-    /// the zero terminator so the canned reply survives TCP teardown on
-    /// every platform; anything else reads by Content-Length.
-    fn read_request(socket: &std::net::TcpStream) -> (String, Vec<u8>) {
-        let mut reader = BufReader::new(socket.try_clone().expect("split"));
+    fn read_request_head(reader: &mut impl BufRead) -> String {
         let mut head = Vec::new();
         loop {
             let mut line = Vec::new();
@@ -2115,7 +2110,16 @@ mod tests {
                 break;
             }
         }
-        let text = String::from_utf8_lossy(&head).into_owned();
+        String::from_utf8_lossy(&head).into_owned()
+    }
+
+    /// Reads one request head plus its body from `socket`, returning the
+    /// head text and the raw body bytes. A chunked framing drains through
+    /// the zero terminator so the canned reply survives TCP teardown on
+    /// every platform; anything else reads by Content-Length.
+    fn read_request(socket: &std::net::TcpStream) -> (String, Vec<u8>) {
+        let mut reader = BufReader::new(socket.try_clone().expect("split"));
+        let text = read_request_head(&mut reader);
         let chunked = text.lines().any(|line| match line.split_once(':') {
             Some((name, value)) => {
                 name.trim().eq_ignore_ascii_case("transfer-encoding")
@@ -2933,7 +2937,7 @@ mod tests {
             socket
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .expect("timeout");
-            read_request(&socket);
+            read_request_head(&mut BufReader::new(socket.try_clone().expect("split")));
             let reply = format!(
                 "HTTP/1.1 {status} Reply\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno"
             );
