@@ -128,17 +128,30 @@ pub struct ExtraHeaderRow {
 fn parse_extra_header(line: &str) -> Option<(String, String)> {
     let (name, value) = line.split_once(':')?;
     let name = name.trim();
-    if name.is_empty() {
-        return None;
-    }
-    if name.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
-        return None;
-    }
     let value = value.strip_prefix([' ', '\t']).unwrap_or(value);
-    if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
-        return None;
-    }
+    validate_header(name, value).ok()?;
     Some((name.to_owned(), value.to_owned()))
+}
+
+fn validate_header(name: &str, value: &str) -> Result<(), GitError> {
+    if name.is_empty()
+        || !name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+        })
+    {
+        return Err(GitError::Invalid {
+            detail: format!("invalid header name {name:?}"),
+        });
+    }
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_control() && byte != b'\t')
+    {
+        return Err(GitError::Invalid {
+            detail: format!("header {name:?} carries a control byte"),
+        });
+    }
+    Ok(())
 }
 
 /// Resolves the `http.extraHeader` request headers for `url` from `rows`
@@ -308,6 +321,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 struct Url {
     secure: bool,
     host: String,
+    authority: String,
     port: u16,
     path: String,
 }
@@ -323,15 +337,21 @@ fn parse_url(url: &str) -> Result<Url, GitError> {
     let invalid = |why: &str| GitError::Invalid {
         detail: format!("bad http url {url:?}: {why}"),
     };
+    if url.bytes().any(|byte| byte.is_ascii_control() || byte == b' ') {
+        return Err(invalid("space or control byte"));
+    }
     let (scheme, rest) = url.split_once("://").ok_or_else(|| invalid("no scheme"))?;
     let secure = match scheme.to_ascii_lowercase().as_str() {
         "http" => false,
         "https" => true,
         _ => return Err(invalid("scheme is not http(s)")),
     };
-    let (authority, path) = match rest.find('/') {
-        Some(index) => (rest[..index].to_owned(), rest[index..].to_owned()),
-        None => (rest.to_owned(), "/".to_owned()),
+    let rest = rest.split_once('#').map_or(rest, |(before, _)| before);
+    let (authority, target) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+    let path = if target.starts_with('/') {
+        target.to_owned()
+    } else {
+        format!("/{target}")
     };
     if authority.is_empty() || authority.starts_with([':', '@']) {
         return Err(invalid("empty host"));
@@ -340,17 +360,25 @@ fn parse_url(url: &str) -> Result<Url, GitError> {
     // headers); strip it so it cannot leak into Host or SNI.
     // `rsplit` always yields one item; the empty host fails below.
     let hostport: &str = authority.rsplit('@').next().unwrap_or_default();
+    let default_port = if secure { 443 } else { 80 };
     let (host, port) = if let Some(bracketed) = hostport.strip_prefix('[') {
         let end = bracketed.find(']').ok_or_else(|| invalid("bad ipv6"))?;
         let port = match bracketed[end + 1..].strip_prefix(':') {
             Some(text) => text.parse::<u16>().map_err(|_| invalid("bad port"))?,
-            None if end + 1 == bracketed.len() => 0,
+            None if end + 1 == bracketed.len() => default_port,
             None => return Err(invalid("bad ipv6")),
         };
-        (bracketed[..end].to_owned(), port)
+        let host = &bracketed[..end];
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(invalid("bad ipv6"));
+        }
+        (host.to_owned(), port)
     } else if let Some((host, port_text)) = hostport.rsplit_once(':') {
         if host.is_empty() {
             return Err(invalid("empty host"));
+        }
+        if host.contains(':') {
+            return Err(invalid("ipv6 host needs brackets"));
         }
         if port_text.is_empty() || !port_text.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(invalid("bad port"));
@@ -358,19 +386,15 @@ fn parse_url(url: &str) -> Result<Url, GitError> {
         let port = port_text.parse::<u16>().map_err(|_| invalid("bad port"))?;
         (host.to_owned(), port)
     } else {
-        (hostport.to_owned(), 0)
+        (hostport.to_owned(), default_port)
     };
     if host.is_empty() {
         return Err(invalid("empty host"));
     }
-    let port = if port == 0 {
-        if secure { 443 } else { 80 }
-    } else {
-        port
-    };
     Ok(Url {
         secure,
         host,
+        authority: hostport.to_owned(),
         port,
         path,
     })
@@ -655,7 +679,7 @@ fn connect(
 /// Writes one HTTP/1.1 request head: method line, Host, caller headers,
 /// `Connection: close`, and `Content-Length` when `content_len` is known.
 fn send_head(
-    stream: &mut Stream,
+    stream: &mut impl Write,
     method: &str,
     parsed: &Url,
     headers: &[(&str, &str)],
@@ -664,14 +688,10 @@ fn send_head(
     let what = format!("{method} {}", parsed.path);
     let mut head = format!(
         "{method} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
-        parsed.path, parsed.host
+        parsed.path, parsed.authority
     );
     for (name, value) in headers {
-        if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
-            return Err(GitError::Invalid {
-                detail: format!("header {name:?} carries a line break"),
-            });
-        }
+        validate_header(name, value)?;
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     if let Some(len) = content_len {
@@ -848,7 +868,10 @@ fn read_chunked(
     let mut total: u64 = 0;
     loop {
         let line = read_line(reader, MAX_HEADER_BYTES)?;
-        let size_end = line.iter().position(|byte| *byte == b';').unwrap_or(line.len());
+        let size_end = line
+            .iter()
+            .position(|byte| *byte == b';')
+            .unwrap_or(line.len());
         let size = u64::from_str_radix(
             std::str::from_utf8(&line[..size_end]).map_err(|_| GitError::Invalid {
                 detail: "chunk size is not UTF-8".to_owned(),
@@ -1072,8 +1095,10 @@ impl Read for HttpBodyReader {
                     ChunkState::Done => return Ok(0),
                     ChunkState::Size => {
                         let line = read_line(&mut self.reader, MAX_HEADER_BYTES).map_err(io_git)?;
-                        let size_end =
-                            line.iter().position(|byte| *byte == b';').unwrap_or(line.len());
+                        let size_end = line
+                            .iter()
+                            .position(|byte| *byte == b';')
+                            .unwrap_or(line.len());
                         let text = std::str::from_utf8(&line[..size_end])
                             .map_err(|_| io_failed("chunk size is not UTF-8"))?;
                         let size = u64::from_str_radix(text, 16)
@@ -1324,7 +1349,7 @@ pub fn post_open_chunked(
 /// Host, `Connection: close`, caller headers, then
 /// `Transfer-Encoding: chunked`.
 fn send_chunked_head(
-    stream: &mut Stream,
+    stream: &mut impl Write,
     method: &str,
     parsed: &Url,
     headers: &[(&str, &str)],
@@ -1332,14 +1357,10 @@ fn send_chunked_head(
     let what = format!("{method} {}", parsed.path);
     let mut head = format!(
         "{method} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
-        parsed.path, parsed.host
+        parsed.path, parsed.authority
     );
     for (name, value) in headers {
-        if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
-            return Err(GitError::Invalid {
-                detail: format!("header {name:?} carries a line break"),
-            });
-        }
+        validate_header(name, value)?;
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     head.push_str("Transfer-Encoding: chunked\r\n\r\n");
@@ -1850,6 +1871,96 @@ mod tests {
         assert!(parse_url("http://host.x:abc/a").is_err());
     }
 
+    #[test]
+    fn request_heads_preserve_url_authority() {
+        for (url, authority, target, port) in [
+            ("http://host.test/repo", "host.test", "/repo", 80),
+            ("http://host.test:8080/repo", "host.test:8080", "/repo", 8080),
+            ("https://host.test:443/repo", "host.test:443", "/repo", 443),
+            ("http://[::1]/repo", "[::1]", "/repo", 80),
+            (
+                "https://[2001:db8::1]:8443/repo?token=a%23b#local",
+                "[2001:db8::1]:8443",
+                "/repo?token=a%23b",
+                8443,
+            ),
+            (
+                "https://user:secret@host.test:8443/repo",
+                "host.test:8443",
+                "/repo",
+                8443,
+            ),
+            (
+                "http://host.test:8080?token=a%23b#local",
+                "host.test:8080",
+                "/?token=a%23b",
+                8080,
+            ),
+            ("http://host.test:0/", "host.test:0", "/", 0),
+        ] {
+            let parsed = parse_url(url).expect("valid URL");
+            assert_eq!(parsed.port, port);
+            let mut ordinary = Vec::new();
+            send_head(&mut ordinary, "POST", &parsed, &[], Some(0)).expect("request head");
+            let mut chunked = Vec::new();
+            send_chunked_head(&mut chunked, "POST", &parsed, &[]).expect("chunked head");
+            for bytes in [ordinary, chunked] {
+                let head = String::from_utf8(bytes).expect("ASCII request");
+                let expected =
+                    format!("POST {target} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n");
+                assert!(head.starts_with(&expected), "{head:?}");
+                assert!(!head.contains("secret"), "{head:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn request_heads_reject_invalid_fields_before_writing() {
+        let parsed = parse_url("http://host.test/repo").expect("URL");
+        for (name, value) in [
+            ("", "value"),
+            ("X Bad", "value"),
+            ("X:Bad", "value"),
+            ("X-Bad\r\nInjected", "value"),
+            ("X-Test", "value\r\nInjected: yes"),
+            ("X-Test", "value\0tail"),
+            ("X-Test", "value\x7f"),
+        ] {
+            for chunked in [false, true] {
+                let mut output = Vec::new();
+                let result = if chunked {
+                    send_chunked_head(&mut output, "POST", &parsed, &[(name, value)])
+                } else {
+                    send_head(&mut output, "POST", &parsed, &[(name, value)], Some(0))
+                };
+                assert!(matches!(result, Err(GitError::Invalid { .. })));
+                assert!(output.is_empty());
+            }
+        }
+        assert!(parse_extra_header("Bad Name: ignored").is_none());
+        assert!(parse_extra_header("X-Test: value\0tail").is_none());
+        assert_eq!(
+            parse_extra_header("X-Test: value\ttail"),
+            Some(("X-Test".to_owned(), "value\ttail".to_owned()))
+        );
+    }
+
+    #[test]
+    fn url_parse_rejects_wire_controls_and_invalid_ipv6() {
+        for url in [
+            "http://host.test/\r\nInjected: yes",
+            "http://host.test/\0",
+            "http://host.test/\t",
+            "http://host.test/with space",
+            "http://ho\nst.test/",
+            "http://host.test/\x7f",
+            "http://[bogus]/",
+            "http://::1/",
+        ] {
+            assert!(matches!(parse_url(url), Err(GitError::Invalid { .. })));
+        }
+    }
+
     /// Reads one request head plus its declared body from `socket`,
     /// returning the head text and the raw body bytes.
     fn read_request(socket: &std::net::TcpStream) -> (String, Vec<u8>) {
@@ -2036,7 +2147,10 @@ mod tests {
         let (port, server) = fake_raw_server(vec![response.clone(), response]);
         let url = format!("http://127.0.0.1:{port}/body");
         let policy = super::super::net::EgressPolicy::deny_private().allow_loopback();
-        assert_eq!(get(&url, &[], &policy, None).expect("buffered body").body, b"x");
+        assert_eq!(
+            get(&url, &[], &policy, None).expect("buffered body").body,
+            b"x"
+        );
         let (mut reader, status, _) =
             post_open(&url, &[], b"", &policy, None).expect("response head");
         assert_eq!(status, 200);
@@ -2076,6 +2190,7 @@ mod tests {
             head.starts_with("POST /info/lfs/objects/batch HTTP/1.1\r\n"),
             "{head:?}"
         );
+        assert!(head.contains(&format!("Host: 127.0.0.1:{port}\r\n")), "{head:?}");
         assert!(head.contains("Authorization: Bearer tok"), "{head:?}");
         assert!(
             head.contains(&format!("Content-Type: {LFS_JSON}")),
@@ -2696,6 +2811,10 @@ mod tests {
                 }
             }
             let head_text = String::from_utf8_lossy(&head).into_owned();
+            assert!(
+                head_text.contains(&format!("Host: 127.0.0.1:{port}\r\n")),
+                "{head_text:?}"
+            );
             assert!(
                 head_text
                     .to_ascii_lowercase()
