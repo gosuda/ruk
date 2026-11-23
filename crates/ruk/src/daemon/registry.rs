@@ -169,21 +169,9 @@ fn push_destination(remote: &[u8]) -> Result<Oid, CoreError> {
             path.into_bytes(),
         ),
         net::Endpoint::Local { path } => {
-            let absolute = std::path::absolute(path)
+            let path = std::path::absolute(path)
                 .map_err(|_| CoreError::new(ErrorCode::EIo, "push destination path is unavailable"))?;
-            let mut path = PathBuf::new();
-            for component in absolute.components() {
-                match component {
-                    std::path::Component::ParentDir => {
-                        path.pop();
-                    }
-                    std::path::Component::CurDir => {}
-                    other => path.push(other.as_os_str()),
-                }
-            }
             let bytes = path.as_os_str().as_encoded_bytes().to_vec();
-            #[cfg(windows)]
-            let bytes = bytes.to_ascii_lowercase();
             (0, String::new(), 0, String::new(), bytes)
         }
     };
@@ -4557,6 +4545,19 @@ mod tests {
             .expect_err("malformed destination fails");
         assert!(!err.to_string().contains("CANARY"));
         assert!(!err.to_string().contains("SECRET"));
+    }
+
+    #[test]
+    fn push_destination_preserves_unresolved_local_path_identity() {
+        let root = scratch_root();
+        let destination = |relative: &str| {
+            let path = root.join(relative);
+            push_destination(path.to_str().expect("test path is UTF-8").as_bytes())
+                .expect("local destination parses")
+        };
+        assert_ne!(destination("Repo.git"), destination("repo.git"));
+        #[cfg(unix)]
+        assert_ne!(destination("link/../repo.git"), destination("repo.git"));
     }
 
     #[test]
