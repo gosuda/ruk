@@ -69,7 +69,10 @@ fn corrupt(message: &str) -> CoreError {
 
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CoreError> {
     let bytes = sonic_rs::to_vec(value).map_err(|err| {
-        CoreError::new(ErrorCode::EInvalid, format!("reconciliation snapshot encode: {err}"))
+        CoreError::new(
+            ErrorCode::EInvalid,
+            format!("reconciliation snapshot encode: {err}"),
+        )
     })?;
     if bytes.len() > ruk_core::MAX_CONTROL_FRAME_BYTES {
         return Err(CoreError::new(
@@ -82,11 +85,12 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CoreError> {
 
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, CoreError> {
     if bytes.len() > ruk_core::MAX_CONTROL_FRAME_BYTES {
-        return Err(corrupt("reconciliation snapshot row exceeds the control bound"));
+        return Err(corrupt(
+            "reconciliation snapshot row exceeds the control bound",
+        ));
     }
-    sonic_rs::from_slice(bytes).map_err(|err| {
-        corrupt(&format!("reconciliation snapshot decode: {err}"))
-    })
+    sonic_rs::from_slice(bytes)
+        .map_err(|err| corrupt(&format!("reconciliation snapshot decode: {err}")))
 }
 
 fn plan_hash(plan: &PushPlanRecord, kind: HashKind) -> Result<Oid, CoreError> {
@@ -95,7 +99,10 @@ fn plan_hash(plan: &PushPlanRecord, kind: HashKind) -> Result<Oid, CoreError> {
 }
 
 fn progress(store: &Store, plan: PlanId) -> Result<Option<(Progress, Vec<u8>)>, CoreError> {
-    let Some(bytes) = store.fact(FactTable::RemoteObservations, &key(PROGRESS_PREFIX, plan, None))?
+    let Some(bytes) = store.fact(
+        FactTable::RemoteObservations,
+        &key(PROGRESS_PREFIX, plan, None),
+    )?
     else {
         return Ok(None);
     };
@@ -143,7 +150,10 @@ fn split_rows(
             Row::Reported(value) => sonic_rs::to_vec(value),
         }
         .map_err(|err| {
-            CoreError::new(ErrorCode::EInvalid, format!("reconciliation row encode: {err}"))
+            CoreError::new(
+                ErrorCode::EInvalid,
+                format!("reconciliation row encode: {err}"),
+            )
         })?
         .len()
             + 1;
@@ -250,7 +260,11 @@ pub(super) fn first(
     }
     if let Some((old, _)) = &previous {
         for index in page_count..old.page_count {
-            facts.push(mutation(store, key(PAGE_PREFIX, plan.id, Some(index)), None)?);
+            facts.push(mutation(
+                store,
+                key(PAGE_PREFIX, plan.id, Some(index)),
+                None,
+            )?);
         }
     }
     facts.push(FactMutation {
@@ -270,7 +284,13 @@ pub(super) fn first(
         facts.push(marker);
     }
     Ok(PreparedPage {
-        reply: reply(plan, first.expect("snapshot has a first page"), &value, session, request)?,
+        reply: reply(
+            plan,
+            first.expect("snapshot has a first page"),
+            &value,
+            session,
+            request,
+        )?,
         facts,
     })
 }
@@ -284,7 +304,9 @@ pub(super) fn next(
     let store = job.coordinator.store();
     let session = job.session;
     let Some((mut value, previous)) = progress(store, plan.id)? else {
-        return Err(stale("reconciliation snapshot is no longer available; start again"));
+        return Err(stale(
+            "reconciliation snapshot is no longer available; start again",
+        ));
     };
     if value.principal != *job.principal {
         return Err(CoreError::new(
@@ -341,7 +363,10 @@ pub(super) fn can_release_receipt(
     if !plan.destination_is_known() || reply.next.is_some() {
         return Ok(false);
     }
-    match store.fact(FactTable::RemoteObservations, &reconciliation_marker_key(plan.id))? {
+    match store.fact(
+        FactTable::RemoteObservations,
+        &reconciliation_marker_key(plan.id),
+    )? {
         Some(value) if value == [RECONCILIATION_MARKER_VERSION] => Ok(true),
         Some(_) => Err(corrupt("reconciliation marker is corrupt")),
         None => Ok(false),

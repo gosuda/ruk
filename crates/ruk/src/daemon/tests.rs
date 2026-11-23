@@ -7972,13 +7972,13 @@ fn reconciled_push_guard_stays_clear_after_restart() {
         .expect("open restores repository and guards");
 
     let err = registry
-        .push_guard_check(&path, remote, std::slice::from_ref(&ref_1))
+        .push_guard_check(&path, remote, None, std::slice::from_ref(&ref_1))
         .expect_err("uncertain un-reconciled push plan guards ref after restart");
     assert_eq!(err.code, ErrorCode::EPushUncertain);
     assert!(err.to_string().contains(&plan_id_1.to_string()));
 
     registry
-        .push_guard_check(&path, remote, std::slice::from_ref(&ref_2))
+        .push_guard_check(&path, remote, None, std::slice::from_ref(&ref_2))
         .expect("reconciled push guard stays clear after restart");
 }
 

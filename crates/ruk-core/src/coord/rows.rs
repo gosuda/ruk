@@ -1531,8 +1531,7 @@ mod tests {
             ),
         )
         .expect("wrong method fixture");
-        let mut partial_tag =
-            postcard::to_allocvec(&RECONCILE_RECEIPT_TAG).expect("new tag");
+        let mut partial_tag = postcard::to_allocvec(&RECONCILE_RECEIPT_TAG).expect("new tag");
         partial_tag.pop().expect("tag ends");
         for (case, malformed) in [
             ("truncated-v2", previous[..previous.len() - 1].to_vec()),

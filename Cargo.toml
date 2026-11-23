@@ -25,6 +25,7 @@ gix-protocol = { version = "=0.67.0" }
 gix-transport = { version = "=0.61.0" }
 gix-ref = { version = "=0.69.0" }
 gix-url = { version = "=0.40.0" }
+shlex = "=2.0.1"
 flate2 = { version = "=1.1.10" }
 # Zip archives (`ruk archive --format=zip`): writer only (stored + deflate
 # through the already-pinned flate2); none of the aes/bzip2/lzma/ppmd/zstd

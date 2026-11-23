@@ -29,6 +29,7 @@ use std::io::{Read, Write};
 
 use ruk_core::change::PlanId;
 use ruk_core::ids::{HashKind, Oid};
+use ruk_core::protocol::PushSshIdentity;
 use ruk_core::store::types::ObjectKind;
 use ruk_core::store::{EventContext, EventSource, FactExpectation, FactMutation, FactTable, Store};
 
@@ -151,8 +152,17 @@ fn scrub_plan_remote(remote: &[u8]) -> Vec<u8> {
     super::credentials::scrub_userinfo_bytes(remote)
 }
 
-fn destination_is_known(remote: &[u8], resolved: bool) -> bool {
+fn destination_is_known(
+    remote: &[u8],
+    resolved: bool,
+    ssh_identity: Option<&PushSshIdentity>,
+) -> bool {
+    #[cfg(not(unix))]
+    let _ = resolved;
     let Ok(remote) = std::str::from_utf8(remote) else {
+        if ssh_identity.is_some() {
+            return false;
+        }
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt as _;
@@ -163,21 +173,28 @@ fn destination_is_known(remote: &[u8], resolved: bool) -> bool {
         return false;
     };
     match super::net::parse_endpoint(remote) {
-        Ok(super::net::Endpoint::Local { path }) => path.is_absolute(),
-        Ok(super::net::Endpoint::Ssh { user, .. }) => resolved || user.is_some(),
-        Ok(super::net::Endpoint::Http { .. } | super::net::Endpoint::Git { .. }) => true,
+        Ok(super::net::Endpoint::Local { path }) => ssh_identity.is_none() && path.is_absolute(),
+        Ok(super::net::Endpoint::Ssh { .. }) => {
+            ssh_identity.is_some()
+                && super::net::restore_push_destination(remote, ssh_identity).is_ok()
+        }
+        Ok(super::net::Endpoint::Http { .. } | super::net::Endpoint::Git { .. }) => {
+            ssh_identity.is_none()
+        }
         Err(_) => false,
     }
 }
 
 /// A durable push plan: state machine plus its `push_plans` row codec.
 ///
-/// Row layout, version 2: `02 | state:u8 | hash:u8 | atomic:u8 | resolved:u8 |
+/// Row layout, version 3: `03 | state:u8 | hash:u8 | atomic:u8 | resolved:u8 |
 /// remote_len:u32 | remote | update_count:u32 | updates |
-/// outcome_count:u32 | outcomes | reported_count:u32 | reported_updates`, where an update is
+/// outcome_count:u32 | outcomes | reported_count:u32 | reported_updates | ssh_identity`,
+/// where SSH identity is `00` or `01 | port:u16 | user_len:u32 | user` and an update is
 /// `name_len:u32 | name | old_oid | new_oid` and an outcome is
 /// `name_len:u32 | name | ok:u8 | reason_len:u32 | reason`.
 /// Version 1 omits destination provenance and reported updates.
+/// Versions 1 and 2 omit the frozen SSH identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PushPlanRecord {
     /// Plan identity; the `push_plans` key is these 16 bytes.
@@ -186,6 +203,8 @@ pub struct PushPlanRecord {
     pub remote: Vec<u8>,
     /// Whether the caller supplied a resolved destination rather than a remote alias.
     pub remote_is_resolved: bool,
+    /// Effective SSH user and port captured before transmission.
+    pub ssh_identity: Option<PushSshIdentity>,
     /// Whether the push is all-or-nothing.
     pub atomic: bool,
     /// Current state.
@@ -207,6 +226,7 @@ impl PushPlanRecord {
             id,
             remote: scrub_plan_remote(&remote),
             remote_is_resolved: true,
+            ssh_identity: None,
             atomic,
             state: PushState::Prepared,
             updates,
@@ -218,7 +238,11 @@ impl PushPlanRecord {
     /// Whether the stored destination identifies the original target without config lookup.
     #[must_use]
     pub fn destination_is_known(&self) -> bool {
-        destination_is_known(&self.remote, self.remote_is_resolved)
+        destination_is_known(
+            &self.remote,
+            self.remote_is_resolved,
+            self.ssh_identity.as_ref(),
+        )
     }
 
     /// Binds an ambiguous legacy plan to its historical resolved destination.
@@ -226,20 +250,34 @@ impl PushPlanRecord {
     ///
     /// # Errors
     /// [`GitError::Invalid`] for a known plan or an unresolved destination.
-    pub fn bind_original_remote(&mut self, remote: Vec<u8>) -> Result<(), GitError> {
+    pub fn bind_original_remote(
+        &mut self,
+        remote: Vec<u8>,
+        ssh_identity: Option<PushSshIdentity>,
+    ) -> Result<(), GitError> {
         if self.destination_is_known() {
             return Err(GitError::Invalid {
                 detail: "a known push destination cannot be rebound".to_owned(),
             });
         }
         let remote = scrub_plan_remote(&remote);
-        if !destination_is_known(&remote, true) {
+        let ssh_identity = match ssh_identity {
+            Some(identity) => Some(identity),
+            None => std::str::from_utf8(&remote)
+                .ok()
+                .and_then(|remote| super::net::parse_endpoint(remote).ok())
+                .map(|endpoint| super::net::explicit_identity(&endpoint))
+                .transpose()?
+                .flatten(),
+        };
+        if !destination_is_known(&remote, true, ssh_identity.as_ref()) {
             return Err(GitError::Invalid {
-                detail: "original push destination must be resolved".to_owned(),
+                detail: "original push destination must be resolved; SSH recovery requires its historical user and port".to_owned(),
             });
         }
         self.remote = remote;
         self.remote_is_resolved = true;
+        self.ssh_identity = ssh_identity;
         Ok(())
     }
 
@@ -324,14 +362,20 @@ impl PushPlanRecord {
     /// Encodes the row value.
     ///
     /// # Errors
-    /// [`GitError::Limit`] past the control bound.
+    /// [`GitError::Limit`] past the control bound or [`GitError::Invalid`]
+    /// when the frozen SSH identity disagrees with its destination.
     pub fn encode(&self, kind: HashKind) -> Result<Vec<u8>, GitError> {
+        if self.ssh_identity.is_some() && !self.destination_is_known() {
+            return Err(GitError::Invalid {
+                detail: "frozen SSH identity disagrees with the push destination".to_owned(),
+            });
+        }
         let hash_tag = match kind {
             HashKind::Sha1 => 1u8,
             HashKind::Sha256 => 2u8,
         };
         let mut out = vec![
-            2,
+            3,
             self.state.tag(),
             hash_tag,
             u8::from(self.atomic),
@@ -354,6 +398,14 @@ impl PushPlanRecord {
             }
         }
         push_updates(&mut out, &self.reported_updates)?;
+        match &self.ssh_identity {
+            Some(identity) => {
+                out.push(1);
+                out.extend_from_slice(&identity.port.get().to_le_bytes());
+                push_bytes(&mut out, identity.user.as_bytes())?;
+            }
+            None => out.push(0),
+        }
         Ok(out)
     }
 
@@ -369,10 +421,10 @@ impl PushPlanRecord {
         let [version, state, hash_tag, atomic, rest @ ..] = bytes else {
             return Err(corrupt("truncated header"));
         };
-        if !matches!(*version, 1 | 2) {
+        if !matches!(*version, 1..=3) {
             return Err(corrupt("unknown version"));
         }
-        let (remote_is_resolved, rest) = if *version == 2 {
+        let (remote_is_resolved, rest) = if *version >= 2 {
             match rest.split_first() {
                 Some((&value, rest)) if value <= 1 => (value == 1, rest),
                 _ => return Err(corrupt("invalid destination provenance")),
@@ -395,10 +447,40 @@ impl PushPlanRecord {
         let (updates, rest) =
             take_updates(rest, hash).ok_or_else(|| corrupt("truncated updates"))?;
         let (outcomes, rest) = take_outcomes(rest).ok_or_else(|| corrupt("truncated outcomes"))?;
-        let (reported_updates, rest) = if *version == 2 {
+        let (reported_updates, rest) = if *version >= 2 {
             take_updates(rest, hash).ok_or_else(|| corrupt("truncated reported updates"))?
         } else {
             (Vec::new(), rest)
+        };
+        let (ssh_identity, rest) = if *version == 3 {
+            let (present, rest) = rest
+                .split_first()
+                .ok_or_else(|| corrupt("missing SSH identity"))?;
+            match *present {
+                0 => (None, rest),
+                1 => {
+                    let port = u16::from_le_bytes(
+                        *rest
+                            .first_chunk::<2>()
+                            .ok_or_else(|| corrupt("truncated SSH port"))?,
+                    );
+                    let port = std::num::NonZeroU16::new(port)
+                        .ok_or_else(|| corrupt("invalid SSH port"))?;
+                    let (user, rest) =
+                        take_bytes(&rest[2..]).ok_or_else(|| corrupt("truncated SSH user"))?;
+                    let user = std::str::from_utf8(user)
+                        .map_err(|_| corrupt("invalid SSH user"))?
+                        .to_owned();
+                    let identity = PushSshIdentity { user, port };
+                    if !destination_is_known(remote, remote_is_resolved, Some(&identity)) {
+                        return Err(corrupt("SSH identity disagrees with destination"));
+                    }
+                    (Some(identity), rest)
+                }
+                _ => return Err(corrupt("invalid SSH identity tag")),
+            }
+        } else {
+            (None, rest)
         };
         for update in &reported_updates {
             ruk_core::refdata::RefName::new(update.name.clone())
@@ -411,6 +493,7 @@ impl PushPlanRecord {
             id,
             remote: scrub_plan_remote(remote),
             remote_is_resolved,
+            ssh_identity,
             atomic: *atomic != 0,
             state,
             updates,
@@ -1680,6 +1763,7 @@ mod tests {
             id,
             remote: b"https://ada:CANARY-s3cret@host.x/r.git".to_vec(),
             remote_is_resolved: false,
+            ssh_identity: None,
             atomic: false,
             state: PushState::Rejected,
             updates: Vec::new(),
@@ -2045,8 +2129,8 @@ mod tests {
             ("origin", false),
             ("relative/repo.git", false),
             ("ssh://host.x/repo.git", false),
-            ("ssh://alice@host.x/repo.git", true),
-            ("alice@host.x:repo.git", true),
+            ("ssh://alice@host.x/repo.git", false),
+            ("alice@host.x:repo.git", false),
             ("https://host.x/repo.git", true),
             ("git://host.x/repo.git", true),
             (absolute, true),
@@ -2063,22 +2147,22 @@ mod tests {
             assert!(decoded.reported_updates.is_empty());
             assert_eq!(decoded.destination_is_known(), known, "{remote}");
             let original = decoded.clone();
-            let destination = b"ssh://host.x/historical.git".to_vec();
+            let destination = b"ssh://alice@host.x:2222/historical.git".to_vec();
             if known {
                 assert!(matches!(
-                    decoded.bind_original_remote(destination),
+                    decoded.bind_original_remote(destination, None),
                     Err(GitError::Invalid { .. })
                 ));
                 assert_eq!(decoded, original);
             } else {
                 assert!(
                     decoded
-                        .bind_original_remote(b"changed-origin".to_vec())
+                        .bind_original_remote(b"changed-origin".to_vec(), None)
                         .is_err()
                 );
                 assert_eq!(decoded, original);
                 decoded
-                    .bind_original_remote(destination.clone())
+                    .bind_original_remote(destination.clone(), None)
                     .expect("explicit original binds");
                 assert_eq!(decoded.remote, destination);
                 assert!(decoded.remote_is_resolved);
@@ -2092,9 +2176,112 @@ mod tests {
                 );
                 assert!(
                     decoded
-                        .bind_original_remote(b"https://elsewhere/repo.git".to_vec())
+                        .bind_original_remote(b"https://elsewhere/repo.git".to_vec(), None)
                         .is_err()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn frozen_ssh_identity_survives_rows_without_reinterpreting_legacy_config() {
+        let remote = b"alice@host.x:relative/repo.git";
+        let identity = PushSshIdentity {
+            user: "alice".to_owned(),
+            port: std::num::NonZeroU16::new(2222).expect("port"),
+        };
+        let mut plan = PushPlanRecord::prepare(
+            PlanId::generate(),
+            remote.to_vec(),
+            false,
+            vec![update(b"refs/heads/main", A, B)],
+        );
+        assert!(!plan.destination_is_known());
+        plan.ssh_identity = Some(identity.clone());
+        plan.begin_send().expect("sending");
+        plan.mark_uncertain();
+        assert!(plan.destination_is_known());
+        let bytes = plan.encode(HashKind::Sha1).expect("version 3 row");
+        assert_eq!(bytes[0], 3);
+        let restored = PushPlanRecord::decode(plan.id, HashKind::Sha1, &bytes).expect("restored");
+        assert_eq!(restored, plan);
+        assert_eq!(restored.remote, remote);
+        assert!(restored.destination_is_known());
+        let mut legacy = bytes[..bytes.len() - identity.user.len() - 7].to_vec();
+        legacy[0] = 2;
+        let mut legacy = PushPlanRecord::decode(plan.id, HashKind::Sha1, &legacy)
+            .expect("version 2 row stays readable");
+        assert!(legacy.remote_is_resolved);
+        assert_eq!(legacy.ssh_identity, None);
+        assert!(!legacy.destination_is_known());
+        assert!(legacy.bind_original_remote(remote.to_vec(), None).is_err());
+        assert_eq!(legacy.ssh_identity, None);
+        legacy
+            .bind_original_remote(remote.to_vec(), Some(identity.clone()))
+            .expect("operator provides the historical SSH settings");
+        assert_eq!(legacy.remote, remote);
+        assert_eq!(legacy.ssh_identity, Some(identity));
+        assert!(legacy.destination_is_known());
+    }
+
+    #[test]
+    fn legacy_ssh_binding_rejects_conflicting_identity_without_mutation() {
+        let mut plan = PushPlanRecord::prepare(
+            PlanId::generate(),
+            b"origin".to_vec(),
+            false,
+            vec![update(b"refs/heads/main", A, B)],
+        );
+        let before = plan.clone();
+        let identity = PushSshIdentity {
+            user: "alice".to_owned(),
+            port: std::num::NonZeroU16::new(2222).expect("port"),
+        };
+        for remote in [
+            b"ssh://alice@host.x:22/repo.git".as_slice(),
+            b"ssh://bob@host.x:2222/repo.git".as_slice(),
+            b"https://host.x/repo.git".as_slice(),
+        ] {
+            assert!(
+                plan.bind_original_remote(remote.to_vec(), Some(identity.clone()))
+                    .is_err()
+            );
+            assert_eq!(plan, before);
+        }
+    }
+
+    #[test]
+    fn frozen_ssh_rows_reject_invalid_identity_fields() {
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            let mut plan = PushPlanRecord::prepare(
+                PlanId::generate(),
+                b"ssh://alice@host.x:22/repo.git".to_vec(),
+                false,
+                Vec::new(),
+            );
+            plan.ssh_identity = Some(PushSshIdentity {
+                user: "alice".to_owned(),
+                port: std::num::NonZeroU16::new(22).expect("port"),
+            });
+            let encoded = plan.encode(kind).expect("valid frozen row");
+            let identity_offset = encoded.len() - 12;
+            for end in identity_offset..encoded.len() {
+                assert!(PushPlanRecord::decode(plan.id, kind, &encoded[..end]).is_err());
+            }
+            let mut bad_tag = encoded.clone();
+            bad_tag[identity_offset] = 2;
+            assert!(PushPlanRecord::decode(plan.id, kind, &bad_tag).is_err());
+            let mut bad_port = encoded;
+            bad_port[identity_offset + 1..identity_offset + 3].fill(0);
+            assert!(PushPlanRecord::decode(plan.id, kind, &bad_port).is_err());
+            for user in [
+                String::new(),
+                "bob".to_owned(),
+                "alice\0".to_owned(),
+                "a".repeat(1025),
+            ] {
+                plan.ssh_identity.as_mut().expect("identity").user = user;
+                assert!(matches!(plan.encode(kind), Err(GitError::Invalid { .. })));
             }
         }
     }

@@ -318,6 +318,7 @@ async fn legacy_reconcile_requires_an_original_destination() {
             .push_guard_check(
                 &fixture.path,
                 b"https://original.example/repo.git",
+                None,
                 std::slice::from_ref(&plan.updates[0].name),
             )
             .expect_err("wildcard remains")
@@ -441,8 +442,9 @@ async fn legacy_local_reconcile_observes_only_the_authenticated_store() {
             reply.observations.items[1].observed,
             Some(plan.reported_updates[0].new)
         );
-        let stored = PushPlanRecord::decode(plan.id, HashKind::Sha256, &fixture.plan_bytes(plan.id))
-            .expect("bound local plan decodes");
+        let stored =
+            PushPlanRecord::decode(plan.id, HashKind::Sha256, &fixture.plan_bytes(plan.id))
+                .expect("bound local plan decodes");
         assert_eq!(stored.remote, remote.as_bytes());
         assert!(stored.destination_is_known());
         assert_eq!(fixture.marker(plan.id), Some(vec![0x01]));
@@ -453,6 +455,7 @@ async fn legacy_local_reconcile_observes_only_the_authenticated_store() {
                 .push_guard_check(
                     &fixture.path,
                     b"https://unrelated.example/repo.git",
+                    None,
                     std::slice::from_ref(&update.name),
                 )
                 .expect("completed local recovery releases its wildcard owner");
@@ -507,6 +510,7 @@ async fn legacy_local_reconcile_refuses_other_stores_and_path_escapes() {
                 .push_guard_check(
                     &fixture.path,
                     b"https://unrelated.example/repo.git",
+                    None,
                     std::slice::from_ref(&plan.updates[0].name),
                 )
                 .expect_err("failed local recovery retains the wildcard")
@@ -547,6 +551,7 @@ async fn legacy_local_reconcile_refuses_replaced_store_identity() {
             .push_guard_check(
                 &fixture.path,
                 b"https://unrelated.example/repo.git",
+                None,
                 std::slice::from_ref(&plan.updates[0].name),
             )
             .expect_err("replaced store identity retains the wildcard")
@@ -632,6 +637,7 @@ async fn legacy_reconcile_receipt_replays_without_releasing_unknown_guard() {
             .push_guard_check(
                 &fixture.path,
                 b"https://unrelated.example/repo.git",
+                None,
                 std::slice::from_ref(&plan.updates[0].name),
             )
             .expect_err("receipt replay cannot prove the missing destination")
@@ -689,6 +695,7 @@ async fn legacy_reconcile_binds_and_observes_reported_refs() {
             .push_guard_check(
                 &fixture.path,
                 remote.as_bytes(),
+                None,
                 std::slice::from_ref(&update.name),
             )
             .expect("observed requested and reported refs release their owner");
@@ -738,6 +745,7 @@ async fn legacy_reconcile_writer_race_preserves_guard_and_marker() {
                 .push_guard_check(
                     &fixture.path,
                     remote.as_bytes(),
+                    None,
                     std::slice::from_ref(&update.name)
                 )
                 .expect_err("failed publication retains every wildcard guard")
@@ -768,7 +776,7 @@ async fn legacy_reconcile_after_lost_completion_releases_committed_binding() {
         let request_id = RequestId::generate();
         let mut bound = plan.clone();
         bound
-            .bind_original_remote(remote.as_bytes().to_vec())
+            .bind_original_remote(remote.as_bytes().to_vec(), None)
             .expect("explicit legacy binding");
         let observed = vec![
             AdvertisedLocalRef {
@@ -833,6 +841,7 @@ async fn legacy_reconcile_after_lost_completion_releases_committed_binding() {
                 .push_guard_check(
                     &fixture.path,
                     remote.as_bytes(),
+                    None,
                     std::slice::from_ref(&plan.updates[0].name)
                 )
                 .expect_err("in-memory wildcard still awaits completion")
@@ -875,6 +884,7 @@ async fn legacy_reconcile_after_lost_completion_releases_committed_binding() {
                 .push_guard_check(
                     &fixture.path,
                     remote.as_bytes(),
+                    None,
                     std::slice::from_ref(&update.name),
                 )
                 .expect("receipt replay releases each committed wildcard owner");
@@ -908,20 +918,24 @@ fn large_recovery_plan() -> PushPlanRecord {
 async fn large_reconciliation_pages_survive_restart_and_release_only_at_completion() {
     let plan = large_recovery_plan();
     let fixture = RecoveryFixture::new(&plan).await;
-    fixture.coordinator.store().publish(
-        Vec::new(),
-        &[reconciliation_marker_fact(fixture.coordinator.store(), plan.id)
-            .expect("legacy marker")],
-        EventSource::LocalPush,
-        &EventContext::default(),
-    ).expect("legacy completion predates known destination");
+    fixture
+        .coordinator
+        .store()
+        .publish(
+            Vec::new(),
+            &[
+                reconciliation_marker_fact(fixture.coordinator.store(), plan.id)
+                    .expect("legacy marker"),
+            ],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("legacy completion predates known destination");
     assert!(fixture.marker(plan.id).is_some());
     let (remote, peer) = discovery_peer(advertisement(&plan), || {});
     let first_request = RequestId::generate();
     let open = fixture.invocation(plan.id, first_request, Some(&remote));
-    let first = reconcile_reply(
-        &fixture.job().reconcile(&open).await.expect("first page"),
-    );
+    let first = reconcile_reply(&fixture.job().reconcile(&open).await.expect("first page"));
     peer.join().expect("the only network observation completes");
     assert!(first.rewritten);
     assert_eq!(first.observations.total, 1002);
@@ -932,7 +946,11 @@ async fn large_reconciliation_pages_survive_restart_and_release_only_at_completi
     assert_eq!(cursor.page, 1);
     assert!(fixture.marker(plan.id).is_none());
     let replay = reconcile_reply(
-        &fixture.job().reconcile(&open).await.expect("first-page receipt replay"),
+        &fixture
+            .job()
+            .reconcile(&open)
+            .await
+            .expect("first-page receipt replay"),
     );
     assert!(replay.outcome.receipt.replayed);
     assert_eq!(replay.next, first.next);
@@ -942,17 +960,15 @@ async fn large_reconciliation_pages_survive_restart_and_release_only_at_completi
         .push_guard_check(
             &fixture.path,
             remote.as_bytes(),
+            None,
             std::slice::from_ref(&plan.updates[0].name),
         )
         .expect_err("partial replay must retain the guard");
 
     let fixture = fixture.restart().await;
     assert_ne!(fixture.session, cursor.session);
-    let bound = PushPlanRecord::decode(
-        plan.id,
-        HashKind::Sha256,
-        &fixture.plan_bytes(plan.id),
-    ).expect("bound plan survives restart");
+    let bound = PushPlanRecord::decode(plan.id, HashKind::Sha256, &fixture.plan_bytes(plan.id))
+        .expect("bound plan survives restart");
     let Principal::Unix(uid) = &fixture.principal else {
         panic!("Unix fixture has a Unix principal");
     };
@@ -965,18 +981,20 @@ async fn large_reconciliation_pages_survive_restart_and_release_only_at_completi
         &fixture.refs,
         &fixture.cancel,
     );
-    let err = reconcile_pages::next(
-        &other_job,
-        &bound,
-        cursor,
-        RequestId::generate(),
-    ).err().expect("another principal cannot consume this snapshot");
+    let err = reconcile_pages::next(&other_job, &bound, cursor, RequestId::generate())
+        .err()
+        .expect("another principal cannot consume this snapshot");
     assert_eq!(err.code, ErrorCode::EForbidden);
     let mut skipped = cursor;
     skipped.page += 1;
     let invalid = fixture.page_invocation(plan.id, RequestId::generate(), skipped);
     assert_eq!(
-        fixture.job().reconcile(&invalid).await.expect_err("skipped page").code,
+        fixture
+            .job()
+            .reconcile(&invalid)
+            .await
+            .expect_err("skipped page")
+            .code,
         ErrorCode::EStale
     );
     assert!(fixture.marker(plan.id).is_none());
@@ -986,6 +1004,7 @@ async fn large_reconciliation_pages_survive_restart_and_release_only_at_completi
         .push_guard_check(
             &fixture.path,
             remote.as_bytes(),
+            None,
             std::slice::from_ref(&plan.reported_updates[500].name),
         )
         .expect_err("restart retains reported-target guards");
@@ -993,20 +1012,40 @@ async fn large_reconciliation_pages_survive_restart_and_release_only_at_completi
     let last_request = RequestId::generate();
     let last_open = fixture.page_invocation(plan.id, last_request, cursor);
     let last = reconcile_reply(
-        &fixture.job().reconcile(&last_open).await.expect("durable second page"),
+        &fixture
+            .job()
+            .reconcile(&last_open)
+            .await
+            .expect("durable second page"),
     );
     assert!(last.next.is_none());
     assert_eq!(last.observations.total, 1002);
     assert_eq!(last.reported_observations.total, 501);
     assert_eq!(last.observations.items.len(), 2);
     assert_eq!(last.reported_observations.items.len(), 501);
-    let observations: Vec<_> = first.observations.items.into_iter()
+    let observations: Vec<_> = first
+        .observations
+        .items
+        .into_iter()
         .chain(last.observations.items)
         .collect();
     assert_eq!(observations.len(), 1002);
-    assert!(observations[..501].iter().all(|row| row.verdict == ReconcileVerdict::EqualOld));
-    assert!(observations[501..].iter().all(|row| row.verdict == ReconcileVerdict::EqualNew));
-    for (row, update) in last.reported_observations.items.iter().zip(&plan.reported_updates) {
+    assert!(
+        observations[..501]
+            .iter()
+            .all(|row| row.verdict == ReconcileVerdict::EqualOld)
+    );
+    assert!(
+        observations[501..]
+            .iter()
+            .all(|row| row.verdict == ReconcileVerdict::EqualNew)
+    );
+    for (row, update) in last
+        .reported_observations
+        .items
+        .iter()
+        .zip(&plan.reported_updates)
+    {
         assert_eq!(row.remote_ref.as_bytes(), update.name);
         assert_eq!(row.old, None);
         assert_eq!(row.new, Some(update.new));
@@ -1015,14 +1054,23 @@ async fn large_reconciliation_pages_survive_restart_and_release_only_at_completi
     }
     assert_eq!(fixture.marker(plan.id), Some(vec![0x01]));
     for update in plan.updates.iter().chain(&plan.reported_updates) {
-        fixture.refs.registry.push_guard_check(
-            &fixture.path,
-            remote.as_bytes(),
-            std::slice::from_ref(&update.name),
-        ).expect("only completed snapshot releases every observed target");
+        fixture
+            .refs
+            .registry
+            .push_guard_check(
+                &fixture.path,
+                remote.as_bytes(),
+                None,
+                std::slice::from_ref(&update.name),
+            )
+            .expect("only completed snapshot releases every observed target");
     }
     let replay = reconcile_reply(
-        &fixture.job().reconcile(&last_open).await.expect("last-page receipt replay"),
+        &fixture
+            .job()
+            .reconcile(&last_open)
+            .await
+            .expect("last-page receipt replay"),
     );
     assert!(replay.outcome.receipt.replayed);
     assert!(replay.next.is_none());
@@ -1035,35 +1083,49 @@ async fn paged_reconciliation_rejects_a_changed_plan_without_releasing_guards() 
     let fixture = RecoveryFixture::new(&plan).await;
     let (remote, peer) = discovery_peer(advertisement(&plan), || {});
     let open = fixture.invocation(plan.id, RequestId::generate(), Some(&remote));
-    let first = reconcile_reply(
-        &fixture.job().reconcile(&open).await.expect("first page"),
-    );
+    let first = reconcile_reply(&fixture.job().reconcile(&open).await.expect("first page"));
     peer.join().expect("discovery completes");
     let before = fixture.plan_bytes(plan.id);
-    let mut changed = PushPlanRecord::decode(plan.id, HashKind::Sha256, &before)
-        .expect("bound plan");
+    let mut changed =
+        PushPlanRecord::decode(plan.id, HashKind::Sha256, &before).expect("bound plan");
     changed.atomic = !changed.atomic;
-    fixture.coordinator.store().publish(
-        Vec::new(),
-        &[changed.persist_mutation(HashKind::Sha256, Some(before)).expect("plan change")],
-        EventSource::LocalPush,
-        &EventContext::default(),
-    ).expect("concurrent plan mutation");
+    fixture
+        .coordinator
+        .store()
+        .publish(
+            Vec::new(),
+            &[changed
+                .persist_mutation(HashKind::Sha256, Some(before))
+                .expect("plan change")],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("concurrent plan mutation");
     let open = fixture.page_invocation(
         plan.id,
         RequestId::generate(),
         first.next.expect("continuation"),
     );
     assert_eq!(
-        fixture.job().reconcile(&open).await.expect_err("stale snapshot").code,
+        fixture
+            .job()
+            .reconcile(&open)
+            .await
+            .expect_err("stale snapshot")
+            .code,
         ErrorCode::EStale
     );
     assert!(fixture.marker(plan.id).is_none());
-    fixture.refs.registry.push_guard_check(
-        &fixture.path,
-        remote.as_bytes(),
-        std::slice::from_ref(&plan.updates[0].name),
-    ).expect_err("changed plan must remain guarded");
+    fixture
+        .refs
+        .registry
+        .push_guard_check(
+            &fixture.path,
+            remote.as_bytes(),
+            None,
+            std::slice::from_ref(&plan.updates[0].name),
+        )
+        .expect_err("changed plan must remain guarded");
     fixture.finish().await;
 }
 
@@ -1080,8 +1142,8 @@ fn same_ref_rewrites_keep_both_requested_and_reported_comparisons() {
         name: plan.updates[0].name.clone(),
         target: RefTarget::Direct(replacement),
     }];
-    let requested = map_observations(HashKind::Sha256, &plan, &advertised)
-        .expect("requested comparisons");
+    let requested =
+        map_observations(HashKind::Sha256, &plan, &advertised).expect("requested comparisons");
     let reported = map_reported_observations(HashKind::Sha256, &plan, &advertised)
         .expect("reported comparisons");
     assert_eq!(requested.len(), 1);

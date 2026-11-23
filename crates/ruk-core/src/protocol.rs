@@ -3361,10 +3361,14 @@ impl Validate for PushReconcileArgs {
     fn validate(&self) -> Result<(), CoreError> {
         if let Some(cursor) = self.cursor {
             if cursor.page == 0 {
-                return Err(invalid("a reconciliation continuation starts after page zero"));
+                return Err(invalid(
+                    "a reconciliation continuation starts after page zero",
+                ));
             }
             if self.original_remote.is_some() || self.original_ssh.is_some() {
-                return Err(invalid("a reconciliation continuation cannot bind a destination"));
+                return Err(invalid(
+                    "a reconciliation continuation cannot bind a destination",
+                ));
             }
         }
         if let Some(identity) = &self.original_ssh {
@@ -3375,7 +3379,9 @@ impl Validate for PushReconcileArgs {
                 || identity.user.len() > 1024
                 || identity.user.bytes().any(|byte| byte.is_ascii_control())
             {
-                return Err(invalid("SSH user must contain 1..=1024 bytes without controls"));
+                return Err(invalid(
+                    "SSH user must contain 1..=1024 bytes without controls",
+                ));
             }
         }
         Ok(())
@@ -6427,8 +6433,7 @@ mod tests {
         let mut other_page = continuation.clone();
         other_page.cursor.as_mut().expect("cursor").page = 2;
         let mut other_session = continuation.clone();
-        other_session.cursor.as_mut().expect("cursor").session =
-            SessionId::from_bytes([9; 16]);
+        other_session.cursor.as_mut().expect("cursor").session = SessionId::from_bytes([9; 16]);
         let mut other_request = continuation.clone();
         other_request.cursor.as_mut().expect("cursor").request = request_id(3);
         let mut digests = HashSet::new();
@@ -6449,7 +6454,10 @@ mod tests {
                 .digest_input_v1()
                 .expect("request digest")
                 .expect("mutation digest");
-            assert!(digests.insert(digest), "each recovery scope has its own digest");
+            assert!(
+                digests.insert(digest),
+                "each recovery scope has its own digest"
+            );
         }
     }
 
@@ -6466,11 +6474,18 @@ mod tests {
             original_ssh: Some(identity.clone()),
             cursor: None,
         };
-        historical.validate().expect("explicit historical SSH identity");
+        historical
+            .validate()
+            .expect("explicit historical SSH identity");
         let mut max_user = historical.clone();
         max_user.original_ssh.as_mut().expect("identity").user = "u".repeat(1024);
         max_user.validate().expect("maximum user length");
-        for user in [String::new(), "u\n".to_owned(), "u\u{7f}".to_owned(), "u".repeat(1025)] {
+        for user in [
+            String::new(),
+            "u\n".to_owned(),
+            "u\u{7f}".to_owned(),
+            "u".repeat(1025),
+        ] {
             let mut args = historical.clone();
             args.original_ssh.as_mut().expect("identity").user = user;
             assert_eq!(
@@ -6509,7 +6524,9 @@ mod tests {
         let mut zero = continuation.clone();
         zero.cursor.as_mut().expect("cursor").page = 0;
         assert_eq!(
-            zero.validate().expect_err("page zero is not a continuation").code,
+            zero.validate()
+                .expect_err("page zero is not a continuation")
+                .code,
             ErrorCode::EInvalid
         );
         for (remote, ssh) in [
@@ -6569,7 +6586,11 @@ mod tests {
             .expect("required recovery fields");
         assert!(required.iter().any(|field| field.as_str() == Some("plan")));
         for optional in ["original_remote", "original_ssh", "cursor"] {
-            assert!(!required.iter().any(|field| field.as_str() == Some(optional)));
+            assert!(
+                !required
+                    .iter()
+                    .any(|field| field.as_str() == Some(optional))
+            );
         }
     }
 

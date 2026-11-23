@@ -1508,9 +1508,7 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             outcomes.extend(early);
             push_outcomes(outcomes)
         }
-        Target::Net { endpoint, url } => {
-            push_net(ctx, &endpoint, &url, &spec_texts, &flags, &remote_label)
-        }
+        Target::Net { url, .. } => push_net(ctx, &url, &spec_texts, &flags, &remote_label),
     }
 }
 
@@ -1626,7 +1624,6 @@ fn push_local(
 /// Oracle: `git/builtin/push.c`.
 fn push_net(
     ctx: &mut Ctx,
-    endpoint: &Endpoint,
     url: &str,
     spec_texts: &[String],
     flags: &PushFlags,
@@ -1634,6 +1631,8 @@ fn push_net(
 ) -> Result<Vec<u8>, GitError> {
     let kind = ctx.kind()?;
     let tls_roots = tls_roots_for(ctx)?;
+    let destination = net::freeze_push_destination(url, &ctx.egress, &flags.interrupt)?;
+    let endpoint = &destination.endpoint;
     // Discovery plus the update list under one scoped store borrow, so the
     // LFS upload below can reborrow `ctx` mutably for stderr.
     let (updates, early, http_adv) = {
@@ -1747,6 +1746,7 @@ fn push_net(
         flags.atomic,
         updates,
     );
+    plan.ssh_identity = destination.ssh_identity;
     let mut outcomes = match &http_adv {
         Some((base, adv, extra_headers)) => ruk_git::transport::smart_http::push_pack(
             base,

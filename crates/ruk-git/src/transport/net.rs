@@ -20,6 +20,11 @@
 //! `GIT_SSH_COMMAND`/`GIT_SSH`), `git/Documentation/gitprotocol-pack.txt`
 //! (git:// request shape), `git/builtin/ls-remote.c` (discovery).
 
+mod ssh_identity;
+
+pub(crate) use ssh_identity::explicit_identity;
+pub use ssh_identity::{FrozenPushDestination, freeze_push_destination, restore_push_destination};
+
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
@@ -501,6 +506,14 @@ fn ssh_invocation(
     ssh_command: Option<&str>,
 ) -> SshInvocation {
     let remote = remote_command(dial.service, dial.path);
+    if dial.pinned_ip.is_some()
+        && let Some(command) = ssh_command.filter(|command| !command.is_empty())
+        && let Ok(mut argv) = ssh_identity::pinned_openssh_command(dial, command)
+    {
+        argv.push(dial.login.clone());
+        argv.push(remote);
+        return SshInvocation::Exec(argv);
+    }
     match ssh_command {
         Some(command) if !command.is_empty() => {
             let mut line = command.to_owned();
@@ -1034,12 +1047,20 @@ pub fn open_stream(
             user,
             path,
         } => {
+            let ssh_program = std::env::var("GIT_SSH").unwrap_or_else(|_| "ssh".to_owned());
+            let ssh_command = std::env::var("GIT_SSH_COMMAND").ok();
+            if matches!(service, Service::ReceivePack) {
+                let variant = std::env::var("GIT_SSH_VARIANT").ok();
+                ssh_identity::check_push_client(
+                    &ssh_program,
+                    ssh_command.as_deref(),
+                    variant.as_deref(),
+                )?;
+            }
             let effective = port.unwrap_or(22);
             let label = format!("ssh://{host}:{effective}");
             let resolved = resolve_addrs(&label, host, effective)?;
             let allowed = policy.filter_addrs(&label, &resolved)?;
-            let ssh_program = std::env::var("GIT_SSH").unwrap_or_else(|_| "ssh".to_owned());
-            let ssh_command = std::env::var("GIT_SSH_COMMAND").ok();
             let deadline = Instant::now() + Duration::from_secs(30);
             Ok(Stream::Ssh(ssh_dial_each(&label, &allowed, |addr| {
                 interrupt.check("connecting to the remote")?;
@@ -1554,10 +1575,19 @@ mod tests {
                 "ssh",
                 Some("ssh -i key"),
             ),
-            SshInvocation::Shell(
-                "ssh -i key -o 'HostKeyAlias=example.com' -o 'Hostname=93.184.216.34' 'git@example.com' 'git-receive-pack '\\''a.git'\\'''"
-                    .to_owned()
-            )
+            SshInvocation::Exec(vec![
+                "ssh".to_owned(),
+                "-l".to_owned(),
+                "git".to_owned(),
+                "-o".to_owned(),
+                "HostKeyAlias=example.com".to_owned(),
+                "-o".to_owned(),
+                "Hostname=93.184.216.34".to_owned(),
+                "-i".to_owned(),
+                "key".to_owned(),
+                "git@example.com".to_owned(),
+                "git-receive-pack 'a.git'".to_owned(),
+            ])
         );
     }
 
@@ -1760,13 +1790,19 @@ mod tests {
         )
         .expect("pinned dial v6");
         assert_eq!(dial_v6.login, "forge.example");
-        let invocation_shell = ssh_invocation(&dial_v6, "ssh", Some("ssh -v"));
+        let invocation = ssh_invocation(&dial_v6, "ssh", Some("ssh -v"));
         assert_eq!(
-            invocation_shell,
-            SshInvocation::Shell(
-                "ssh -v -o 'HostKeyAlias=forge.example' -o 'Hostname=2001:db8::1' 'forge.example' 'git-receive-pack '\\''/org/repo.git'\\'''"
-                    .to_owned()
-            )
+            invocation,
+            SshInvocation::Exec(vec![
+                "ssh".to_owned(),
+                "-o".to_owned(),
+                "HostKeyAlias=forge.example".to_owned(),
+                "-o".to_owned(),
+                "Hostname=2001:db8::1".to_owned(),
+                "-v".to_owned(),
+                "forge.example".to_owned(),
+                "git-receive-pack '/org/repo.git'".to_owned(),
+            ])
         );
     }
 

@@ -23,8 +23,8 @@
 //! `E_PUSH_UNCERTAIN` until that plan confirms, rejects, or a reconcile
 //! observes the remote: the observation is the operator looking before
 //! retrying, so it clears the block and a fresh plan may proceed. The block
-//! lives in the [`Registry`], covering every connection of the daemon
-//! process but not a restart.
+//! lives in the [`Registry`], covering every connection of the daemon.
+//! The registry restores the block from durable plans after a restart.
 //!
 //! No wall-clock deadline rides the job interrupt: mirror syncs may run
 //! long, and a fixed horizon would kill legitimate transfers. Lease and
@@ -197,16 +197,6 @@ impl<'a> PushJob<'a> {
         let url = push_url(&args.args.remote)?;
         let bridge = CancelBridge::arm(self.cancel, open, self.refs.registry.egress_policy());
         refuse_url_userinfo(url, &bridge.auth).map_err(to_core)?;
-        let ref_names: Vec<Vec<u8>> = args
-            .args
-            .updates
-            .iter()
-            .map(|update| update.remote_ref.as_bytes().to_vec())
-            .collect();
-        self.refs
-            .registry
-            .push_guard_check(self.repo_path, url.as_bytes(), &ref_names)?;
-
         // Discovery plus translation runs on the bulkhead: store reads and
         // network I/O never block the lane. Each phase arms its own
         // watcher, so cancellation trips the flag exactly while that
@@ -327,8 +317,11 @@ impl<'a> PushJob<'a> {
                 }
                 (true, Some(remote)) => {
                     refuse_url_userinfo(remote, &bridge.auth).map_err(to_core)?;
-                    plan.bind_original_remote(remote.as_bytes().to_vec())
-                        .map_err(to_core)?;
+                    plan.bind_original_remote(
+                        remote.as_bytes().to_vec(),
+                        args.args.original_ssh.clone(),
+                    )
+                    .map_err(to_core)?;
                     remote.as_bytes().to_vec()
                 }
                 (false, None) => plan.remote.clone(),
@@ -341,27 +334,21 @@ impl<'a> PushJob<'a> {
                 .refs
                 .transport
                 .run(move || {
-                    let advertised = job.discover_for_reconcile(&remote, &bridge)?;
+                    let advertised =
+                        job.discover_for_reconcile(&remote, plan.ssh_identity.as_ref(), &bridge)?;
                     let observations = map_observations(kind, &plan, &advertised)?;
                     let reported = map_reported_observations(kind, &plan, &advertised)?;
                     Ok::<_, CoreError>((observations, reported, plan))
                 })
                 .await??;
             plan = observed_plan;
-            reconcile_pages::first(
-                &self,
-                &plan,
-                observations,
-                reported,
-                request_id,
-                rebound,
-            )?
+            reconcile_pages::first(&self, &plan, observations, reported, request_id, rebound)?
         };
-        let reconcile_pages::PreparedPage {
-            reply,
-            mut facts,
-        } = prepared;
-        facts.push(plan.persist_mutation(kind, Some(encoded)).map_err(to_core)?);
+        let reconcile_pages::PreparedPage { reply, mut facts } = prepared;
+        facts.push(
+            plan.persist_mutation(kind, Some(encoded))
+                .map_err(to_core)?,
+        );
         let stored = self
             .coordinator
             .submit_prepared(
@@ -397,9 +384,13 @@ impl<'a> PushJob<'a> {
             .chain(&plan.reported_updates)
             .map(|update| update.name.clone())
             .collect();
-        self.refs
-            .registry
-            .note_push_reconciled(self.repo_path, &plan.remote, plan.id, &names)?;
+        self.refs.registry.note_push_reconciled(
+            self.repo_path,
+            &plan.remote,
+            plan.ssh_identity.as_ref(),
+            plan.id,
+            &names,
+        )?;
         self.refs
             .registry
             .note_legacy_push_reconciled(self.repo_path, plan.id, &names)
@@ -492,7 +483,19 @@ impl BlockingJob {
         atomicity: PushAtomicity,
         bridge: &CancelBridge,
     ) -> Result<TranslatedPush, CoreError> {
-        let advertised = self.discover(url, bridge)?;
+        let destination = net::freeze_push_destination(url, &bridge.egress, &bridge.interrupt)
+            .map_err(to_core)?;
+        let ref_names: Vec<Vec<u8>> = updates
+            .iter()
+            .map(|update| update.remote_ref.as_bytes().to_vec())
+            .collect();
+        self.registry.push_guard_check(
+            &self.repo,
+            url.as_bytes(),
+            destination.ssh_identity.as_ref(),
+            &ref_names,
+        )?;
+        let advertised = self.discover(&destination.endpoint, bridge)?;
         let atomic = matches!(atomicity, PushAtomicity::Atomic);
         let mut translated = Vec::with_capacity(updates.len());
         let mut early = Vec::new();
@@ -516,6 +519,7 @@ impl BlockingJob {
             atomic,
             translated.clone(),
         );
+        plan.ssh_identity = destination.ssh_identity;
         if atomic && !early.is_empty() {
             // Withhold the whole batch without sending: the plan records
             // the sibling refusals locally and reaches `Rejected`.
@@ -539,7 +543,7 @@ impl BlockingJob {
                 http: None,
             });
         }
-        let http = match net::parse_endpoint(url).map_err(to_core)? {
+        let http = match destination.endpoint {
             Endpoint::Http { .. } => Some(self.http_adv(url, bridge)?),
             _ => None,
         };
@@ -558,12 +562,12 @@ impl BlockingJob {
     /// Advertised refs of one remote, in the local rows the verbs map.
     fn discover(
         &self,
-        url: &str,
+        endpoint: &Endpoint,
         bridge: &CancelBridge,
     ) -> Result<Vec<AdvertisedLocalRef>, CoreError> {
-        discover_advertised(
+        discover_endpoint_advertised(
             self.coordinator.store(),
-            url,
+            endpoint,
             &bridge.auth,
             &bridge.egress,
             &bridge.interrupt,
@@ -574,12 +578,13 @@ impl BlockingJob {
     fn discover_for_reconcile(
         &self,
         remote: &[u8],
+        ssh_identity: Option<&ruk_core::protocol::PushSshIdentity>,
         bridge: &CancelBridge,
     ) -> Result<Vec<AdvertisedLocalRef>, CoreError> {
         let path = match std::str::from_utf8(remote) {
-            Ok(url) => match net::parse_endpoint(url).map_err(to_core)? {
+            Ok(url) => match net::restore_push_destination(url, ssh_identity).map_err(to_core)? {
                 Endpoint::Local { path } => path,
-                _ => return self.discover(url, bridge),
+                endpoint => return self.discover(&endpoint, bridge),
             },
             Err(_) => {
                 #[cfg(unix)]
@@ -686,7 +691,9 @@ impl BlockingJob {
             )
             .map_err(to_core),
             None => {
-                let endpoint = net::parse_endpoint(&plan_remote(&plan)?).map_err(to_core)?;
+                let endpoint =
+                    net::restore_push_destination(&plan_remote(&plan)?, plan.ssh_identity.as_ref())
+                        .map_err(to_core)?;
                 let stream = net::open_stream(
                     &endpoint,
                     Service::ReceivePack,
@@ -755,6 +762,7 @@ impl BlockingJob {
         self.registry.note_push_terminal(
             &self.repo,
             &plan.remote,
+            plan.ssh_identity.as_ref(),
             plan_id,
             &names,
             state == PushState::Uncertain,
@@ -913,15 +921,26 @@ pub(crate) fn discover_advertised(
     interrupt: &Interrupt,
     service: Service,
 ) -> Result<Vec<AdvertisedLocalRef>, CoreError> {
-    let kind = store.hash_kind();
     let endpoint = net::parse_endpoint(url).map_err(to_core)?;
+    discover_endpoint_advertised(store, &endpoint, auth, egress, interrupt, service)
+}
+
+fn discover_endpoint_advertised(
+    store: &Store,
+    endpoint: &Endpoint,
+    auth: &AuthPolicy,
+    egress: &EgressPolicy,
+    interrupt: &Interrupt,
+    service: Service,
+) -> Result<Vec<AdvertisedLocalRef>, CoreError> {
+    let kind = store.hash_kind();
     if matches!(endpoint, Endpoint::Local { .. }) {
         return Err(CoreError::new(
             ErrorCode::EInvalid,
             "daemon jobs serve network remotes; local paths stay out",
         ));
     }
-    match &endpoint {
+    match endpoint {
         Endpoint::Http { url: http_url, .. } => {
             let base = smart_http::normalize_base(http_url).map_err(to_core)?;
             let adv = smart_http::discover(
@@ -945,7 +964,7 @@ pub(crate) fn discover_advertised(
         }
         _ => {
             let refs = net::discover_endpoint(
-                &endpoint,
+                endpoint,
                 service,
                 kind,
                 smart_http::RpcCall {
@@ -1790,14 +1809,21 @@ mod tests {
         let name = b"refs/heads/main".to_vec();
         let remote = b"https://mirror.example/repo.git";
         registry
-            .push_guard_check(&root, remote, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, None, std::slice::from_ref(&name))
             .expect("clean ref passes");
         let blocking = PlanId::generate();
         registry
-            .note_push_terminal(&root, remote, blocking, std::slice::from_ref(&name), true)
+            .note_push_terminal(
+                &root,
+                remote,
+                None,
+                blocking,
+                std::slice::from_ref(&name),
+                true,
+            )
             .expect("uncertain records");
         let err = registry
-            .push_guard_check(&root, remote, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, None, std::slice::from_ref(&name))
             .expect_err("uncertain blocks");
         assert_eq!(err.code, ErrorCode::EPushUncertain);
         assert!(err.to_string().contains(&blocking.to_string()));
@@ -1812,19 +1838,33 @@ mod tests {
         assert_eq!(refs.items[0].remote_ref.as_bytes(), name);
         assert_eq!(refs.items[0].status, PushRefStatus::Uncertain);
         registry
-            .note_push_terminal(&root, remote, blocking, std::slice::from_ref(&name), false)
+            .note_push_terminal(
+                &root,
+                remote,
+                None,
+                blocking,
+                std::slice::from_ref(&name),
+                false,
+            )
             .expect("confirmed clears");
         registry
-            .push_guard_check(&root, remote, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, None, std::slice::from_ref(&name))
             .expect("confirmed passes");
         registry
-            .note_push_terminal(&root, remote, blocking, std::slice::from_ref(&name), true)
+            .note_push_terminal(
+                &root,
+                remote,
+                None,
+                blocking,
+                std::slice::from_ref(&name),
+                true,
+            )
             .expect("uncertain records again");
         registry
-            .note_push_reconciled(&root, remote, blocking, std::slice::from_ref(&name))
+            .note_push_reconciled(&root, remote, None, blocking, std::slice::from_ref(&name))
             .expect("reconcile clears");
         registry
-            .push_guard_check(&root, remote, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, None, std::slice::from_ref(&name))
             .expect("reconciled passes");
     }
 
@@ -1921,24 +1961,38 @@ mod tests {
         let first = PlanId::generate();
         let second = PlanId::generate();
         registry
-            .note_push_terminal(&root, remote, first, std::slice::from_ref(&name), true)
+            .note_push_terminal(
+                &root,
+                remote,
+                None,
+                first,
+                std::slice::from_ref(&name),
+                true,
+            )
             .expect("first plan blocks");
         registry
-            .note_push_terminal(&root, remote, second, std::slice::from_ref(&name), true)
+            .note_push_terminal(
+                &root,
+                remote,
+                None,
+                second,
+                std::slice::from_ref(&name),
+                true,
+            )
             .expect("second plan takes the block");
         registry
-            .note_push_reconciled(&root, remote, first, std::slice::from_ref(&name))
+            .note_push_reconciled(&root, remote, None, first, std::slice::from_ref(&name))
             .expect("other plan's reconcile runs");
         let err = registry
-            .push_guard_check(&root, remote, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, None, std::slice::from_ref(&name))
             .expect_err("other plan's reconcile keeps the block");
         assert_eq!(err.code, ErrorCode::EPushUncertain);
         assert!(err.to_string().contains(&second.to_string()));
         registry
-            .note_push_reconciled(&root, remote, second, std::slice::from_ref(&name))
+            .note_push_reconciled(&root, remote, None, second, std::slice::from_ref(&name))
             .expect("owning plan's reconcile runs");
         registry
-            .push_guard_check(&root, remote, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, None, std::slice::from_ref(&name))
             .expect("owning plan's reconcile clears");
     }
 

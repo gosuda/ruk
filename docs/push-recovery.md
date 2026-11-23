@@ -21,9 +21,9 @@ ref names, observed OIDs, and verdicts before you create another push.
 ## Plans from older versions
 
 Some older plans contain a remote name such as `origin` instead of its
-resolved URL. Other older plans lost an explicit SSH username. These
-records cannot identify the original destination. Ruk conservatively
-blocks their affected refs across destinations.
+resolved URL. Older SSH plans did not save the effective user and port.
+These records cannot identify the original destination. Ruk blocks their
+affected refs across destinations until the original target is recovered.
 
 Recover the destination from the original operation's trusted records.
 Do not assume that the current remote configuration has the same value.
@@ -42,6 +42,30 @@ server applies its normal authentication and destination policies. It
 observes the destination, then commits the bound plan and reconciliation
 record together. Only then does it release that plan's legacy guard.
 Other unresolved plans keep their guards.
+
+For an SSH destination with an omitted user or port, supply the historical
+settings in `original_ssh`. Keep the original path spelling. A relative
+SCP path and an absolute SSH URL path can name different repositories:
+
+```json
+{
+  "plan":"00000000-0000-4000-8000-000000000001",
+  "original_remote":"mirror.example:relative/repo.git",
+  "original_ssh":{"user":"alice","port":2222}
+}
+```
+
+Current SSH configuration cannot establish the historical settings.
+`original_ssh` must agree with any user or port written in the destination.
+It is accepted only with `original_remote` for an unknown destination.
+New SSH plans save the effective user and port before discovery and use
+those same settings for transmission and recovery. A later SSH
+configuration change cannot redirect the saved plan to another identity.
+
+SSH pushes require a direct OpenSSH command. Arguments such as `-F` and
+`-i` remain supported. Shell expansions and custom SSH clients are
+refused before a push plan is created because they can override the
+saved destination. Recovery applies the same check before discovery.
 
 `original_remote` is accepted only when the saved destination is unknown.
 It cannot change the destination of a plan that already identifies one.
@@ -64,8 +88,6 @@ request and leaves the push uncertain. Reconciliation observes both the
 requested and reported refs. A reply with `rewritten: true` requires a
 decision about the reported result before another send. Reconciliation
 does not turn that result into confirmation of the original request.
-
-
 ## Large recovery results
 
 A response contains at most 1,000 observations across `observations` and
