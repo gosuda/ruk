@@ -413,7 +413,12 @@ fn parse_url(url: &str) -> Result<Url, GitError> {
             return Err(invalid("bad port"));
         }
         let port = port_text.parse::<u16>().map_err(|_| invalid("bad port"))?;
-        (host.to_owned(), port, hostport.to_owned(), host.parse().ok())
+        (
+            host.to_owned(),
+            port,
+            hostport.to_owned(),
+            host.parse().ok(),
+        )
     } else {
         (
             hostport.to_owned(),
