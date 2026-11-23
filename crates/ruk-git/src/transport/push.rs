@@ -1407,7 +1407,7 @@ mod tests {
             "ssh://al%69ce:CANARY-s3cret@[2001:db8::1]:2222/~git/r.git",
             "ssh://alice:CANARY-s3cret@host.x/a%2Fb%252Fc.git?literal#path",
             "alice@host.x:relative/repo.git",
-            "alice@[2001:db8::1]:/absolute/repo.git",
+            "alice@host.x:/absolute/repo.git",
         ] {
             let expected = parse_endpoint(remote).expect("SSH endpoint parses");
             let plan = PushPlanRecord::prepare(
@@ -1437,8 +1437,8 @@ mod tests {
             let mut legacy = plan.clone();
             legacy.remote = remote.as_bytes().to_vec();
             let dirty = legacy.encode(HashKind::Sha1).expect("legacy plan encodes");
-            let decoded =
-                PushPlanRecord::decode(plan.id, HashKind::Sha1, &dirty).expect("legacy plan decodes");
+            let decoded = PushPlanRecord::decode(plan.id, HashKind::Sha1, &dirty)
+                .expect("legacy plan decodes");
             assert_eq!(decoded, plan, "legacy SSH identity survives decoding");
         }
         assert_eq!(scrub_plan_remote(b"UPPER:repo.git"), b"UPPER:repo.git");

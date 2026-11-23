@@ -358,9 +358,12 @@ impl<'a> PushJob<'a> {
                 self.cancel,
             )
             .await?;
-        self.refs
-            .registry
-            .note_push_reconciled(self.repo_path, &remote, plan_id, &observed_refs)?;
+        self.refs.registry.note_push_reconciled(
+            self.repo_path,
+            &remote,
+            plan_id,
+            &observed_refs,
+        )?;
         encode_reply(Some(request_id), stored)
     }
 

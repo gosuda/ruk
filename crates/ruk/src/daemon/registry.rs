@@ -131,10 +131,12 @@ fn push_destination(remote: &[u8]) -> Result<Oid, CoreError> {
         .map_err(|_| CoreError::new(ErrorCode::EInvalid, "push destination is invalid"))?;
     let (transport, host, port, user, path) = match endpoint {
         net::Endpoint::Http { secure, url } => {
-            let base = smart_http::normalize_base(&url)
-                .map_err(|_| CoreError::new(ErrorCode::EInvalid, "HTTP push destination is invalid"))?;
-            let authority = http::url_authority(&base)
-                .map_err(|_| CoreError::new(ErrorCode::EInvalid, "HTTP push authority is invalid"))?;
+            let base = smart_http::normalize_base(&url).map_err(|_| {
+                CoreError::new(ErrorCode::EInvalid, "HTTP push destination is invalid")
+            })?;
+            let authority = http::url_authority(&base).map_err(|_| {
+                CoreError::new(ErrorCode::EInvalid, "HTTP push authority is invalid")
+            })?;
             let (host, port) = authority
                 .rsplit_once(':')
                 .expect("HTTP authority includes its numeric port");
@@ -169,8 +171,9 @@ fn push_destination(remote: &[u8]) -> Result<Oid, CoreError> {
             path.into_bytes(),
         ),
         net::Endpoint::Local { path } => {
-            let path = std::path::absolute(path)
-                .map_err(|_| CoreError::new(ErrorCode::EIo, "push destination path is unavailable"))?;
+            let path = std::path::absolute(path).map_err(|_| {
+                CoreError::new(ErrorCode::EIo, "push destination path is unavailable")
+            })?;
             let bytes = path.as_os_str().as_encoded_bytes().to_vec();
             (0, String::new(), 0, String::new(), bytes)
         }
