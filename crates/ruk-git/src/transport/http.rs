@@ -1199,11 +1199,11 @@ impl ChunkedBody {
                     buffer.clear();
                 }
             }
-            let mut chunks = rest.chunks_exact(CHUNK_WINDOW);
-            for chunk in &mut chunks {
+            let (chunks, remainder) = rest.as_chunks::<CHUNK_WINDOW>();
+            for chunk in chunks {
                 write_chunk(stream, chunk)?;
             }
-            buffer.extend_from_slice(chunks.remainder());
+            buffer.extend_from_slice(remainder);
             Ok(())
         })?;
         Ok(input.len())
