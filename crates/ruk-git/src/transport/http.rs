@@ -1153,13 +1153,17 @@ pub fn post_open(
 /// own chunk, so a multi-gigabyte pack never sits in one buffer.
 pub struct ChunkedUpload {
     stream: Stream,
-    buf: Vec<u8>,
+    body: ChunkedBody,
 }
 
 impl std::fmt::Debug for ChunkedUpload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let buffered_bytes = match &self.body {
+            ChunkedBody::Open(buffer) => buffer.len(),
+            ChunkedBody::Failed(_) => 0,
+        };
         f.debug_struct("ChunkedUpload")
-            .field("buffered_bytes", &self.buf.len())
+            .field("buffered_bytes", &buffered_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -1168,15 +1172,76 @@ impl std::fmt::Debug for ChunkedUpload {
 /// overhead negligible, small enough to bound memory.
 const CHUNK_WINDOW: usize = 65536;
 
-impl ChunkedUpload {
-    fn emit(&mut self, chunk: &[u8]) -> std::io::Result<()> {
-        self.stream
-            .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())?;
-        self.stream.write_all(chunk)?;
-        self.stream.write_all(b"\r\n")?;
-        Ok(())
+enum ChunkedBody {
+    Open(Vec<u8>),
+    Failed(std::io::Error),
+}
+
+impl ChunkedBody {
+    fn run(
+        &mut self,
+        operation: impl FnOnce(&mut Vec<u8>) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let result = match self {
+            Self::Open(buffer) => operation(buffer),
+            Self::Failed(error) => {
+                return Err(std::io::Error::new(error.kind(), error.to_string()));
+            }
+        };
+        if let Err(error) = &result {
+            *self = Self::Failed(std::io::Error::new(error.kind(), error.to_string()));
+        }
+        result
     }
 
+    fn write(&mut self, stream: &mut impl Write, input: &[u8]) -> std::io::Result<usize> {
+        self.run(|buffer| {
+            let mut rest = input;
+            if !buffer.is_empty() {
+                let count = rest.len().min(CHUNK_WINDOW - buffer.len());
+                buffer.extend_from_slice(&rest[..count]);
+                rest = &rest[count..];
+                if buffer.len() == CHUNK_WINDOW {
+                    write_chunk(stream, buffer)?;
+                    buffer.clear();
+                }
+            }
+            let mut chunks = rest.chunks_exact(CHUNK_WINDOW);
+            for chunk in &mut chunks {
+                write_chunk(stream, chunk)?;
+            }
+            buffer.extend_from_slice(chunks.remainder());
+            Ok(())
+        })?;
+        Ok(input.len())
+    }
+
+    fn flush(&mut self, stream: &mut impl Write) -> std::io::Result<()> {
+        self.run(|buffer| {
+            if !buffer.is_empty() {
+                write_chunk(stream, buffer)?;
+                buffer.clear();
+            }
+            stream.flush()
+        })
+    }
+
+    fn finish(&mut self, stream: &mut impl Write) -> std::io::Result<()> {
+        self.flush(stream)?;
+        self.run(|_| {
+            stream.write_all(b"0\r\n\r\n")?;
+            stream.flush()
+        })
+    }
+}
+
+fn write_chunk(stream: &mut impl Write, chunk: &[u8]) -> std::io::Result<()> {
+    write!(stream, "{:x}\r\n", chunk.len())?;
+    stream.write_all(chunk)?;
+    stream.write_all(b"\r\n")
+}
+
+impl ChunkedUpload {
     /// Abandons the body after a write failure and reads whatever status
     /// the server already sent: an early refusal (auth, moved, missing)
     /// reports honestly instead of surfacing as a broken pipe. Used only
@@ -1204,14 +1269,8 @@ impl ChunkedUpload {
     /// # Errors
     /// Routing, framing, and transport failures as [`GitError`].
     pub fn finish(self) -> Result<OpenResponse, GitError> {
-        use std::io::Write as _;
         let mut this = self;
-        let closed = (|| -> std::io::Result<()> {
-            this.flush()?;
-            this.stream.write_all(b"0\r\n\r\n")?;
-            this.stream.flush()?;
-            Ok(())
-        })();
+        let closed = this.body.finish(&mut this.stream);
         let mut reader = BufReader::new(this.stream);
         let head = read_head(&mut reader);
         let (status, headers) = match (closed, head) {
@@ -1236,20 +1295,11 @@ impl ChunkedUpload {
 
 impl std::io::Write for ChunkedUpload {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buf.extend_from_slice(buf);
-        while self.buf.len() >= CHUNK_WINDOW {
-            let chunk: Vec<u8> = self.buf.drain(..CHUNK_WINDOW).collect();
-            self.emit(&chunk)?;
-        }
-        Ok(buf.len())
+        self.body.write(&mut self.stream, buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        if !self.buf.is_empty() {
-            let chunk = std::mem::take(&mut self.buf);
-            self.emit(&chunk)?;
-        }
-        self.stream.flush()
+        self.body.flush(&mut self.stream)
     }
 }
 
@@ -1273,7 +1323,7 @@ pub fn post_open_chunked(
     send_chunked_head(&mut stream, "POST", &parsed, headers)?;
     Ok(ChunkedUpload {
         stream,
-        buf: Vec::new(),
+        body: ChunkedBody::Open(Vec::with_capacity(CHUNK_WINDOW)),
     })
 }
 
@@ -2406,11 +2456,92 @@ mod tests {
     }
 
     #[test]
-    fn chunked_refusal_without_drain_still_reports_status() {
-        // The server answers 403 from the head alone and hangs up without
-        // consuming the body: the client must surface the refusal, not a
-        // broken pipe, no matter how much body was already buffered.
-        let (port, server) = fake_server(vec![(403, vec![], b"no".to_vec())]);
+    fn chunked_body_stops_after_write_or_flush_failure() {
+        struct RecoveringWriter {
+            fail_write: bool,
+            fail_flush: bool,
+            writes: usize,
+            flushes: usize,
+        }
+
+        impl Write for RecoveringWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                if std::mem::take(&mut self.fail_write) {
+                    return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                }
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                if std::mem::take(&mut self.fail_flush) {
+                    return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                }
+                Ok(())
+            }
+        }
+
+        for (fail_write, size) in [(true, CHUNK_WINDOW), (true, 7), (false, 7)] {
+            let mut writer = RecoveringWriter {
+                fail_write,
+                fail_flush: !fail_write,
+                writes: 0,
+                flushes: 0,
+            };
+            let mut body = ChunkedBody::Open(Vec::with_capacity(CHUNK_WINDOW));
+            let result = body
+                .write(&mut writer, &vec![b'x'; size])
+                .and_then(|_| body.flush(&mut writer));
+            assert_eq!(
+                result.expect_err("first operation fails").kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+            let calls = (writer.writes, writer.flushes);
+            assert!(body.write(&mut writer, b"more").is_err());
+            assert!(body.flush(&mut writer).is_err());
+            assert!(body.finish(&mut writer).is_err());
+            assert_eq!((writer.writes, writer.flushes), calls);
+        }
+    }
+
+    #[test]
+    fn chunked_body_bounds_buffer_for_large_writes() {
+        let mut body = ChunkedBody::Open(Vec::with_capacity(CHUNK_WINDOW));
+        let mut writer = std::io::sink();
+        body.write(&mut writer, b"prefix").expect("prefix");
+        body.write(&mut writer, &vec![b'x'; 5 << 20])
+            .expect("large write");
+        let ChunkedBody::Open(buffer) = body else {
+            panic!("successful upload remains open");
+        };
+        assert_eq!(buffer, b"xxxxxx");
+        assert_eq!(buffer.capacity(), CHUNK_WINDOW);
+    }
+
+    fn failed_chunked_upload(
+        status: u16,
+    ) -> (
+        ChunkedUpload,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback");
+        let port = listener.local_addr().expect("addr").port();
+        let (release, hold) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            read_request(&socket);
+            let reply = format!(
+                "HTTP/1.1 {status} Reply\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno"
+            );
+            socket.write_all(reply.as_bytes()).expect("reply");
+            hold.recv_timeout(Duration::from_secs(10))
+                .expect("client read the response");
+        });
         let mut upload = post_open_chunked(
             &format!("http://127.0.0.1:{port}/up"),
             &[("Content-Type", "application/x-git-test")],
@@ -2418,18 +2549,34 @@ mod tests {
             None,
         )
         .expect("chunked open");
-        {
-            use std::io::Write as _;
-            upload.write_all(&vec![b'x'; 5 << 20]).unwrap_or_default();
-        }
+        let Stream::Plain(socket) = &upload.stream else {
+            panic!("loopback uses plain HTTP");
+        };
+        socket
+            .shutdown(std::net::Shutdown::Write)
+            .expect("close upload direction");
+        assert!(upload.write_all(&vec![b'x'; 5 << 20]).is_err());
+        (upload, release, server)
+    }
+
+    #[test]
+    fn chunked_refusal_without_drain_still_reports_status() {
+        let (upload, release, server) = failed_chunked_upload(403);
         let (mut reader, status, _) = upload.finish().expect("refusal reports");
         assert_eq!(status, 403);
         let mut body = Vec::new();
-        {
-            use std::io::Read as _;
-            reader.read_to_end(&mut body).expect("refusal body");
-        }
+        reader.read_to_end(&mut body).expect("refusal body");
         assert_eq!(body, b"no");
+        drop(reader);
+        release.send(()).expect("release server");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn chunked_failed_upload_never_reports_success() {
+        let (upload, release, server) = failed_chunked_upload(200);
+        assert!(matches!(upload.finish(), Err(GitError::Io { .. })));
+        release.send(()).expect("release server");
         server.join().expect("server");
     }
 
@@ -2501,7 +2648,7 @@ mod tests {
         )
         .expect("chunked open");
         let payload = b"hello world".to_vec();
-        let big = vec![b'x'; 70000];
+        let big = vec![b'x'; (5 << 20) + 37];
         {
             use std::io::Write as _;
             upload.write_all(&payload).expect("first write");
