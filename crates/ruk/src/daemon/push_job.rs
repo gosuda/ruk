@@ -1584,6 +1584,42 @@ mod tests {
     }
 
     #[test]
+    fn map_observations_absent_create_keeps_reported_ref() {
+        let kind = HashKind::Sha256;
+        let new = oid_fill(2);
+        let mut plan = PushPlanRecord::prepare(
+            PlanId::generate(),
+            b"https://mirror.example/r.git".to_vec(),
+            false,
+            vec![PushUpdate {
+                name: b"refs/for/main".to_vec(),
+                old: kind.zero_oid(),
+                new,
+            }],
+        );
+        plan.reported_updates.push(PushUpdate {
+            name: b"refs/changes/7/head".to_vec(),
+            old: kind.zero_oid(),
+            new,
+        });
+        let advertised = [AdvertisedLocalRef {
+            name: plan.reported_updates[0].name.clone(),
+            target: RefTarget::Direct(new),
+        }];
+        let observations = map_observations(kind, &plan, &advertised).expect("maps");
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].remote_ref.as_bytes(), plan.updates[0].name);
+        assert_eq!(observations[0].verdict, ReconcileVerdict::EqualOld);
+        assert_eq!(observations[0].observed, None);
+        assert_eq!(
+            observations[1].remote_ref.as_bytes(),
+            plan.reported_updates[0].name
+        );
+        assert_eq!(observations[1].verdict, ReconcileVerdict::EqualNew);
+        assert_eq!(observations[1].observed, Some(new));
+    }
+
+    #[test]
     fn map_observations_malformed_plan_ref_fails_corrupt() {
         let kind = HashKind::Sha256;
         let plan = PushPlanRecord::prepare(

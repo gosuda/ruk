@@ -560,6 +560,7 @@ pub fn reconcile(
             } else {
                 match at {
                     Some(oid) if oid == update.new => RefObservation::EqualNew,
+                    None if update.old == zero => RefObservation::EqualOld,
                     Some(oid) if oid == update.old => RefObservation::EqualOld,
                     current => RefObservation::Moved { current },
                 }
@@ -2488,6 +2489,45 @@ mod tests {
             peer.written().is_empty(),
             "nothing is sent after a local refusal"
         );
+    }
+
+    #[test]
+    fn reconcile_distinguishes_absent_create_delete_and_update() {
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            let old = Oid::from_bytes(&[1; 32][..kind.oid_len()]).expect("old tip");
+            let new = Oid::from_bytes(&[2; 32][..kind.oid_len()]).expect("new tip");
+            let zero = kind.zero_oid();
+            let plan = PushPlanRecord::prepare(
+                PlanId::generate(),
+                b"https://host.x/repo.git".to_vec(),
+                false,
+                vec![
+                    PushUpdate {
+                        name: b"refs/heads/create".to_vec(),
+                        old: zero,
+                        new,
+                    },
+                    PushUpdate {
+                        name: b"refs/heads/delete".to_vec(),
+                        old,
+                        new: zero,
+                    },
+                    PushUpdate {
+                        name: b"refs/heads/update".to_vec(),
+                        old,
+                        new,
+                    },
+                ],
+            );
+            let reconciled = reconcile(&plan, kind, &[]);
+            assert_eq!(reconciled.len(), 3);
+            assert_eq!(reconciled[0].observation, RefObservation::EqualOld);
+            assert_eq!(reconciled[1].observation, RefObservation::EqualNew);
+            assert_eq!(
+                reconciled[2].observation,
+                RefObservation::Moved { current: None }
+            );
+        }
     }
 
     #[test]
