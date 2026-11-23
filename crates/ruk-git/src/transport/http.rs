@@ -719,26 +719,11 @@ fn send_request(
 /// # Errors
 /// [`GitError::Invalid`] for a malformed status line, [`GitError::Limit`]
 /// past [`MAX_HEADER_BYTES`].
-fn read_head(reader: &mut BufReader<Stream>) -> Result<(u16, Vec<(String, String)>), GitError> {
+fn read_head(reader: &mut impl BufRead) -> Result<(u16, Vec<(String, String)>), GitError> {
     let mut head = Vec::new();
     loop {
-        let mut line = Vec::new();
-        reader
-            .read_until(b'\n', &mut line)
-            .map_err(|err| GitError::Io {
-                detail: format!("cannot read response head: {err}"),
-            })?;
-        if line.is_empty() {
-            return Err(GitError::Io {
-                detail: "response ended mid-head".to_owned(),
-            });
-        }
+        let line = read_http_line(reader, MAX_HEADER_BYTES - head.len())?;
         head.extend_from_slice(&line);
-        if head.len() > MAX_HEADER_BYTES {
-            return Err(GitError::Limit {
-                detail: "response head exceeds 64 KiB".to_owned(),
-            });
-        }
         if head.ends_with(b"\r\n\r\n") || head.ends_with(b"\n\n") {
             break;
         }
@@ -816,23 +801,34 @@ fn read_sized(
 ///
 /// # Errors
 /// [`GitError::Io`] on EOF or read failure.
-fn read_line(reader: &mut BufReader<Stream>) -> Result<Vec<u8>, GitError> {
-    let mut line = Vec::new();
-    reader
-        .read_until(b'\n', &mut line)
-        .map_err(|err| GitError::Io {
-            detail: format!("cannot read chunk line: {err}"),
-        })?;
-    if line.is_empty() {
-        return Err(GitError::Io {
-            detail: "chunked body ended mid-stream".to_owned(),
+fn read_line(reader: &mut impl BufRead, limit: usize) -> Result<Vec<u8>, GitError> {
+    let mut line = read_http_line(reader, limit)?;
+    if !line.ends_with(b"\r\n") {
+        return Err(GitError::Invalid {
+            detail: "chunk line misses its trailing CRLF".to_owned(),
         });
     }
-    while line
-        .last()
-        .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
-    {
-        line.pop();
+    line.truncate(line.len() - 2);
+    Ok(line)
+}
+
+fn read_http_line(reader: &mut impl BufRead, limit: usize) -> Result<Vec<u8>, GitError> {
+    let mut line = Vec::new();
+    reader
+        .take(limit as u64 + 1)
+        .read_until(b'\n', &mut line)
+        .map_err(|err| GitError::Io {
+            detail: format!("cannot read response line: {err}"),
+        })?;
+    if line.len() > limit {
+        return Err(GitError::Limit {
+            detail: format!("response line exceeds its {limit}-byte budget"),
+        });
+    }
+    if !line.ends_with(b"\n") {
+        return Err(GitError::Io {
+            detail: "response ended before a line terminator".to_owned(),
+        });
     }
     Ok(line)
 }
@@ -851,14 +847,10 @@ fn read_chunked(
 ) -> Result<(), GitError> {
     let mut total: u64 = 0;
     loop {
-        let line = read_line(reader)?;
-        let size_text = line
-            .iter()
-            .take_while(|byte| **byte != b';')
-            .copied()
-            .collect::<Vec<u8>>();
+        let line = read_line(reader, MAX_HEADER_BYTES)?;
+        let size_end = line.iter().position(|byte| *byte == b';').unwrap_or(line.len());
         let size = u64::from_str_radix(
-            std::str::from_utf8(&size_text).map_err(|_| GitError::Invalid {
+            std::str::from_utf8(&line[..size_end]).map_err(|_| GitError::Invalid {
                 detail: "chunk size is not UTF-8".to_owned(),
             })?,
             16,
@@ -867,9 +859,11 @@ fn read_chunked(
             detail: "bad chunk size".to_owned(),
         })?;
         if size == 0 {
-            // Trailers end at the first blank line.
+            let mut trailer_bytes = 0;
             loop {
-                if read_line(reader)?.is_empty() {
+                let line = read_line(reader, MAX_HEADER_BYTES - trailer_bytes)?;
+                trailer_bytes += line.len() + 2;
+                if line.is_empty() {
                     return Ok(());
                 }
             }
@@ -883,8 +877,7 @@ fn read_chunked(
             });
         }
         read_sized(reader, size, sink, None)?;
-        // Every chunk closes with its own CRLF.
-        let crlf = read_line(reader)?;
+        let crlf = read_line(reader, 2)?;
         if !crlf.is_empty() {
             return Err(GitError::Invalid {
                 detail: "chunk misses its trailing CRLF".to_owned(),
@@ -1021,7 +1014,7 @@ enum ChunkState {
     /// Consume the CRLF closing the current chunk.
     DataEnd,
     /// Consume trailers to the blank line.
-    Trailers,
+    Trailers { bytes: usize },
     /// The zero chunk and trailers are past: all reads are EOF.
     Done,
 }
@@ -1078,18 +1071,15 @@ impl Read for HttpBodyReader {
                 match *state {
                     ChunkState::Done => return Ok(0),
                     ChunkState::Size => {
-                        let line = read_line(&mut self.reader).map_err(io_git)?;
-                        let size_text = line
-                            .iter()
-                            .take_while(|byte| **byte != b';')
-                            .copied()
-                            .collect::<Vec<u8>>();
-                        let text = std::str::from_utf8(&size_text)
+                        let line = read_line(&mut self.reader, MAX_HEADER_BYTES).map_err(io_git)?;
+                        let size_end =
+                            line.iter().position(|byte| *byte == b';').unwrap_or(line.len());
+                        let text = std::str::from_utf8(&line[..size_end])
                             .map_err(|_| io_failed("chunk size is not UTF-8"))?;
                         let size = u64::from_str_radix(text, 16)
                             .map_err(|_| io_failed("bad chunk size"))?;
                         *state = if size == 0 {
-                            ChunkState::Trailers
+                            ChunkState::Trailers { bytes: 0 }
                         } else {
                             ChunkState::Data { rest: size }
                         };
@@ -1108,13 +1098,16 @@ impl Read for HttpBodyReader {
                         return Ok(got);
                     }
                     ChunkState::DataEnd => {
-                        if !read_line(&mut self.reader).map_err(io_git)?.is_empty() {
+                        if !read_line(&mut self.reader, 2).map_err(io_git)?.is_empty() {
                             return Err(io_failed("chunk misses its trailing CRLF"));
                         }
                         *state = ChunkState::Size;
                     }
-                    ChunkState::Trailers => {
-                        if read_line(&mut self.reader).map_err(io_git)?.is_empty() {
+                    ChunkState::Trailers { ref mut bytes } => {
+                        let line = read_line(&mut self.reader, MAX_HEADER_BYTES - *bytes)
+                            .map_err(io_git)?;
+                        *bytes += line.len() + 2;
+                        if line.is_empty() {
                             *state = ChunkState::Done;
                         }
                     }
@@ -1945,11 +1938,112 @@ mod tests {
                     .expect("timeout");
                 let (head, _) = read_request(&socket);
                 requests.push(head);
-                socket.write_all(&reply).expect("raw reply");
+                if let Err(error) = socket.write_all(&reply) {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ),
+                        "{error}"
+                    );
+                }
             }
             requests
         });
         (port, server)
+    }
+
+    #[test]
+    fn response_head_stops_at_budget_without_newline() {
+        let mut input = std::io::Cursor::new(vec![b'x'; MAX_HEADER_BYTES * 4]);
+        assert!(matches!(read_head(&mut input), Err(GitError::Limit { .. })));
+        assert_eq!(input.position(), MAX_HEADER_BYTES as u64 + 1);
+    }
+
+    #[test]
+    fn chunk_line_stops_at_budget_without_newline() {
+        let mut input = std::io::Cursor::new(vec![b'1'; MAX_HEADER_BYTES * 4]);
+        assert!(matches!(
+            read_line(&mut input, MAX_HEADER_BYTES),
+            Err(GitError::Limit { .. })
+        ));
+        assert_eq!(input.position(), MAX_HEADER_BYTES as u64 + 1);
+    }
+
+    #[test]
+    fn response_head_budget_counts_all_lines() {
+        let mut response = b"HTTP/1.1 200 OK\r\n".to_vec();
+        for _ in 0..3 {
+            response.extend_from_slice(b"X-Fill: ");
+            response.extend(std::iter::repeat_n(b'x', MAX_HEADER_BYTES / 2));
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"\r\n");
+        let mut input = std::io::Cursor::new(response);
+        assert!(matches!(read_head(&mut input), Err(GitError::Limit { .. })));
+        assert_eq!(input.position(), MAX_HEADER_BYTES as u64 + 1);
+    }
+
+    #[test]
+    fn response_head_accepts_exact_budget_without_consuming_body() {
+        let mut response = b"HTTP/1.1 200 OK\r\nX-Fill: ".to_vec();
+        response.resize(MAX_HEADER_BYTES - 4, b'x');
+        response.extend_from_slice(b"\r\n\r\nbody");
+        let mut input = std::io::Cursor::new(response);
+        let (status, headers) = read_head(&mut input).expect("bounded head");
+        assert_eq!(status, 200);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(input.position(), MAX_HEADER_BYTES as u64);
+    }
+
+    #[test]
+    fn chunked_responses_reject_unbounded_or_truncated_framing() {
+        let mut extension = b"1;".to_vec();
+        extension.extend(std::iter::repeat_n(b'x', MAX_HEADER_BYTES));
+        extension.extend_from_slice(b"\r\nx\r\n0\r\n\r\n");
+        let mut trailers = b"1\r\nx\r\n0\r\n".to_vec();
+        for _ in 0..=MAX_HEADER_BYTES / 6 {
+            trailers.extend_from_slice(b"X: a\r\n");
+        }
+        trailers.extend_from_slice(b"\r\n");
+        let truncated = b"1\r\nx\r\n0\r\n\r".to_vec();
+        for (body, exceeds_limit) in [(extension, true), (trailers, true), (truncated, false)] {
+            let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+            response.extend_from_slice(&body);
+            let (port, server) = fake_raw_server(vec![response.clone(), response]);
+            let url = format!("http://127.0.0.1:{port}/body");
+            let policy = super::super::net::EgressPolicy::deny_private().allow_loopback();
+            let error = get(&url, &[], &policy, None).expect_err("invalid buffered framing");
+            if exceeds_limit {
+                assert!(matches!(error, GitError::Limit { .. }), "{error}");
+            } else {
+                assert!(matches!(error, GitError::Io { .. }), "{error}");
+            }
+            let (mut reader, status, _) =
+                post_open(&url, &[], b"", &policy, None).expect("response head");
+            assert_eq!(status, 200);
+            assert!(reader.read_to_end(&mut Vec::new()).is_err());
+            drop(reader);
+            server.join().expect("server");
+        }
+    }
+
+    #[test]
+    fn chunked_responses_accept_bounded_extensions_and_trailers() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;key=value\r\nx\r\n0\r\nX-Check: yes\r\n\r\n".to_vec();
+        let (port, server) = fake_raw_server(vec![response.clone(), response]);
+        let url = format!("http://127.0.0.1:{port}/body");
+        let policy = super::super::net::EgressPolicy::deny_private().allow_loopback();
+        assert_eq!(get(&url, &[], &policy, None).expect("buffered body").body, b"x");
+        let (mut reader, status, _) =
+            post_open(&url, &[], b"", &policy, None).expect("response head");
+        assert_eq!(status, 200);
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).expect("streamed body");
+        assert_eq!(body, b"x");
+        server.join().expect("server");
     }
 
     #[test]
