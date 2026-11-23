@@ -3688,7 +3688,6 @@ mod tests {
     #[tokio::test]
     async fn parked_poll_releases_its_admission_slot_between_scans() {
         let (_temp, coord, owner) = coordinator_with_limits(one_interactive_slot());
-        let coord = Arc::new(coord);
         let _runner = coord
             .spawn_on(&tokio::runtime::Handle::current())
             .expect("spawn lane");
@@ -3697,22 +3696,21 @@ mod tests {
             .open_session(&owner, &SessionOpenArgs::default(), &cancel)
             .await
             .expect("open session");
-        let poll = tokio::spawn({
-            let coord = Arc::clone(&coord);
-            let owner = owner.clone();
-            let cancel = cancel.clone();
-            async move {
-                coord
-                    .read(
-                        &owner,
-                        session,
-                        Request::EventsTail(Box::new(poll_args(1500))),
-                        &cancel,
-                    )
-                    .await
-            }
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let poll = coord.read(
+            &owner,
+            session,
+            Request::EventsTail(Box::new(poll_args(1500))),
+            &cancel,
+        );
+        tokio::pin!(poll);
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(poll.as_mut(), cx).is_pending(),
+                "the long poll must park before the competing read",
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
         let _listed = refs_list(
             &coord,
             &owner,
@@ -3725,7 +3723,7 @@ mod tests {
             },
         )
         .await;
-        let parked = poll.await.expect("poll joins").expect("poll serves");
+        let parked = poll.await.expect("poll serves");
         assert!(
             matches!(parked, Reply::EventsTail(_)),
             "poll answers its own reply"
@@ -3737,7 +3735,6 @@ mod tests {
     #[tokio::test]
     async fn parked_poll_refuses_a_session_that_lost_authority() {
         let (_temp, coord, owner) = coordinator();
-        let coord = Arc::new(coord);
         let _runner = coord
             .spawn_on(&tokio::runtime::Handle::current())
             .expect("spawn lane");
@@ -3746,27 +3743,26 @@ mod tests {
             .open_session(&owner, &SessionOpenArgs::default(), &cancel)
             .await
             .expect("open session");
-        let poll = tokio::spawn({
-            let coord = Arc::clone(&coord);
-            let owner = owner.clone();
-            let cancel = cancel.clone();
-            async move {
-                coord
-                    .read(
-                        &owner,
-                        session,
-                        Request::EventsTail(Box::new(poll_args(1500))),
-                        &cancel,
-                    )
-                    .await
-            }
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let poll = coord.read(
+            &owner,
+            session,
+            Request::EventsTail(Box::new(poll_args(1500))),
+            &cancel,
+        );
+        tokio::pin!(poll);
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(poll.as_mut(), cx).is_pending(),
+                "the long poll must park before the session closes",
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
         coord
             .close_session(session, &cancel)
             .await
             .expect("close session");
-        let outcome = poll.await.expect("poll joins");
+        let outcome = poll.await;
         let err = outcome.expect_err("a closed session must not finish the poll");
         assert_eq!(err.code, ErrorCode::EForbidden);
     }
