@@ -1902,9 +1902,11 @@ mod tests {
     #[test]
     fn service_paths_precede_base_queries_and_fragments() {
         use super::super::dumb_http::{dumb_head_url, dumb_refs_url};
-        use super::super::smart_http::{SmartService, refs_url, rpc_url};
+        use super::super::smart_http::{SmartService, normalize_base, refs_url, rpc_url};
 
         let base = "http://host.test/repo.git/?token=a%23b#readme?ignored";
+        let signed_base =
+            normalize_base("http://host.test/repo.git/?token=x/#readme").expect("base");
         let cases = [
             (
                 refs_url(base, SmartService::UploadPack),
@@ -1913,6 +1915,10 @@ mod tests {
             (
                 rpc_url(base, SmartService::UploadPack),
                 "/repo.git/git-upload-pack?token=a%23b",
+            ),
+            (
+                refs_url(&signed_base, SmartService::UploadPack),
+                "/repo.git/info/refs?service=git-upload-pack&token=x/",
             ),
             (dumb_refs_url(base), "/repo.git/info/refs?token=a%23b"),
             (dumb_head_url(base), "/repo.git/HEAD?token=a%23b"),

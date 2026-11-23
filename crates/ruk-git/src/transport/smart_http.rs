@@ -114,8 +114,8 @@ impl SmartService {
     }
 }
 
-/// Normalizes an endpoint URL to the RPC base: the URL as spelled minus
-/// trailing slashes, so `info/refs` and service paths join with one `/`.
+/// Normalizes an endpoint URL to the RPC base: removes its fragment and
+/// trailing path slashes while preserving query bytes.
 ///
 /// # Errors
 /// [`GitError::Invalid`] for a non-HTTP URL (checked through
@@ -123,13 +123,16 @@ impl SmartService {
 pub fn normalize_base(url: &str) -> Result<String, GitError> {
     http::url_authority(url)?;
     let base = url.split_once('#').map_or(url, |(before, _)| before);
-    let base = base.trim_end_matches('/');
+    let base = match base.split_once('?') {
+        Some((path, query)) => format!("{}?{query}", path.trim_end_matches('/')),
+        None => base.trim_end_matches('/').to_owned(),
+    };
     if base.is_empty() {
         return Err(GitError::Invalid {
             detail: format!("http remote {url:?} has no usable base"),
         });
     }
-    Ok(base.to_owned())
+    Ok(base)
 }
 
 /// The discovery URL: `<base>/info/refs?service=<svc>`. A base that
@@ -1360,6 +1363,10 @@ mod tests {
         assert_eq!(
             normalize_base("http://127.0.0.1:8080/a").expect("base"),
             "http://127.0.0.1:8080/a"
+        );
+        assert_eq!(
+            normalize_base("https://host.x/a.git/?token=x/#readme").expect("base"),
+            "https://host.x/a.git?token=x/"
         );
         assert!(normalize_base("ftp://host.x/a").is_err());
         assert!(normalize_base("not a url").is_err());
