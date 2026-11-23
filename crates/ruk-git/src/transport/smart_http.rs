@@ -902,9 +902,10 @@ pub fn fetch_pack(
 /// receive-pack service at this base.
 ///
 /// # Errors
-/// Capability, grammar, transport and store failures. Any error from
-/// [`PushPlanRecord::begin_send`] onward persists `Uncertain` best-effort
-/// before returning, exactly like [`super::push::push_over`].
+/// Capability, grammar, transport and store failures. Failures after
+/// [`PushPlanRecord::begin_send`] persist `Uncertain` best-effort unless
+/// the plan is already terminal. HTTP refusals below status 500 persist
+/// `Rejected` and return their typed HTTP error.
 pub fn push_pack(
     base: &str,
     adv: &Advertisement,
@@ -1192,9 +1193,9 @@ fn push_pack_inner(
                     },
                 }));
                 scrub_outcomes(&mut refused, &secrets);
-                plan.finalize(refused.clone())?;
+                plan.finalize(refused)?;
                 push::persist(store, plan, kind, push::current_encoding(store, plan)?)?;
-                return Ok(refused);
+                return Err(status_err);
             }
             other => return Err(other),
         }
@@ -2733,74 +2734,98 @@ mod tests {
     }
 
     #[test]
-    fn push_post_forbidden_is_rejected_not_uncertain() {
+    fn push_post_refusals_keep_typed_detail_and_terminal_plans() {
         use super::super::push::{PushUpdate, PushWireRequest};
         use super::super::session::test_support::store_with_pack;
         use ruk_core::change::PlanId;
 
-        let (base, server) = fake_smart_server(vec![(
-            403,
-            vec![("Content-Type".to_owned(), "text/plain".to_owned())],
-            b"token CANARY-tok expired".to_vec(),
-            false,
-        )]);
-        let kind = HashKind::Sha1;
-        let store = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
-        let zero = kind.zero_oid();
-        let updates = vec![PushUpdate {
-            name: b"refs/heads/x".to_vec(),
-            old: zero,
-            new: oid(FOUR),
-        }];
-        let req = PushWireRequest {
-            updates: updates.clone(),
-            atomic: false,
-        };
-        let mut plan =
-            PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
-        let mut adv = Advertisement {
-            version: super::super::refadv::ProtocolVersion::V0,
-            capabilities: super::super::refadv::Capabilities::default(),
-            refs: Vec::new(),
-            shallow: Vec::new(),
-        };
-        adv.capabilities = super::super::refadv::Capabilities::parse_list(b"report-status");
-        let auth = credentials::AuthPolicy::explicit(credentials::TransportAuth {
-            kind: credentials::TransportAuthKind::Bearer,
-            credential: "CANARY-tok".to_owned(),
-            origin: credentials::TransportAuth::origin_of(&base).expect("loopback origin"),
-        });
-        let outcomes = push_pack(
-            &base,
-            &adv,
-            &store,
-            &mut plan,
-            &req,
-            RpcCall {
-                extra: &[],
-                auth: &auth,
-                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
-                tls_roots: None,
-                interrupt: &Interrupt::none(),
-            },
-        )
-        .expect("a 403 refuses before any report");
-        assert_eq!(outcomes.len(), 1);
-        let super::push::RefResult::Rejected { reason } = &outcomes[0].result else {
-            panic!("a 403 rejects: {outcomes:?}");
-        };
-        assert!(reason.contains("403"), "{reason:?}");
-        assert!(!reason.contains("CANARY-tok"), "{reason:?}");
-        assert_eq!(plan.state, super::push::PushState::Rejected);
-        let requests = server.join().expect("server");
-        assert!(
-            requests[0]
-                .head
-                .to_ascii_lowercase()
-                .contains("transfer-encoding: chunked"),
-            "pack must stream, not buffer: {:?}",
-            requests[0].head
-        );
+        for (status, retry_after) in [(403, None), (429, Some(120))] {
+            let mut headers = vec![("Content-Type".to_owned(), "text/plain".to_owned())];
+            if let Some(seconds) = retry_after {
+                headers.push(("Retry-After".to_owned(), seconds.to_string()));
+            }
+            let (base, server) = fake_smart_server(vec![(
+                status,
+                headers,
+                b"token CANARY-tok expired".to_vec(),
+                false,
+            )]);
+            let kind = HashKind::Sha1;
+            let store = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+            let zero = kind.zero_oid();
+            let updates = vec![PushUpdate {
+                name: b"refs/heads/x".to_vec(),
+                old: zero,
+                new: oid(FOUR),
+            }];
+            let req = PushWireRequest {
+                updates: updates.clone(),
+                atomic: false,
+            };
+            let mut plan =
+                PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
+            let mut adv = Advertisement {
+                version: super::super::refadv::ProtocolVersion::V0,
+                capabilities: super::super::refadv::Capabilities::default(),
+                refs: Vec::new(),
+                shallow: Vec::new(),
+            };
+            adv.capabilities = super::super::refadv::Capabilities::parse_list(b"report-status");
+            let auth = credentials::AuthPolicy::explicit(credentials::TransportAuth {
+                kind: credentials::TransportAuthKind::Bearer,
+                credential: "CANARY-tok".to_owned(),
+                origin: credentials::TransportAuth::origin_of(&base).expect("loopback origin"),
+            });
+            let err = push_pack(
+                &base,
+                &adv,
+                &store,
+                &mut plan,
+                &req,
+                RpcCall {
+                    extra: &[],
+                    auth: &auth,
+                    egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                    tls_roots: None,
+                    interrupt: &Interrupt::none(),
+                },
+            )
+            .expect_err("an HTTP refusal preserves its typed detail");
+            assert!(
+                matches!(
+                    &err,
+                    GitError::Http {
+                        status: actual,
+                        retry_after_seconds,
+                        ..
+                    } if *actual == status && *retry_after_seconds == retry_after
+                ),
+                "{err:?}"
+            );
+            assert!(!err.to_string().contains("CANARY-tok"));
+            assert_eq!(plan.outcomes.len(), 1);
+            let super::push::RefResult::Rejected { reason } = &plan.outcomes[0].result else {
+                panic!("an HTTP refusal rejects: {:?}", plan.outcomes);
+            };
+            assert!(reason.contains(&status.to_string()), "{reason:?}");
+            assert!(!reason.contains("CANARY-tok"), "{reason:?}");
+            assert_eq!(plan.state, super::push::PushState::Rejected);
+            let encoded = store
+                .fact(ruk_core::store::FactTable::PushPlans, plan.id.as_bytes())
+                .expect("plan reads")
+                .expect("terminal plan persists");
+            let stored = PushPlanRecord::decode(plan.id, kind, &encoded).expect("plan decodes");
+            assert_eq!(stored, plan);
+            let requests = server.join().expect("server");
+            assert!(
+                requests[0]
+                    .head
+                    .to_ascii_lowercase()
+                    .contains("transfer-encoding: chunked"),
+                "pack must stream, not buffer: {:?}",
+                requests[0].head
+            );
+        }
     }
 
     #[test]
