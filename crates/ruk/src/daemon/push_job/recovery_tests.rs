@@ -478,6 +478,45 @@ async fn legacy_local_reconcile_refuses_other_stores_and_path_escapes() {
 }
 
 #[tokio::test]
+async fn legacy_local_reconcile_refuses_replaced_store_identity() {
+    let plan = uncertain_plan(b"origin", false);
+    let fixture = RecoveryFixture::new(&plan).await;
+    let before = fixture.plan_bytes(plan.id);
+    let format_path = fixture.path.join(Store::format_file());
+    let original = std::fs::read(&format_path).expect("original store identity");
+    let replacement = ruk_core::store::types::StoreFormat {
+        kind: HashKind::Sha256,
+        id: ruk_core::change::StoreId::generate(),
+    };
+    std::fs::write(&format_path, replacement.to_bytes()).expect("replacement store identity");
+    let open = fixture.invocation(
+        plan.id,
+        RequestId::generate(),
+        Some(fixture.root.to_str().expect("repository path is UTF-8")),
+    );
+    let result = fixture.job().reconcile(&open).await;
+    std::fs::write(&format_path, original).expect("restore fixture store identity");
+    let err = result.expect_err("a replaced store is not the authenticated destination");
+    assert_eq!(err.code, ErrorCode::EForbidden);
+    assert_eq!(fixture.plan_bytes(plan.id), before);
+    assert!(fixture.marker(plan.id).is_none());
+    assert_eq!(
+        fixture
+            .refs
+            .registry
+            .push_guard_check(
+                &fixture.path,
+                b"https://unrelated.example/repo.git",
+                std::slice::from_ref(&plan.updates[0].name),
+            )
+            .expect_err("replaced store identity retains the wildcard")
+            .code,
+        ErrorCode::EPushUncertain
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
 async fn legacy_reconcile_receipt_replays_without_releasing_unknown_guard() {
     let plan = uncertain_plan(b"ssh://mirror.example/repo.git", false);
     let fixture = RecoveryFixture::new(&plan).await;

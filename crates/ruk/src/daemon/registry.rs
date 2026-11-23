@@ -767,6 +767,50 @@ impl Registry {
                 "local recovery destination must be the authenticated repository's own store",
             ));
         }
+        drop(inner);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let access = pinned
+            .open_path()
+            .unwrap_or_else(|| pinned.path().to_path_buf());
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let access = pinned.path().to_path_buf();
+        use std::io::Read as _;
+        const MAX_FORMAT_BYTES: u64 = 128;
+        let file = std::fs::File::open(access.join(Store::format_file())).map_err(|err| {
+            CoreError::new(
+                ErrorCode::EIo,
+                format!("local recovery store identity is not readable: {err}"),
+            )
+        })?;
+        let mut bytes = Vec::new();
+        file.take(MAX_FORMAT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|err| {
+                CoreError::new(
+                    ErrorCode::EIo,
+                    format!("local recovery store identity is not readable: {err}"),
+                )
+            })?;
+        if !u64::try_from(bytes.len()).is_ok_and(|len| len <= MAX_FORMAT_BYTES) {
+            return Err(CoreError::new(
+                ErrorCode::ECorrupt,
+                "local recovery store identity exceeds its format bound",
+            ));
+        }
+        let format = Store::parses_format(&bytes).map_err(|err| {
+            CoreError::new(
+                ErrorCode::ECorrupt,
+                format!("local recovery store identity is invalid: {err}"),
+            )
+        })?;
+        if format.id != coordinator.store().store_id()
+            || format.kind != coordinator.store().hash_kind()
+        {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "local recovery store identity no longer matches the hosted repository",
+            ));
+        }
         pinned.verify_open(expected)
     }
 
