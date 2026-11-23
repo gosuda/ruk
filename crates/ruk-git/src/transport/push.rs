@@ -1191,12 +1191,14 @@ pub(crate) fn read_report<R: Read>(
 ) -> Result<Vec<RefOutcome>, GitError> {
     if let Some(max_frame) = sideband {
         let mut band = SidebandReader::new(pkt, max_frame);
-        let mut raw = Vec::new();
-        std::io::Read::read_to_end(&mut band, &mut raw)
-            .map_err(|err| super::pktline::io_error("reading the push report", &err))?;
+        let outcomes = read_report_packets(&mut PktReader::new(&mut band, Interrupt::none()))?;
         let _ = band.drain_to_end()?;
-        return parse_report(&raw);
+        return Ok(outcomes);
     }
+    read_report_packets(pkt)
+}
+
+fn read_report_packets<R: Read>(pkt: &mut PktReader<R>) -> Result<Vec<RefOutcome>, GitError> {
     let mut raw = Vec::new();
     loop {
         match pkt.read_packet()? {
@@ -1388,6 +1390,67 @@ mod tests {
     }
 
     #[test]
+    fn sideband_report_decodes_nested_packets_across_frames() {
+        let mut inner = Vec::new();
+        super::super::pktline::encode_data(&mut inner, b"unpack ok\n").expect("packet");
+        super::super::pktline::encode_data(&mut inner, b"ok refs/heads/main\n").expect("packet");
+        super::super::pktline::encode_data(&mut inner, b"option forced-update\n").expect("packet");
+        super::super::pktline::encode_data(&mut inner, b"ng refs/heads/protected hook declined\n")
+            .expect("packet");
+        super::super::pktline::encode_flush(&mut inner);
+        for chunk_size in [1, 3, 7, inner.len()] {
+            let mut outer = Vec::new();
+            for chunk in inner.chunks(chunk_size) {
+                let mut payload = vec![1];
+                payload.extend_from_slice(chunk);
+                super::super::pktline::encode_data(&mut outer, &payload).expect("band");
+                super::super::pktline::encode_data(&mut outer, b"\x02progress\n")
+                    .expect("progress");
+            }
+            super::super::pktline::encode_flush(&mut outer);
+            let mut packets = PktReader::new(outer.as_slice(), Interrupt::none());
+            let report = read_report(&mut packets, Some(pktline::LARGE_PACKET_MAX))
+                .expect("nested report decodes");
+            assert_eq!(
+                report,
+                vec![
+                    RefOutcome {
+                        name: b"refs/heads/main".to_vec(),
+                        result: RefResult::Ok,
+                    },
+                    RefOutcome {
+                        name: b"refs/heads/protected".to_vec(),
+                        result: RefResult::Rejected {
+                            reason: "hook declined".to_owned(),
+                        },
+                    },
+                ],
+                "chunk size {chunk_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn sideband_report_requires_both_terminators() {
+        for (inner_end, outer_end) in [(false, true), (true, false)] {
+            let mut payload = vec![1];
+            super::super::pktline::encode_data(&mut payload, b"unpack ok\n").expect("packet");
+            super::super::pktline::encode_data(&mut payload, b"ok refs/heads/main\n")
+                .expect("packet");
+            if inner_end {
+                super::super::pktline::encode_flush(&mut payload);
+            }
+            let mut outer = Vec::new();
+            super::super::pktline::encode_data(&mut outer, &payload).expect("band");
+            if outer_end {
+                super::super::pktline::encode_flush(&mut outer);
+            }
+            let mut packets = PktReader::new(outer.as_slice(), Interrupt::none());
+            assert!(read_report(&mut packets, Some(pktline::LARGE_PACKET_MAX)).is_err());
+        }
+    }
+
+    #[test]
     fn plan_codec_round_trips_and_rejects_garbage() {
         let id = PlanId::generate();
         let mut plan = PushPlanRecord::prepare(
@@ -1558,17 +1621,17 @@ mod tests {
         .expect("frame");
         script.extend(adv);
         pkt::encode_flush(&mut script);
-        // Side-band multiplexed report: band-1 payloads, then flush.
+        let mut inner = Vec::new();
         for payload in [
             &b"unpack ok\n"[..],
             &b"ng refs/heads/main atomic failed\n"[..],
         ] {
-            let mut band = vec![1u8];
-            band.extend_from_slice(payload);
-            let mut frame = Vec::new();
-            pkt::encode_data(&mut frame, &band).expect("frame");
-            script.extend(frame);
+            pkt::encode_data(&mut inner, payload).expect("packet");
         }
+        pkt::encode_flush(&mut inner);
+        let mut band = vec![1u8];
+        band.extend_from_slice(&inner);
+        pkt::encode_data(&mut script, &band).expect("frame");
         pkt::encode_flush(&mut script);
         let mut peer = ScriptedPeer::new(script);
         let updates = vec![PushUpdate {

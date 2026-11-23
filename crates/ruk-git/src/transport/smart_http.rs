@@ -2543,9 +2543,12 @@ mod tests {
         );
         pktline::encode_data(&mut adv_body, first.as_bytes()).expect("frame");
         pktline::encode_flush(&mut adv_body);
-        let mut report = sideband_frame(b"unpack ok\n");
-        report.extend_from_slice(&sideband_frame(b"ok refs/heads/x\n"));
-        report.extend_from_slice(b"0000");
+        let mut inner_report = Vec::new();
+        pktline::encode_data(&mut inner_report, b"unpack ok\n").expect("packet");
+        pktline::encode_data(&mut inner_report, b"ok refs/heads/x\n").expect("packet");
+        pktline::encode_flush(&mut inner_report);
+        let mut report = sideband_frame(&inner_report);
+        pktline::encode_flush(&mut report);
         let (base, server) = fake_smart_server(vec![
             (
                 200,
@@ -2823,9 +2826,12 @@ mod tests {
 
         let secret = "injected-secret-token-12345";
         let ng_line = format!("ng refs/heads/x rejected token {secret}\n");
-        let mut report = sideband_frame(b"unpack ok\n");
-        report.extend_from_slice(&sideband_frame(ng_line.as_bytes()));
-        report.extend_from_slice(b"0000");
+        let mut inner_report = Vec::new();
+        pktline::encode_data(&mut inner_report, b"unpack ok\n").expect("packet");
+        pktline::encode_data(&mut inner_report, ng_line.as_bytes()).expect("packet");
+        pktline::encode_flush(&mut inner_report);
+        let mut report = sideband_frame(&inner_report);
+        pktline::encode_flush(&mut report);
 
         let (base, server) = fake_smart_server(vec![
             (
