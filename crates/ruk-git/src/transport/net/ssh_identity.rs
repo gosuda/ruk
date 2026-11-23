@@ -300,14 +300,12 @@ fn expand_command_home(command: &str, home: Option<&str>) -> Result<String, GitE
             (ShellQuote::Unquoted, '~') if word_start => {
                 let next = chars.peek().copied();
                 if next.is_none_or(|ch| ch == '/' || ch.is_ascii_whitespace()) {
-                    let home = home
-                        .filter(|home| !home.is_empty())
-                        .ok_or_else(unsupported_probe)?;
-                    expanded.push_str(&super::shell_quote(home));
-                    word_start = false;
-                    continue;
-                }
-                if !matches!(next, Some('\'' | '"' | '\\')) {
+                    if let Some(home) = home.filter(|home| !home.is_empty()) {
+                        expanded.push_str(&super::shell_quote(home));
+                        word_start = false;
+                        continue;
+                    }
+                } else if !matches!(next, Some('\'' | '"' | '\\')) {
                     return Err(unsupported_probe());
                 }
                 word_start = false;
@@ -699,7 +697,6 @@ mod tests {
                 .expect("supported home expansion");
             assert_eq!(words, vec!["ssh".to_owned(), "-F".to_owned(), expected]);
         }
-        assert!(openssh_words_with_home("ssh", Some("ssh -F ~/config"), None).is_err());
         assert!(
             openssh_words_with_home("ssh", Some("ssh -F ~another/config"), Some(home)).is_err()
         );
@@ -713,6 +710,33 @@ mod tests {
                 .expect("tilde inside an argument stays literal"),
             vec!["ssh", "-F~/.ssh/work"],
         );
+    }
+
+    #[test]
+    fn command_home_expansion_defers_to_openssh_without_home() {
+        for home in [None, Some("")] {
+            for (command, expected) in [
+                ("ssh -i ~/.ssh/work", vec!["-i", "~/.ssh/work"]),
+                ("ssh -i~/.ssh/work", vec!["-i", "~/.ssh/work"]),
+                ("ssh -F ~/.ssh/config", vec!["-F", "~/.ssh/config"]),
+                ("ssh -F~/.ssh/config", vec!["-F", "~/.ssh/config"]),
+                (
+                    "ssh -o IdentityFile=~/.ssh/work",
+                    vec!["-o", "IdentityFile=~/.ssh/work"],
+                ),
+                (
+                    "ssh -oIdentityFile=~/.ssh/work",
+                    vec!["-o", "IdentityFile=~/.ssh/work"],
+                ),
+            ] {
+                let words = openssh_words_with_home("ssh", Some(command), home)
+                    .expect("OpenSSH receives its original path syntax");
+                assert_eq!(
+                    push_options(&words[1..]).expect("supported options"),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]
