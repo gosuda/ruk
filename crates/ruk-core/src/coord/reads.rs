@@ -321,8 +321,8 @@ pub(crate) fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
 /// whose source lacked the terminator gains a trailing
 /// `\ No newline at end of file` marker.
 pub(crate) fn unified_patch(
-    old_label: &str,
-    new_label: &str,
+    old_path: Option<&[u8]>,
+    new_path: Option<&[u8]>,
     old: &[&[u8]],
     new: &[&[u8]],
     ops: &[LcsOp],
@@ -381,8 +381,16 @@ pub(crate) fn unified_patch(
         cursor = end;
     }
     let mut out = Vec::new();
-    out.extend_from_slice(format!("--- {old_label}\n").as_bytes());
-    out.extend_from_slice(format!("+++ {new_label}\n").as_bytes());
+    for (header, prefix, path) in [(b"--- ", b"a/", old_path), (b"+++ ", b"b/", new_path)] {
+        out.extend_from_slice(header);
+        if let Some(path) = path {
+            out.extend_from_slice(prefix);
+            out.extend_from_slice(path);
+        } else {
+            out.extend_from_slice(b"/dev/null");
+        }
+        out.push(b'\n');
+    }
     for (start, end) in hunks {
         let (mut old_count, mut new_count) = (0_usize, 0_usize);
         let (mut old_base, mut new_base) = (0_usize, 0_usize);
@@ -1185,8 +1193,45 @@ mod tests {
             let old = split_lines(old_bytes.as_bytes());
             let new = split_lines(new_bytes.as_bytes());
             let ops = lcs_align(&old, &new).expect("align");
-            let patch = unified_patch("a/f", "b/f", &old, &new, &ops);
+            let patch = unified_patch(Some(b"f"), Some(b"f"), &old, &new, &ops);
             assert_eq!(patch, expected.as_bytes(), "{old_bytes:?} -> {new_bytes:?}");
+        }
+    }
+
+    #[test]
+    fn unified_patch_preserves_path_bytes() {
+        let path: &[u8] = b"odd\n\xffname.txt";
+        for (old_path, new_path, old_bytes, new_bytes, expected) in [
+            (
+                Some(path),
+                Some(path),
+                b"old\n".as_slice(),
+                b"new\n".as_slice(),
+                b"--- a/odd\n\xffname.txt\n+++ b/odd\n\xffname.txt\n@@ -1,1 +1,1 @@\n+new\n-old\n"
+                    .as_slice(),
+            ),
+            (
+                None,
+                Some(path),
+                b"".as_slice(),
+                b"new\n".as_slice(),
+                b"--- /dev/null\n+++ b/odd\n\xffname.txt\n@@ -0,0 +1,1 @@\n+new\n".as_slice(),
+            ),
+            (
+                Some(path),
+                None,
+                b"old\n".as_slice(),
+                b"".as_slice(),
+                b"--- a/odd\n\xffname.txt\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-old\n".as_slice(),
+            ),
+        ] {
+            let old = split_lines(old_bytes);
+            let new = split_lines(new_bytes);
+            let ops = lcs_align(&old, &new).expect("align");
+            assert_eq!(
+                unified_patch(old_path, new_path, &old, &new, &ops),
+                expected
+            );
         }
     }
 
@@ -1210,7 +1255,7 @@ mod tests {
             b"EXTRA\n",
         ];
         let ops = lcs_align(&old, &new).expect("align");
-        let patch = unified_patch("a/f", "b/f", &old, &new, &ops);
+        let patch = unified_patch(Some(b"f"), Some(b"f"), &old, &new, &ops);
         let text = String::from_utf8(patch).expect("patch is UTF-8");
         assert_eq!(text.matches("@@").count() / 2, 2, "two hunks: {text}");
         assert!(text.contains("-l1\n"), "deletion renders: {text}");
@@ -1223,7 +1268,7 @@ mod tests {
         let mut new = old.clone();
         new[0] = b"CHANGED\n";
         let ops = lcs_align(&old, &new).expect("align");
-        let patch = unified_patch("a/f", "b/f", &old, &new, &ops);
+        let patch = unified_patch(Some(b"f"), Some(b"f"), &old, &new, &ops);
         let text = String::from_utf8(patch).expect("patch is UTF-8");
         let body_lines = text
             .lines()
@@ -1315,7 +1360,7 @@ mod tests {
         let old: Vec<&[u8]> = vec![b"one\n", b"two"];
         let new: Vec<&[u8]> = vec![b"one\n", b"TWO"];
         let ops = lcs_align(&old, &new).expect("align");
-        let patch = unified_patch("a/f", "b/f", &old, &new, &ops);
+        let patch = unified_patch(Some(b"f"), Some(b"f"), &old, &new, &ops);
         let text = String::from_utf8(patch).expect("patch is UTF-8");
         assert_eq!(
             text.matches("\\ No newline at end of file\n").count(),
@@ -1329,7 +1374,7 @@ mod tests {
         let old: Vec<&[u8]> = vec![b"keep\n", b"two"];
         let new: Vec<&[u8]> = vec![b"keep\n", b"TWO\n"];
         let ops = lcs_align(&old, &new).expect("align");
-        let patch = unified_patch("a/f", "b/f", &old, &new, &ops);
+        let patch = unified_patch(Some(b"f"), Some(b"f"), &old, &new, &ops);
         let text = String::from_utf8(patch).expect("patch is UTF-8");
         assert_eq!(
             text.matches("\\ No newline at end of file\n").count(),
