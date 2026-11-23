@@ -2097,8 +2097,10 @@ mod tests {
         }
     }
 
-    /// Reads one request head plus its declared body from `socket`,
-    /// returning the head text and the raw body bytes.
+    /// Reads one request head plus its body from `socket`, returning the
+    /// head text and the raw body bytes. A chunked framing drains through
+    /// the zero terminator so the canned reply survives TCP teardown on
+    /// every platform; anything else reads by Content-Length.
     fn read_request(socket: &std::net::TcpStream) -> (String, Vec<u8>) {
         let mut reader = BufReader::new(socket.try_clone().expect("split"));
         let mut head = Vec::new();
@@ -2114,16 +2116,45 @@ mod tests {
             }
         }
         let text = String::from_utf8_lossy(&head).into_owned();
-        // Header names are case-insensitive on the wire; match loosely.
-        let length = text
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
-            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        let mut body = vec![0_u8; length];
-        if length > 0 {
-            reader.read_exact(&mut body).expect("request body");
+        let chunked = text.lines().any(|line| match line.split_once(':') {
+            Some((name, value)) => {
+                name.trim().eq_ignore_ascii_case("transfer-encoding")
+                    && value.trim().eq_ignore_ascii_case("chunked")
+            }
+            None => false,
+        });
+        let mut body = Vec::new();
+        if chunked {
+            loop {
+                let mut line = Vec::new();
+                reader.read_until(b'\n', &mut line).expect("chunk size");
+                let size = u64::from_str_radix(String::from_utf8_lossy(&line).trim_end(), 16)
+                    .expect("hex chunk size");
+                if size == 0 {
+                    let mut crlf = [0u8; 2];
+                    reader.read_exact(&mut crlf).expect("terminal chunk");
+                    break;
+                }
+                let mut chunk = vec![0u8; usize::try_from(size).expect("chunk fits the test heap")];
+                {
+                    reader.read_exact(&mut chunk).expect("chunk bytes");
+                    let mut crlf = [0u8; 2];
+                    reader.read_exact(&mut crlf).expect("chunk end");
+                }
+                body.extend_from_slice(&chunk);
+            }
+        } else {
+            // Header names are case-insensitive on the wire; match loosely.
+            let length = text
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            body.resize(length, 0);
+            if length > 0 {
+                reader.read_exact(&mut body).expect("request body");
+            }
         }
         (text, body)
     }
@@ -2925,6 +2956,36 @@ mod tests {
             .expect("close upload direction");
         assert!(upload.write_all(&vec![b'x'; 5 << 20]).is_err());
         (upload, release, server)
+    }
+
+    #[test]
+    fn chunked_refusal_still_reports_status() {
+        // The server decides 403 from the head alone, then drains the
+        // chunked body before replying so the refusal survives TCP
+        // teardown on every platform: the client must surface the
+        // refusal, not a broken pipe, no matter how much body was
+        // already buffered.
+        let (port, server) = fake_server(vec![(403, vec![], b"no".to_vec())]);
+        let mut upload = post_open_chunked(
+            &format!("http://127.0.0.1:{port}/up"),
+            &[("Content-Type", "application/x-git-test")],
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            None,
+        )
+        .expect("chunked open");
+        {
+            use std::io::Write as _;
+            upload.write_all(&vec![b'x'; 5 << 20]).unwrap_or_default();
+        }
+        let (mut reader, status, _) = upload.finish().expect("refusal reports");
+        assert_eq!(status, 403);
+        let mut body = Vec::new();
+        {
+            use std::io::Read as _;
+            reader.read_to_end(&mut body).expect("refusal body");
+        }
+        assert_eq!(body, b"no");
+        server.join().expect("server");
     }
 
     #[test]
