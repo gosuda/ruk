@@ -302,7 +302,9 @@ impl<'a> PushJob<'a> {
             })?;
         let mut plan = PushPlanRecord::decode(plan_id, kind, &encoded).map_err(to_core)?;
         if let Some(reply) = self.replay_committed(&request)? {
-            self.release_reconciliation_guard(&plan)?;
+            if plan.destination_is_known() {
+                self.release_reconciliation_guard(&plan)?;
+            }
             return encode_reply(Some(request_id), reply);
         }
         let rebound = !plan.destination_is_known();

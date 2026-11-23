@@ -478,6 +478,87 @@ async fn legacy_local_reconcile_refuses_other_stores_and_path_escapes() {
 }
 
 #[tokio::test]
+async fn legacy_reconcile_receipt_replays_without_releasing_unknown_guard() {
+    let plan = uncertain_plan(b"ssh://mirror.example/repo.git", false);
+    let fixture = RecoveryFixture::new(&plan).await;
+    let before = fixture.plan_bytes(plan.id);
+    let request_id = RequestId::generate();
+    let observed = [AdvertisedLocalRef {
+        name: plan.updates[0].name.clone(),
+        target: RefTarget::Direct(plan.updates[0].new),
+    }];
+    let stored = fixture
+        .coordinator
+        .submit_prepared(
+            &fixture.principal,
+            PreparedMutation {
+                session: fixture.session,
+                request_id,
+                request: Request::PushReconcile(Box::new(Mutation {
+                    request_id,
+                    args: PushReconcileArgs {
+                        plan: plan.id,
+                        original_remote: None,
+                    },
+                })),
+                reply: Reply::PushReconcile(Box::new(PushReconcileReply {
+                    outcome: pending_outcome(fixture.session, request_id),
+                    plan: plan.id,
+                    state: PushState::Uncertain,
+                    rewritten: false,
+                    observations: BoundedList::complete(
+                        map_observations(HashKind::Sha256, &plan, &observed)
+                            .expect("legacy observations"),
+                    )
+                    .expect("observations fit"),
+                })),
+                objects: Vec::new(),
+                facts: vec![
+                    reconciliation_marker_fact(fixture.coordinator.store(), plan.id)
+                        .expect("legacy marker mutation"),
+                ],
+                workspace_fence: None,
+                ref_transaction: None,
+                ref_dependencies: Vec::new(),
+                on_behalf_of: None,
+            },
+            &fixture.cancel,
+        )
+        .await
+        .expect("legacy observation and receipt commit without destination binding");
+    let Reply::PushReconcile(stored) = stored else {
+        panic!("reconciliation reply");
+    };
+    let open = fixture.invocation(plan.id, request_id, None);
+    let replay = reconcile_reply(
+        &fixture
+            .job()
+            .reconcile(&open)
+            .await
+            .expect("a matching retained observation replays"),
+    );
+    assert!(replay.outcome.receipt.replayed);
+    assert_eq!(replay.observations, stored.observations);
+    assert_eq!(replay.state, stored.state);
+    assert_eq!(fixture.plan_bytes(plan.id), before);
+    assert_eq!(fixture.marker(plan.id), Some(vec![0x01]));
+    assert_eq!(
+        fixture
+            .refs
+            .registry
+            .push_guard_check(
+                &fixture.path,
+                b"https://unrelated.example/repo.git",
+                std::slice::from_ref(&plan.updates[0].name),
+            )
+            .expect_err("receipt replay cannot prove the missing destination")
+            .code,
+        ErrorCode::EPushUncertain
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
 async fn legacy_reconcile_binds_and_observes_reported_refs() {
     let plan = uncertain_plan(b"origin", true);
     let fixture = RecoveryFixture::new(&plan).await;
