@@ -1217,7 +1217,10 @@ fn restore_http_refusal(store: &Store, reply: Reply) -> Result<Reply, CoreError>
         || !record.error.fixes.is_empty()
         || !matches!(
             record.error.detail,
-            Some(ErrorDetail::Http { status: ..500, .. })
+            Some(ErrorDetail::Http {
+                status: ..200 | 300..500,
+                ..
+            })
         )
     {
         return Err(CoreError::new(
@@ -1843,7 +1846,19 @@ mod tests {
             error: ErrorReply::from_core(&CoreError::new(ErrorCode::EIo, "not HTTP")),
         })
         .expect("detail encodes");
-        for bytes in [invalid_version, invalid_detail, b"{".to_vec()] {
+        let mut success = ErrorReply::from_core(&error);
+        success.detail = Some(ErrorDetail::http_detail(200, None, None, "success"));
+        let invalid_status = ipc::encode_control(&HttpRefusalRecord {
+            version: HTTP_REFUSAL_VERSION,
+            error: success,
+        })
+        .expect("status encodes");
+        for bytes in [
+            invalid_version,
+            invalid_detail,
+            invalid_status,
+            b"{".to_vec(),
+        ] {
             let key = http_refusal_key(plan);
             let previous = store
                 .fact(FactTable::RemoteObservations, &key)
