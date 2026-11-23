@@ -140,6 +140,44 @@ fn run(
     verb(ctx, &owned)
 }
 
+#[cfg(unix)]
+#[test]
+fn coordinator_rendezvous_does_not_claim_an_unserved_store() {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    for stale in [false, true] {
+        let base = temp_base("coord");
+        let store_dir = base.join(".ruk");
+        drop(
+            Store::create(
+                &store_dir,
+                HashKind::Sha1,
+                Arc::new(PreparationBudget::reference_defaults()),
+            )
+            .expect("create store"),
+        );
+        let lock = store_dir.join("lock");
+        let body = b"unpublished endpoint\n";
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&lock)
+            .expect("ownership file");
+        file.write_all(body).expect("unpublished body");
+        drop(file);
+        if stale {
+            drop(
+                std::os::unix::net::UnixListener::bind(store_dir.join("coordinator.sock"))
+                    .expect("stale socket"),
+            );
+        }
+        super::coordinator::wait_socket(&store_dir);
+        assert_eq!(std::fs::read(&lock).expect("ownership body"), body);
+        std::fs::remove_dir_all(base).expect("cleanup");
+    }
+}
+
 #[test]
 fn verb_table_covers_advertised_names() {
     assert_eq!(VERBS.len(), 128);
