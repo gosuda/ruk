@@ -7739,7 +7739,8 @@ fn reconciled_push_guard_stays_clear_after_restart() {
     let mutation_2 = plan_2
         .persist_mutation(HashKind::Sha256, None)
         .expect("mutation encodes");
-    let marker_fact = super::push_job::reconciliation_marker_fact(plan_id_2);
+    let marker_fact =
+        super::push_job::reconciliation_marker_fact(&store, plan_id_2).expect("marker snapshot");
 
     store
         .publish(

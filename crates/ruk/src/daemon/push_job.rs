@@ -343,7 +343,7 @@ impl<'a> PushJob<'a> {
                     request,
                     reply: reply.clone(),
                     objects: Vec::new(),
-                    facts: vec![reconciliation_marker_fact(plan_id)],
+                    facts: vec![reconciliation_marker_fact(store, plan_id)?],
                     workspace_fence: None,
                     ref_transaction: None,
                     ref_dependencies: Vec::new(),
@@ -1122,13 +1122,27 @@ pub(crate) fn reconciliation_marker_key(plan: PlanId) -> Vec<u8> {
     key
 }
 
-pub(crate) fn reconciliation_marker_fact(plan: PlanId) -> FactMutation {
-    FactMutation {
-        table: FactTable::RemoteObservations,
-        key: reconciliation_marker_key(plan),
-        expected: FactExpectation::Any,
-        value: Some(vec![RECONCILIATION_MARKER_VERSION]),
+pub(crate) fn reconciliation_marker_fact(
+    store: &Store,
+    plan: PlanId,
+) -> Result<FactMutation, CoreError> {
+    let key = reconciliation_marker_key(plan);
+    let previous = store.fact(FactTable::RemoteObservations, &key)?;
+    if previous
+        .as_ref()
+        .is_some_and(|value| value != &[RECONCILIATION_MARKER_VERSION])
+    {
+        return Err(CoreError::new(
+            ErrorCode::ECorrupt,
+            format!("stored reconciliation marker for plan {plan} is corrupt"),
+        ));
     }
+    Ok(FactMutation {
+        table: FactTable::RemoteObservations,
+        key,
+        expected: previous.map_or(FactExpectation::Absent, FactExpectation::Value),
+        value: Some(vec![RECONCILIATION_MARKER_VERSION]),
+    })
 }
 
 fn encode_reply(id: Option<RequestId>, reply: Reply) -> Result<Vec<u8>, CoreError> {
@@ -1522,6 +1536,16 @@ mod tests {
             .expect_err("uncertain blocks");
         assert_eq!(err.code, ErrorCode::EPushUncertain);
         assert!(err.to_string().contains(&blocking.to_string()));
+        let Some(ruk_core::protocol::ErrorDetail::Push { plan, state, refs }) =
+            err.detail.as_deref()
+        else {
+            panic!("uncertain guard must identify its plan in typed detail");
+        };
+        assert_eq!(*plan, blocking);
+        assert_eq!(*state, PushState::Uncertain);
+        assert_eq!(refs.items.len(), 1);
+        assert_eq!(refs.items[0].remote_ref.as_bytes(), name);
+        assert_eq!(refs.items[0].status, PushRefStatus::Uncertain);
         registry
             .note_push_terminal(&root, blocking, std::slice::from_ref(&name), false)
             .expect("confirmed clears");
@@ -1537,6 +1561,79 @@ mod tests {
         registry
             .push_guard_check(&root, std::slice::from_ref(&name))
             .expect("reconciled passes");
+    }
+
+    #[tokio::test]
+    async fn reconciliation_markers_commit_through_the_lane() {
+        use ruk_core::protocol::{Mutation, PushReconcileArgs, SessionOpenArgs};
+
+        let plan = PlanId::generate();
+        let root = std::env::temp_dir().join(format!("ruk-push-marker-{plan}"));
+        std::fs::create_dir_all(&root).expect("scratch fits");
+        let store = Arc::new(
+            Store::create(
+                &root.join(".ruk"),
+                HashKind::Sha256,
+                Arc::new(ruk_core::store::PreparationBudget::reference_defaults()),
+            )
+            .expect("store creates"),
+        );
+        let principal = Principal::from_peer_uid(1000);
+        let coordinator =
+            HostedCoordinator::open(Arc::clone(&store), principal.clone(), root.clone())
+                .expect("coordinator opens");
+        let runner = coordinator
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("lane starts");
+        let (_hold, cancel) = cancellation();
+        let (session, _) = coordinator
+            .open_session(&principal, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("session opens");
+        for _ in 0..2 {
+            let request_id = RequestId::generate();
+            coordinator
+                .submit_prepared(
+                    &principal,
+                    PreparedMutation {
+                        session,
+                        request_id,
+                        request: Request::PushReconcile(Box::new(Mutation {
+                            request_id,
+                            args: PushReconcileArgs { plan },
+                        })),
+                        reply: Reply::PushReconcile(Box::new(PushReconcileReply {
+                            outcome: pending_outcome(session, request_id),
+                            plan,
+                            state: PushState::Uncertain,
+                            observations: BoundedList::complete(Vec::new()).expect("empty fits"),
+                        })),
+                        objects: Vec::new(),
+                        facts: vec![reconciliation_marker_fact(&store, plan).expect("marker")],
+                        workspace_fence: None,
+                        ref_transaction: None,
+                        ref_dependencies: Vec::new(),
+                        on_behalf_of: None,
+                    },
+                    &cancel,
+                )
+                .await
+                .expect("initial and repeated observations commit");
+            assert_eq!(
+                store
+                    .fact(
+                        FactTable::RemoteObservations,
+                        &reconciliation_marker_key(plan)
+                    )
+                    .expect("marker reads"),
+                Some(vec![RECONCILIATION_MARKER_VERSION])
+            );
+        }
+        coordinator.shutdown();
+        runner.await.expect("runner joins").expect("lane drains");
+        drop(coordinator);
+        drop(store);
+        std::fs::remove_dir_all(root).expect("scratch removed");
     }
 
     #[test]
