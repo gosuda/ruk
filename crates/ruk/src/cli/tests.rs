@@ -2197,9 +2197,12 @@ fn push_over_smart_http_reports_status() {
             .as_bytes(),
     ));
     adv.extend_from_slice(b"0000");
-    // side-band-64k was advertised, so the report rides channel 1.
-    let mut report = pkt_frame(b"\x01unpack ok\n");
-    report.extend_from_slice(&pkt_frame(b"\x01ok refs/heads/main\n"));
+    let mut status = pkt_frame(b"unpack ok\n");
+    status.extend_from_slice(&pkt_frame(b"ok refs/heads/main\n"));
+    status.extend_from_slice(b"0000");
+    let mut channel = vec![1];
+    channel.extend_from_slice(&status);
+    let mut report = pkt_frame(&channel);
     report.extend_from_slice(b"0000");
     let (base, log) = smart_http_server(vec![
         (adv, "application/x-git-receive-pack-advertisement"),
@@ -2242,8 +2245,12 @@ fn push_isolates_diverged_refs_per_ref() {
             .as_bytes(),
     ));
     adv.extend_from_slice(b"0000");
-    let mut report = pkt_frame(b"\x01unpack ok\n");
-    report.extend_from_slice(&pkt_frame(b"\x01ok refs/heads/other\n"));
+    let mut status = pkt_frame(b"unpack ok\n");
+    status.extend_from_slice(&pkt_frame(b"ok refs/heads/other\n"));
+    status.extend_from_slice(b"0000");
+    let mut channel = vec![1];
+    channel.extend_from_slice(&status);
+    let mut report = pkt_frame(&channel);
     report.extend_from_slice(b"0000");
     let (base, log) = smart_http_server(vec![
         (adv, "application/x-git-receive-pack-advertisement"),
