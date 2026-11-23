@@ -955,7 +955,7 @@ async fn large_reconciliation_pages_survive_restart_and_release_only_at_completi
     assert!(replay.outcome.receipt.replayed);
     assert_eq!(replay.next, first.next);
     for target in [remote.as_bytes(), b"https://unrelated.example/repo.git"] {
-        fixture
+        let blocked = fixture
             .refs
             .registry
             .push_guard_check(
@@ -965,12 +965,30 @@ async fn large_reconciliation_pages_survive_restart_and_release_only_at_completi
                 std::slice::from_ref(&plan.updates[0].name),
             )
             .expect_err("partial replay must retain the wildcard guard");
+        assert_eq!(blocked.code, ErrorCode::EPushUncertain);
+        let advice = blocked.to_string();
+        assert!(advice.contains("finish push.reconcile"));
+        assert!(advice.contains("original_remote only if the saved destination is unknown"));
+        assert!(!advice.contains("its original destination is unknown"));
     }
 
     let fixture = fixture.restart().await;
     assert_ne!(fixture.session, cursor.session);
     let bound = PushPlanRecord::decode(plan.id, HashKind::Sha256, &fixture.plan_bytes(plan.id))
         .expect("bound plan survives restart");
+    assert!(bound.destination_is_known());
+    let rebind = fixture.invocation(plan.id, RequestId::generate(), Some(&remote));
+    let rejected = fixture
+        .job()
+        .reconcile(&rebind)
+        .await
+        .expect_err("a bound plan no longer accepts original_remote");
+    assert_eq!(rejected.code, ErrorCode::EInvalid);
+    assert!(
+        rejected
+            .to_string()
+            .contains("original_remote cannot rebind")
+    );
     let Principal::Unix(uid) = &fixture.principal else {
         panic!("Unix fixture has a Unix principal");
     };
@@ -1001,7 +1019,7 @@ async fn large_reconciliation_pages_survive_restart_and_release_only_at_completi
     );
     assert!(fixture.marker(plan.id).is_none());
     for target in [remote.as_bytes(), b"https://unrelated.example/repo.git"] {
-        fixture
+        let blocked = fixture
             .refs
             .registry
             .push_guard_check(
@@ -1011,6 +1029,11 @@ async fn large_reconciliation_pages_survive_restart_and_release_only_at_completi
                 std::slice::from_ref(&plan.reported_updates[500].name),
             )
             .expect_err("restart retains wildcard guards for every reported target");
+        assert_eq!(blocked.code, ErrorCode::EPushUncertain);
+        let advice = blocked.to_string();
+        assert!(advice.contains("finish push.reconcile"));
+        assert!(advice.contains("original_remote only if the saved destination is unknown"));
+        assert!(!advice.contains("its original destination is unknown"));
     }
 
     let last_request = RequestId::generate();
