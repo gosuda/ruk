@@ -50,11 +50,13 @@ SCP path and an absolute SSH URL path can name different repositories:
 ```json
 {
   "plan":"00000000-0000-4000-8000-000000000001",
-  "original_remote":"mirror.example:relative/repo.git",
+  "original_remote":"alice@mirror.example:relative/repo.git",
   "original_ssh":{"user":"alice","port":2222}
 }
 ```
 
+Include the verified username in the SCP spelling. Ruk treats a bare
+`host:path` without a username or scheme as a local path.
 Current SSH configuration cannot establish the historical settings.
 `original_ssh` must agree with any user or port written in the destination.
 It is accepted only with `original_remote` for an unknown destination.
@@ -63,9 +65,15 @@ those same settings for transmission and recovery. A later SSH
 configuration change cannot redirect the saved plan to another identity.
 
 SSH pushes require a direct OpenSSH command. Arguments such as `-F` and
-`-i` remain supported. Shell expansions and custom SSH clients are
-refused before a push plan is created because they can override the
-saved destination. Recovery applies the same check before discovery.
+`-i` remain supported. An unquoted `~` or `~/` uses the `HOME` directory.
+Quoted or escaped tildes remain literal. Other shell expansions
+and custom SSH clients are refused before a push plan is created because
+they can override the saved destination. `GIT_SSH_VARIANT=auto` is
+accepted for OpenSSH. Recovery applies the same checks before discovery.
+
+Push discovery, transmission, and recovery disable SSH connection sharing.
+They cannot reuse a control socket connected with a different user or
+port, even when SSH configuration or command options request sharing.
 
 `original_remote` is accepted only when the saved destination is unknown.
 It cannot change the destination of a plan that already identifies one.
@@ -88,6 +96,7 @@ request and leaves the push uncertain. Reconciliation observes both the
 requested and reported refs. A reply with `rewritten: true` requires a
 decision about the reported result before another send. Reconciliation
 does not turn that result into confirmation of the original request.
+
 ## Large recovery results
 
 A response contains at most 1,000 observations across `observations` and
@@ -108,9 +117,13 @@ as `cursor` with the same plan and a new request identifier:
 Use the cursor returned by Ruk, not these example values. Omit
 `original_remote` and `original_ssh` from continuation requests.
 Each page comes from the same saved observation snapshot. A restart does
-not require another network observation. An outstanding guard remains until the last
-page commits and `next` is null. Retrying an earlier page's request
+not require another network observation. An outstanding guard remains
+until the last page commits and `next` is null. Retrying an earlier page's request
 identifier replays that page and does not complete the recovery.
+
+An unfinished legacy recovery retains its guard across destinations,
+including after a restart or replacement snapshot. Its verified destination
+does not narrow that guard before the final page commits.
 
 The totals in each list describe the entire snapshot, not just that
 page. Collect both lists until `next` is null. If the plan or snapshot
