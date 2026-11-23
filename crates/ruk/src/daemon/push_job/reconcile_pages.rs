@@ -25,6 +25,18 @@ struct Progress {
     reported_total: u64,
     page_count: u32,
     next_page: u32,
+    #[serde(default = "legacy_guard_default")]
+    legacy_guard: bool,
+}
+
+fn legacy_guard_default() -> bool {
+    true
+}
+
+impl Progress {
+    fn preserves_legacy_guard(&self) -> bool {
+        self.legacy_guard && self.next_page < self.page_count
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -116,6 +128,17 @@ fn progress(store: &Store, plan: PlanId) -> Result<Option<(Progress, Vec<u8>)>, 
         return Err(corrupt("reconciliation snapshot progress is invalid"));
     }
     Ok(Some((value, bytes)))
+}
+
+/// Whether unfinished recovery still owns the original wildcard guard.
+///
+/// # Errors
+/// Store reads or malformed persisted recovery progress.
+pub(crate) fn has_incomplete_legacy_binding(
+    store: &Store,
+    plan: PlanId,
+) -> Result<bool, CoreError> {
+    Ok(progress(store, plan)?.is_some_and(|(value, _)| value.preserves_legacy_guard()))
 }
 
 fn mutation(
@@ -237,6 +260,10 @@ pub(super) fn first(
         reported_total,
         page_count,
         next_page: 1,
+        legacy_guard: clear_legacy_marker
+            || previous
+                .as_ref()
+                .is_some_and(|(value, _)| value.preserves_legacy_guard()),
     };
     let mut facts = Vec::with_capacity(pages.len() + 2);
     let mut first = None;

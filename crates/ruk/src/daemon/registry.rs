@@ -2572,7 +2572,9 @@ impl Registry {
                     };
                     let known_destination = plan.destination_is_known();
                     if !reconciled || !known_destination {
-                        let destination = known_destination
+                        let legacy_binding =
+                            super::push_job::has_incomplete_legacy_binding(store, plan.id)?;
+                        let destination = (known_destination && !legacy_binding)
                             .then(|| push_destination(&plan.remote, plan.ssh_identity.as_ref()))
                             .transpose()?;
                         for update in plan.updates.iter().chain(&plan.reported_updates) {

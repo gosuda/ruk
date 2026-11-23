@@ -75,6 +75,7 @@ use crate::cli::state::is_ancestor;
 use crate::daemon::ipc;
 
 mod reconcile_pages;
+pub(crate) use reconcile_pages::has_incomplete_legacy_binding;
 
 /// The shared handles of one hosted push invocation.
 pub(crate) struct PushJob<'a> {
