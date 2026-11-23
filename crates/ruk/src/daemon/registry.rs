@@ -2696,7 +2696,8 @@ impl Drop for Registry {
 
 #[cfg(test)]
 mod tests {
-    use super::{PushKeyClaim, Registry};
+    use super::{PushKeyClaim, Registry, push_destination};
+    use std::collections::HashSet;
     use std::io::Read;
     use std::path::Path;
     use std::sync::Arc;
@@ -4562,6 +4563,9 @@ mod tests {
 
     #[test]
     fn uncertain_push_guards_isolate_destinations_and_plan_ownership() {
+        use ruk_core::change::PlanId;
+        use ruk_core::error::ErrorCode;
+
         let root = scratch_root();
         let registry = Registry::new(vec![root.clone()]).expect("registry opens");
         let names = vec![b"refs/heads/main".to_vec()];
