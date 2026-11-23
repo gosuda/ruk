@@ -480,7 +480,7 @@ impl Registry {
                         format!("ref {noun} is blocked by uncertain push plan {plan}")
                     } else {
                         format!(
-                            "ref {noun} is blocked by uncertain push plan {plan}: its original destination is unknown; verify it and supply original_remote to push.reconcile"
+                            "ref {noun} is blocked by uncertain push plan {plan}: finish push.reconcile for this plan and consume every page; supply a verified original_remote only if the saved destination is unknown"
                         )
                     };
                     return Err(
@@ -5386,7 +5386,10 @@ mod tests {
                 .push_guard_check(&path, remote, fixture_ssh_identity(remote).as_ref(), &names)
                 .expect_err("unknown original destination blocks every destination");
             assert_eq!(err.code, ErrorCode::EPushUncertain);
-            assert!(err.to_string().contains("original destination is unknown"));
+            assert!(err.to_string().contains("finish push.reconcile"));
+            assert!(err.to_string().contains(
+                "supply a verified original_remote only if the saved destination is unknown"
+            ));
             assert!(
                 plans
                     .iter()
