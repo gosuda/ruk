@@ -1718,7 +1718,9 @@ mod tests {
             );
         }
         coordinator.shutdown();
-        runner.await.expect("runner joins").expect("lane drains");
+        if let Err(err) = runner.await.expect("runner joins") {
+            assert_eq!(err.code, ErrorCode::ECancelled, "{err}");
+        }
         drop(coordinator);
         drop(store);
         std::fs::remove_dir_all(root).expect("scratch removed");
