@@ -729,6 +729,47 @@ impl Registry {
         Ok(pinned)
     }
 
+    /// Verifies that a local recovery destination names the current hosted store.
+    /// The caller must hold an active session on `coordinator`.
+    ///
+    /// # Errors
+    /// Containment failures, `E_INVALID` for a relative path, or `E_FORBIDDEN`
+    /// when the destination is not the same registered store and coordinator.
+    pub(crate) fn verify_recovery_store(
+        &self,
+        requested: &Path,
+        expected: &Path,
+        coordinator: &Arc<HostedCoordinator>,
+    ) -> Result<(), CoreError> {
+        if !requested.is_absolute() {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "local recovery destination must be absolute",
+            ));
+        }
+        let pinned = self.store_pinned(requested)?;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned"))?;
+        if pinned.path() != expected
+            || inner.deleting.contains(expected)
+            || !inner.entries.values().any(|entry| {
+                entry.path == expected
+                    && entry
+                        .coordinator
+                        .as_ref()
+                        .is_some_and(|registered| Arc::ptr_eq(registered, coordinator))
+            })
+        {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "local recovery destination must be the authenticated repository's own store",
+            ));
+        }
+        pinned.verify_open(expected)
+    }
+
     /// Resolves `requested` naming either a repository root or its store
     /// directly, returning `(repo_root, store)`.
     ///

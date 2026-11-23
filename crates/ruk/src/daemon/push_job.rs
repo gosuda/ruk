@@ -321,22 +321,19 @@ impl<'a> PushJob<'a> {
                 refuse_url_userinfo(remote, &bridge.auth).map_err(to_core)?;
                 plan.bind_original_remote(remote.as_bytes().to_vec())
                     .map_err(to_core)?;
-                remote.to_owned()
+                remote.as_bytes().to_vec()
             }
-            (false, None) => String::from_utf8(plan.remote.clone()).map_err(|_| {
-                CoreError::new(
-                    ErrorCode::EInvalid,
-                    "daemon jobs serve network remotes; local paths stay out",
-                )
-            })?,
+            (false, None) => plan.remote.clone(),
         };
-        refuse_url_userinfo(&remote, &bridge.auth).map_err(to_core)?;
+        if let Ok(remote) = std::str::from_utf8(&remote) {
+            refuse_url_userinfo(remote, &bridge.auth).map_err(to_core)?;
+        }
         let job = self.snapshot();
         let (observations, plan) = self
             .refs
             .transport
             .run(move || {
-                let advertised = job.discover(&remote, &bridge)?;
+                let advertised = job.discover_for_reconcile(&remote, &bridge)?;
                 map_observations(kind, &plan, &advertised).map(|observations| (observations, plan))
             })
             .await??;
@@ -557,6 +554,40 @@ impl BlockingJob {
             &bridge.interrupt,
             Service::ReceivePack,
         )
+    }
+
+    fn discover_for_reconcile(
+        &self,
+        remote: &[u8],
+        bridge: &CancelBridge,
+    ) -> Result<Vec<AdvertisedLocalRef>, CoreError> {
+        let path = match std::str::from_utf8(remote) {
+            Ok(url) => match net::parse_endpoint(url).map_err(to_core)? {
+                Endpoint::Local { path } => path,
+                _ => return self.discover(url, bridge),
+            },
+            Err(_) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt as _;
+                    PathBuf::from(std::ffi::OsStr::from_bytes(remote))
+                }
+                #[cfg(not(unix))]
+                {
+                    return Err(CoreError::new(
+                        ErrorCode::EInvalid,
+                        "local recovery destination is not UTF-8",
+                    ));
+                }
+            }
+        };
+        self.registry
+            .verify_recovery_store(&path, &self.repo, &self.coordinator)?;
+        bridge
+            .interrupt
+            .check("observing the local push destination")
+            .map_err(to_core)?;
+        ruk_git::transport::session::advertise(self.coordinator.store()).map_err(to_core)
     }
 
     /// The HTTP advertisement for the POST half, discovered with the same

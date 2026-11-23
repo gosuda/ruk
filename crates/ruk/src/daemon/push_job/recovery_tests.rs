@@ -23,6 +23,10 @@ struct RecoveryFixture {
 
 impl RecoveryFixture {
     async fn new(plan: &PushPlanRecord) -> Self {
+        Self::with_refs(plan, &[]).await
+    }
+
+    async fn with_refs(plan: &PushPlanRecord, advertised: &[AdvertisedLocalRef]) -> Self {
         let root = std::env::temp_dir().join(format!("ruk-push-recovery-{}", plan.id));
         std::fs::create_dir_all(&root).expect("scratch directory");
         let store = Store::create(
@@ -31,12 +35,29 @@ impl RecoveryFixture {
             Arc::new(PreparationBudget::reference_defaults()),
         )
         .expect("store creates");
+        let transaction = ruk_core::refdata::RefTransaction::new(
+            HashKind::Sha256,
+            advertised
+                .iter()
+                .map(|entry| ruk_core::refdata::RefUpdate {
+                    name: RefName::new(entry.name.clone()).expect("advertised ref"),
+                    expected: ruk_core::refdata::RefExpect::Absent,
+                    change: ruk_core::refdata::RefChange::Set(entry.target.clone()),
+                })
+                .collect(),
+        )
+        .expect("fixture refs validate");
+        let mut facts = ruk_core::refs::prepare_checked_transaction(&store, &transaction)
+            .expect("fixture refs prepare before hosting")
+            .into_mutations();
+        facts.push(
+            plan.persist_mutation(HashKind::Sha256, None)
+                .expect("plan mutation"),
+        );
         store
             .publish(
                 Vec::new(),
-                &[plan
-                    .persist_mutation(HashKind::Sha256, None)
-                    .expect("plan mutation")],
+                &facts,
                 EventSource::LocalPush,
                 &EventContext::default(),
             )
@@ -331,6 +352,128 @@ async fn known_reconcile_destination_cannot_be_rebound() {
     );
     assert_eq!(fixture.plan_bytes(plan.id), before);
     assert!(fixture.marker(plan.id).is_none());
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn legacy_local_reconcile_observes_only_the_authenticated_store() {
+    for direct_store_path in [false, true] {
+        let plan = uncertain_plan(b"origin", true);
+        let advertised = [
+            AdvertisedLocalRef {
+                name: plan.updates[0].name.clone(),
+                target: RefTarget::Direct(plan.updates[0].old),
+            },
+            AdvertisedLocalRef {
+                name: plan.reported_updates[0].name.clone(),
+                target: RefTarget::Direct(plan.reported_updates[0].new),
+            },
+        ];
+        let fixture = RecoveryFixture::with_refs(&plan, &advertised).await;
+        let remote = if direct_store_path {
+            fixture.path.to_str().expect("store path is UTF-8")
+        } else {
+            fixture.root.to_str().expect("repository path is UTF-8")
+        };
+        let open = fixture.invocation(plan.id, RequestId::generate(), Some(remote));
+        let reply = reconcile_reply(
+            &fixture
+                .job()
+                .reconcile(&open)
+                .await
+                .expect("local recovery observes the authenticated destination"),
+        );
+        assert!(reply.rewritten);
+        assert_eq!(reply.observations.items.len(), 2);
+        assert_eq!(
+            reply.observations.items[0].verdict,
+            ReconcileVerdict::EqualOld
+        );
+        assert_eq!(
+            reply.observations.items[0].observed,
+            Some(plan.updates[0].old)
+        );
+        assert_eq!(
+            reply.observations.items[1].verdict,
+            ReconcileVerdict::EqualNew
+        );
+        assert_eq!(
+            reply.observations.items[1].observed,
+            Some(plan.reported_updates[0].new)
+        );
+        let stored = PushPlanRecord::decode(plan.id, HashKind::Sha256, &fixture.plan_bytes(plan.id))
+            .expect("bound local plan decodes");
+        assert_eq!(stored.remote, remote.as_bytes());
+        assert!(stored.destination_is_known());
+        assert_eq!(fixture.marker(plan.id), Some(vec![0x01]));
+        for update in plan.updates.iter().chain(&plan.reported_updates) {
+            fixture
+                .refs
+                .registry
+                .push_guard_check(
+                    &fixture.path,
+                    b"https://unrelated.example/repo.git",
+                    std::slice::from_ref(&update.name),
+                )
+                .expect("completed local recovery releases its wildcard owner");
+        }
+        let fresh = fixture.invocation(plan.id, RequestId::generate(), None);
+        let known = reconcile_reply(
+            &fixture
+                .job()
+                .reconcile(&fresh)
+                .await
+                .expect("known local destination remains recoverable"),
+        );
+        assert_eq!(known.observations, reply.observations);
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn legacy_local_reconcile_refuses_other_stores_and_path_escapes() {
+    let plan = uncertain_plan(b"origin", false);
+    let fixture = RecoveryFixture::new(&plan).await;
+    let before = fixture.plan_bytes(plan.id);
+    let other = fixture.root.join("other");
+    std::fs::create_dir(&other).expect("other repository directory");
+    let other_store = Store::create(
+        &other.join(".ruk"),
+        HashKind::Sha256,
+        Arc::new(PreparationBudget::reference_defaults()),
+    )
+    .expect("other repository store");
+    drop(other_store);
+    let link = fixture.root.join("alias");
+    std::os::unix::fs::symlink(&fixture.root, &link).expect("symlink fixture");
+    for remote in [other.as_path(), link.as_path(), Path::new("/")] {
+        let open = fixture.invocation(
+            plan.id,
+            RequestId::generate(),
+            Some(remote.to_str().expect("fixture path is UTF-8")),
+        );
+        let err = fixture
+            .job()
+            .reconcile(&open)
+            .await
+            .expect_err("local recovery cannot read a different store or escape containment");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+        assert_eq!(fixture.plan_bytes(plan.id), before);
+        assert!(fixture.marker(plan.id).is_none());
+        assert_eq!(
+            fixture
+                .refs
+                .registry
+                .push_guard_check(
+                    &fixture.path,
+                    b"https://unrelated.example/repo.git",
+                    std::slice::from_ref(&plan.updates[0].name),
+                )
+                .expect_err("failed local recovery retains the wildcard")
+                .code,
+            ErrorCode::EPushUncertain
+        );
+    }
     fixture.finish().await;
 }
 

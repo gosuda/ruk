@@ -46,6 +46,11 @@ Other unresolved plans keep their guards.
 `original_remote` is accepted only when the saved destination is unknown.
 It cannot change the destination of a plan that already identifies one.
 An old reconciliation record alone cannot recover a missing destination.
+For an older local push, supply the absolute path of the destination
+repository or its store. Local push plans reside in that destination
+store. The path must identify the same hosted store that contains the
+plan. Ruk applies its path containment checks and reads that already
+authorized store. Recovery cannot open another local repository.
 
 ## Server-reported changes
 
