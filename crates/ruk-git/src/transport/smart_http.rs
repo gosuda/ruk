@@ -114,21 +114,25 @@ impl SmartService {
     }
 }
 
-/// Normalizes an endpoint URL to the RPC base: the URL as spelled minus
-/// trailing slashes, so `info/refs` and service paths join with one `/`.
+/// Normalizes an endpoint URL to the RPC base: removes its fragment and
+/// trailing path slashes while preserving query bytes.
 ///
 /// # Errors
 /// [`GitError::Invalid`] for a non-HTTP URL (checked through
 /// [`http::url_authority`], which owns URL validation).
 pub fn normalize_base(url: &str) -> Result<String, GitError> {
     http::url_authority(url)?;
-    let base = url.trim_end_matches('/');
+    let base = url.split_once('#').map_or(url, |(before, _)| before);
+    let base = match base.split_once('?') {
+        Some((path, query)) => format!("{}?{query}", path.trim_end_matches('/')),
+        None => base.trim_end_matches('/').to_owned(),
+    };
     if base.is_empty() {
         return Err(GitError::Invalid {
             detail: format!("http remote {url:?} has no usable base"),
         });
     }
-    Ok(base.to_owned())
+    Ok(base)
 }
 
 /// The discovery URL: `<base>/info/refs?service=<svc>`. A base that
@@ -136,17 +140,19 @@ pub fn normalize_base(url: &str) -> Result<String, GitError> {
 /// so no server-side parameter is lost.
 #[must_use]
 pub fn refs_url(base: &str, service: SmartService) -> String {
+    let base = base.split_once('#').map_or(base, |(before, _)| before);
     let (path, query) = match base.split_once('?') {
         Some((path, query)) => (path, format!("&{query}")),
         None => (base, String::new()),
     };
+    let path = path.trim_end_matches('/');
     format!("{path}/info/refs?service={}{query}", service.name())
 }
 
 /// The RPC URL: `<base>/<svc>`.
 #[must_use]
 pub fn rpc_url(base: &str, service: SmartService) -> String {
-    format!("{base}/{}", service.name())
+    http::endpoint_url(base, service.name())
 }
 
 /// Builds owned request headers from `extra_headers` (resolved
@@ -896,9 +902,10 @@ pub fn fetch_pack(
 /// receive-pack service at this base.
 ///
 /// # Errors
-/// Capability, grammar, transport and store failures. Any error from
-/// [`PushPlanRecord::begin_send`] onward persists `Uncertain` best-effort
-/// before returning, exactly like [`super::push::push_over`].
+/// Capability, grammar, transport and store failures. Failures after
+/// [`PushPlanRecord::begin_send`] persist `Uncertain` best-effort unless
+/// the plan is already terminal. HTTP refusals below status 500 persist
+/// `Rejected` and return their typed HTTP error.
 pub fn push_pack(
     base: &str,
     adv: &Advertisement,
@@ -1186,9 +1193,9 @@ fn push_pack_inner(
                     },
                 }));
                 scrub_outcomes(&mut refused, &secrets);
-                plan.finalize(refused.clone())?;
+                plan.finalize(refused)?;
                 push::persist(store, plan, kind, push::current_encoding(store, plan)?)?;
-                return Ok(refused);
+                return Err(status_err);
             }
             other => return Err(other),
         }
@@ -1203,8 +1210,7 @@ fn push_pack_inner(
         });
     }
     let mut pkt = PktReader::new(reader, interrupt.clone());
-    let server = push::read_report(&mut pkt, sideband)?;
-    push::check_report_covers_live(&live, &server)?;
+    let server = push::read_report(&mut pkt, sideband, &live)?;
     let mut report = server;
     report.extend(outcomes);
     scrub_outcomes(&mut report, &secrets);
@@ -1351,12 +1357,16 @@ mod tests {
     #[test]
     fn base_and_url_shapes() {
         assert_eq!(
-            normalize_base("https://host.x/a.git/").expect("base"),
+            normalize_base("https://host.x/a.git/#readme").expect("base"),
             "https://host.x/a.git"
         );
         assert_eq!(
             normalize_base("http://127.0.0.1:8080/a").expect("base"),
             "http://127.0.0.1:8080/a"
+        );
+        assert_eq!(
+            normalize_base("https://host.x/a.git/?token=x/#readme").expect("base"),
+            "https://host.x/a.git?token=x/"
         );
         assert!(normalize_base("ftp://host.x/a").is_err());
         assert!(normalize_base("not a url").is_err());
@@ -2048,6 +2058,7 @@ mod tests {
             body,
             false,
         )]);
+        let base = normalize_base(&format!("{base}#readme")).expect("base");
         let adv = discover(
             &base,
             SmartService::UploadPack,
@@ -2532,9 +2543,12 @@ mod tests {
         );
         pktline::encode_data(&mut adv_body, first.as_bytes()).expect("frame");
         pktline::encode_flush(&mut adv_body);
-        let mut report = sideband_frame(b"unpack ok\n");
-        report.extend_from_slice(&sideband_frame(b"ok refs/heads/x\n"));
-        report.extend_from_slice(b"0000");
+        let mut inner_report = Vec::new();
+        pktline::encode_data(&mut inner_report, b"unpack ok\n").expect("packet");
+        pktline::encode_data(&mut inner_report, b"ok refs/heads/x\n").expect("packet");
+        pktline::encode_flush(&mut inner_report);
+        let mut report = sideband_frame(&inner_report);
+        pktline::encode_flush(&mut report);
         let (base, server) = fake_smart_server(vec![
             (
                 200,
@@ -2719,74 +2733,185 @@ mod tests {
     }
 
     #[test]
-    fn push_post_forbidden_is_rejected_not_uncertain() {
+    fn push_v2_redirects_stay_uncertain_after_http_reports() {
         use super::super::push::{PushUpdate, PushWireRequest};
         use super::super::session::test_support::store_with_pack;
         use ruk_core::change::PlanId;
 
-        let (base, server) = fake_smart_server(vec![(
-            403,
-            vec![("Content-Type".to_owned(), "text/plain".to_owned())],
-            b"token CANARY-tok expired".to_vec(),
-            false,
-        )]);
-        let kind = HashKind::Sha1;
-        let store = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
-        let zero = kind.zero_oid();
-        let updates = vec![PushUpdate {
-            name: b"refs/heads/x".to_vec(),
-            old: zero,
-            new: oid(FOUR),
-        }];
-        let req = PushWireRequest {
-            updates: updates.clone(),
-            atomic: false,
-        };
-        let mut plan =
-            PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
-        let mut adv = Advertisement {
-            version: super::super::refadv::ProtocolVersion::V0,
-            capabilities: super::super::refadv::Capabilities::default(),
-            refs: Vec::new(),
-            shallow: Vec::new(),
-        };
-        adv.capabilities = super::super::refadv::Capabilities::parse_list(b"report-status");
-        let auth = credentials::AuthPolicy::explicit(credentials::TransportAuth {
-            kind: credentials::TransportAuthKind::Bearer,
-            credential: "CANARY-tok".to_owned(),
-            origin: credentials::TransportAuth::origin_of(&base).expect("loopback origin"),
-        });
-        let outcomes = push_pack(
-            &base,
-            &adv,
-            &store,
-            &mut plan,
-            &req,
-            RpcCall {
-                extra: &[],
-                auth: &auth,
-                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
-                tls_roots: None,
-                interrupt: &Interrupt::none(),
-            },
-        )
-        .expect("a 403 refuses before any report");
-        assert_eq!(outcomes.len(), 1);
-        let super::push::RefResult::Rejected { reason } = &outcomes[0].result else {
-            panic!("a 403 rejects: {outcomes:?}");
-        };
-        assert!(reason.contains("403"), "{reason:?}");
-        assert!(!reason.contains("CANARY-tok"), "{reason:?}");
-        assert_eq!(plan.state, super::push::PushState::Rejected);
-        let requests = server.join().expect("server");
-        assert!(
-            requests[0]
-                .head
-                .to_ascii_lowercase()
-                .contains("transfer-encoding: chunked"),
-            "pack must stream, not buffer: {:?}",
-            requests[0].head
-        );
+        for (refname, confirmed) in [("refs/heads/x", true), ("refs/changes/1/head", false)] {
+            let mut report = Vec::new();
+            for line in [
+                "unpack ok".to_owned(),
+                "ok refs/heads/x".to_owned(),
+                format!("option refname {refname}"),
+                format!("option new-oid {FOUR}"),
+            ] {
+                pktline::encode_data(&mut report, line.as_bytes()).expect("report packet");
+            }
+            pktline::encode_flush(&mut report);
+            let mut payload = vec![1];
+            payload.extend_from_slice(&report);
+            let mut body = Vec::new();
+            pktline::encode_data(&mut body, &payload).expect("sideband packet");
+            pktline::encode_flush(&mut body);
+            let (base, server) = fake_smart_server(vec![(
+                200,
+                vec![(
+                    "Content-Type".to_owned(),
+                    "application/x-git-receive-pack-result".to_owned(),
+                )],
+                body,
+                false,
+            )]);
+            let kind = HashKind::Sha1;
+            let store = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+            let updates = vec![PushUpdate {
+                name: b"refs/heads/x".to_vec(),
+                old: kind.zero_oid(),
+                new: oid(FOUR),
+            }];
+            let req = PushWireRequest {
+                updates: updates.clone(),
+                atomic: false,
+            };
+            let mut plan = PushPlanRecord::prepare(
+                PlanId::generate(),
+                base.as_bytes().to_vec(),
+                false,
+                updates,
+            );
+            let adv = Advertisement {
+                version: super::super::refadv::ProtocolVersion::V0,
+                capabilities: super::super::refadv::Capabilities::parse_list(
+                    b"report-status-v2 side-band-64k",
+                ),
+                refs: Vec::new(),
+                shallow: Vec::new(),
+            };
+            let result = push_pack(
+                &base,
+                &adv,
+                &store,
+                &mut plan,
+                &req,
+                RpcCall {
+                    extra: &[],
+                    auth: &no_auth(),
+                    egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                    tls_roots: None,
+                    interrupt: &Interrupt::none(),
+                },
+            );
+            if confirmed {
+                assert_eq!(result.expect("identical report confirms").len(), 1);
+                assert_eq!(plan.state, super::push::PushState::Confirmed);
+            } else {
+                assert!(matches!(result, Err(GitError::Unsupported { .. })));
+                assert_eq!(plan.state, super::push::PushState::Uncertain);
+                assert!(plan.outcomes.is_empty());
+            }
+            let encoded = push::current_encoding(&store, &plan)
+                .expect("stored plan reads")
+                .expect("plan persists");
+            let stored = PushPlanRecord::decode(plan.id, kind, &encoded).expect("plan decodes");
+            assert_eq!(stored, plan);
+            assert_eq!(server.join().expect("HTTP peer joins").len(), 1);
+        }
+    }
+
+    #[test]
+    fn push_post_refusals_keep_typed_detail_and_terminal_plans() {
+        use super::super::push::{PushUpdate, PushWireRequest};
+        use super::super::session::test_support::store_with_pack;
+        use ruk_core::change::PlanId;
+
+        for (status, retry_after) in [(403, None), (429, Some(120))] {
+            let mut headers = vec![("Content-Type".to_owned(), "text/plain".to_owned())];
+            if let Some(seconds) = retry_after {
+                headers.push(("Retry-After".to_owned(), seconds.to_string()));
+            }
+            let (base, server) = fake_smart_server(vec![(
+                status,
+                headers,
+                b"token CANARY-tok expired".to_vec(),
+                false,
+            )]);
+            let kind = HashKind::Sha1;
+            let store = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+            let zero = kind.zero_oid();
+            let updates = vec![PushUpdate {
+                name: b"refs/heads/x".to_vec(),
+                old: zero,
+                new: oid(FOUR),
+            }];
+            let req = PushWireRequest {
+                updates: updates.clone(),
+                atomic: false,
+            };
+            let mut plan =
+                PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
+            let mut adv = Advertisement {
+                version: super::super::refadv::ProtocolVersion::V0,
+                capabilities: super::super::refadv::Capabilities::default(),
+                refs: Vec::new(),
+                shallow: Vec::new(),
+            };
+            adv.capabilities = super::super::refadv::Capabilities::parse_list(b"report-status");
+            let auth = credentials::AuthPolicy::explicit(credentials::TransportAuth {
+                kind: credentials::TransportAuthKind::Bearer,
+                credential: "CANARY-tok".to_owned(),
+                origin: credentials::TransportAuth::origin_of(&base).expect("loopback origin"),
+            });
+            let err = push_pack(
+                &base,
+                &adv,
+                &store,
+                &mut plan,
+                &req,
+                RpcCall {
+                    extra: &[],
+                    auth: &auth,
+                    egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                    tls_roots: None,
+                    interrupt: &Interrupt::none(),
+                },
+            )
+            .expect_err("an HTTP refusal preserves its typed detail");
+            assert!(
+                matches!(
+                    &err,
+                    GitError::Http {
+                        status: actual,
+                        retry_after_seconds,
+                        ..
+                    } if *actual == status && *retry_after_seconds == retry_after
+                ),
+                "{err:?}"
+            );
+            assert!(!err.to_string().contains("CANARY-tok"));
+            assert_eq!(plan.outcomes.len(), 1);
+            let super::push::RefResult::Rejected { reason } = &plan.outcomes[0].result else {
+                panic!("an HTTP refusal rejects: {:?}", plan.outcomes);
+            };
+            assert!(reason.contains(&status.to_string()), "{reason:?}");
+            assert!(!reason.contains("CANARY-tok"), "{reason:?}");
+            assert_eq!(plan.state, super::push::PushState::Rejected);
+            let encoded = store
+                .fact(ruk_core::store::FactTable::PushPlans, plan.id.as_bytes())
+                .expect("plan reads")
+                .expect("terminal plan persists");
+            let stored = PushPlanRecord::decode(plan.id, kind, &encoded).expect("plan decodes");
+            assert_eq!(stored, plan);
+            let requests = server.join().expect("server");
+            assert!(
+                requests[0]
+                    .head
+                    .to_ascii_lowercase()
+                    .contains("transfer-encoding: chunked"),
+                "pack must stream, not buffer: {:?}",
+                requests[0].head
+            );
+        }
     }
 
     #[test]
@@ -2812,9 +2937,12 @@ mod tests {
 
         let secret = "injected-secret-token-12345";
         let ng_line = format!("ng refs/heads/x rejected token {secret}\n");
-        let mut report = sideband_frame(b"unpack ok\n");
-        report.extend_from_slice(&sideband_frame(ng_line.as_bytes()));
-        report.extend_from_slice(b"0000");
+        let mut inner_report = Vec::new();
+        pktline::encode_data(&mut inner_report, b"unpack ok\n").expect("packet");
+        pktline::encode_data(&mut inner_report, ng_line.as_bytes()).expect("packet");
+        pktline::encode_flush(&mut inner_report);
+        let mut report = sideband_frame(&inner_report);
+        pktline::encode_flush(&mut report);
 
         let (base, server) = fake_smart_server(vec![
             (

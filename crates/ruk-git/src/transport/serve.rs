@@ -427,28 +427,6 @@ fn ingest_and_verify<R: Read>(
     Ok((staged, facts))
 }
 
-/// One `<old> <new> <ref>` line of hook stdin.
-fn hook_line(cmd: &Command) -> String {
-    format!(
-        "{} {} {}\n",
-        cmd.old.to_hex(),
-        cmd.new.to_hex(),
-        String::from_utf8_lossy(&cmd.name),
-    )
-}
-
-/// One landed `post-receive` line for a diverted command the hook
-/// accepted: the review ref it reported, with the hook-supplied OIDs when
-/// it sent `option old-oid` / `option new-oid`, else the pushed OIDs.
-fn alternate_line(alternate: &AlternateRef, old: Oid, new: Oid) -> String {
-    format!(
-        "{} {} {}\n",
-        alternate.old_oid.unwrap_or(old).to_hex(),
-        alternate.new_oid.unwrap_or(new).to_hex(),
-        String::from_utf8_lossy(&alternate.refname),
-    )
-}
-
 /// Serves one `receive-pack` session: writes the advertisement, reads update
 /// commands plus the pack, and reports per-ref outcomes.
 ///
@@ -1043,23 +1021,29 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     // failure relays to server diagnostics and never fails the push:
     // protocol v0's report has no sideband slot for it. The hosted
     // policy only stashes the callback here; the daemon pumps it after
-    // the receipt write and the report delivery, never before. Diverted
-    // commands the hook accepted arrive under their review ref: the hook
-    // performed the write itself, so the landed line names the
-    // hook-supplied refname (with the hook-supplied OIDs when present),
-    // not the original `refs/for/` name.
+    // the receipt write and the report delivery, never before.
     let landed: String = live
         .iter()
         .filter(|(index, _)| matches!(results[*index], Some(Ok(()))))
         .map(|(index, update)| {
-            if let Some((_, alternate)) = alternates.iter().find(|(i, _)| i == index) {
-                return alternate_line(alternate, update.old, update.new);
-            }
-            let cmd = commands
-                .iter()
-                .find(|cmd| cmd.name == update.name)
-                .expect("live update names a command");
-            hook_line(cmd)
+            let (name, old, new) =
+                if let Some((_, applied)) = divert_writes.iter().find(|(i, _)| i == index) {
+                    (applied.name.as_slice(), applied.old, applied.new)
+                } else if let Some((_, alternate)) = alternates.iter().find(|(i, _)| i == index) {
+                    (
+                        alternate.refname.as_slice(),
+                        alternate.old_oid.unwrap_or(update.old),
+                        alternate.new_oid.unwrap_or(update.new),
+                    )
+                } else {
+                    (update.name.as_slice(), update.old, update.new)
+                };
+            format!(
+                "{} {} {}\n",
+                old.to_hex(),
+                new.to_hex(),
+                String::from_utf8_lossy(name),
+            )
         })
         .collect();
     if !landed.is_empty() && interrupt.check("running post-receive hook").is_ok() {
@@ -1728,6 +1712,158 @@ mod tests {
         }
 
         fn post_receive(&self, _landed: &LandedRefs<'_>) {}
+    }
+
+    struct RecordHostedDivert {
+        alternate: AlternateRef,
+        landed: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl ReceivePolicy for RecordHostedDivert {
+        fn needs_quarantine(&self) -> bool {
+            false
+        }
+
+        fn quarantine_parent(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+
+        fn pre_receive(&self, batch: &ReceiveBatch<'_>) -> Vec<RefVerdict> {
+            batch
+                .commands
+                .iter()
+                .map(|command| {
+                    if command.name == b"refs/for/main" {
+                        RefVerdict::Divert {
+                            alternate: self.alternate.clone(),
+                            write_through_cas: true,
+                        }
+                    } else {
+                        RefVerdict::Accept
+                    }
+                })
+                .collect()
+        }
+
+        fn post_receive(&self, landed: &LandedRefs<'_>) {
+            self.landed.borrow_mut().push(landed.lines.to_owned());
+        }
+    }
+
+    #[test]
+    fn receive_hosted_divert_reports_applied_old_and_new() {
+        let kind = HashKind::Sha1;
+        let review_ref = b"refs/changes/7/patchset/2";
+        for previous in [None, Some(oid(THREE))] {
+            let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+            let dest = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+            if let Some(previous) = previous {
+                set_ref(&dest, kind, review_ref, previous);
+            }
+            let mut input = command(
+                kind.zero_oid(),
+                oid(FOUR),
+                b"refs/for/main",
+                Some("report-status"),
+            );
+            input.extend_from_slice(b"0000");
+            input.extend_from_slice(&push_pack(
+                &src,
+                kind,
+                kind.zero_oid(),
+                oid(FOUR),
+                b"refs/for/main",
+            ));
+            let policy = RecordHostedDivert {
+                alternate: AlternateRef {
+                    refname: review_ref.to_vec(),
+                    old_oid: Some(oid(FOUR)),
+                    new_oid: Some(oid(THREE)),
+                    forced: false,
+                },
+                landed: std::cell::RefCell::new(Vec::new()),
+            };
+            let mut out = Vec::new();
+            serve_receive_pack_with(ReceivePackParams {
+                reader: &input[..],
+                writer: &mut out,
+                store: &dest,
+                kind,
+                head: &head(),
+                interrupt: &Interrupt::none(),
+                policy: &policy,
+                lfs: LfsMode::Deny,
+                limits: ReceiveLimits::default(),
+                on_behalf_of: None,
+            })
+            .expect("hosted divert lands");
+            assert_eq!(
+                report_lines(&out),
+                vec![b"unpack ok".to_vec(), b"ok refs/for/main".to_vec()]
+            );
+            assert_eq!(ref_oid(&dest, review_ref), Some(oid(FOUR)));
+            assert_eq!(ref_oid(&dest, b"refs/for/main"), None);
+            assert_eq!(
+                *policy.landed.borrow(),
+                vec![format!(
+                    "{} {FOUR} refs/changes/7/patchset/2\n",
+                    previous.unwrap_or(kind.zero_oid()).to_hex(),
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn receive_hosted_divert_omits_rejected_cas_from_callback() {
+        let kind = HashKind::Sha1;
+        let review_ref = b"refs/changes/7/patchset/2";
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        set_ref(&dest, kind, review_ref, oid(THREE));
+        let mut input = command(oid(THREE), oid(FOUR), review_ref, Some("report-status"));
+        input.extend_from_slice(&command(kind.zero_oid(), oid(FOUR), b"refs/for/main", None));
+        input.extend_from_slice(b"0000");
+        input.extend_from_slice(&push_pack(
+            &src,
+            kind,
+            kind.zero_oid(),
+            oid(FOUR),
+            b"refs/for/main",
+        ));
+        let policy = RecordHostedDivert {
+            alternate: AlternateRef {
+                refname: review_ref.to_vec(),
+                old_oid: None,
+                new_oid: None,
+                forced: false,
+            },
+            landed: std::cell::RefCell::new(Vec::new()),
+        };
+        let mut out = Vec::new();
+        serve_receive_pack_with(ReceivePackParams {
+            reader: &input[..],
+            writer: &mut out,
+            store: &dest,
+            kind,
+            head: &head(),
+            interrupt: &Interrupt::none(),
+            policy: &policy,
+            lfs: LfsMode::Deny,
+            limits: ReceiveLimits::default(),
+            on_behalf_of: None,
+        })
+        .expect("stale hosted CAS reports refusal");
+        let lines = report_lines(&out);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], b"unpack ok");
+        assert_eq!(lines[1], b"ok refs/changes/7/patchset/2");
+        assert!(lines[2].starts_with(b"ng refs/for/main "), "{lines:?}");
+        assert_eq!(ref_oid(&dest, review_ref), Some(oid(FOUR)));
+        assert_eq!(ref_oid(&dest, b"refs/for/main"), None);
+        assert_eq!(
+            *policy.landed.borrow(),
+            vec![format!("{THREE} {FOUR} refs/changes/7/patchset/2\n")]
+        );
     }
 
     #[test]

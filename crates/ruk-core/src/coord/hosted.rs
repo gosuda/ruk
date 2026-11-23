@@ -1890,22 +1890,22 @@ impl HostedCoordinator {
             }
             let empty: Vec<&[u8]> = Vec::new();
             let lines = split_lines(&bytes);
-            let (old_lines, new_lines, old_label, new_label) = match old {
+            let (old_lines, new_lines, old_path, new_path) = match old {
                 Some(_) => (
                     lines.as_slice(),
                     empty.as_slice(),
-                    format!("a/{}", String::from_utf8_lossy(path.as_bytes())),
-                    String::from("/dev/null"),
+                    Some(path.as_bytes()),
+                    None,
                 ),
                 None => (
                     empty.as_slice(),
                     lines.as_slice(),
-                    String::from("/dev/null"),
-                    format!("b/{}", String::from_utf8_lossy(path.as_bytes())),
+                    None,
+                    Some(path.as_bytes()),
                 ),
             };
             let ops = lcs_align(old_lines, new_lines)?;
-            let patch = unified_patch(&old_label, &new_label, old_lines, new_lines, &ops);
+            let patch = unified_patch(old_path, new_path, old_lines, new_lines, &ops);
             let inline = super::reads::inline_body(patch)?;
             return Ok(DiffBody::Unified { patch: inline });
         };
@@ -1920,10 +1920,9 @@ impl HostedCoordinator {
         let old_lines = split_lines(&old_bytes);
         let new_lines = split_lines(&new_bytes);
         let ops = lcs_align(&old_lines, &new_lines)?;
-        let label = String::from_utf8_lossy(path.as_bytes()).into_owned();
         let patch = unified_patch(
-            &format!("a/{label}"),
-            &format!("b/{label}"),
+            Some(path.as_bytes()),
+            Some(path.as_bytes()),
             &old_lines,
             &new_lines,
             &ops,
@@ -3689,7 +3688,6 @@ mod tests {
     #[tokio::test]
     async fn parked_poll_releases_its_admission_slot_between_scans() {
         let (_temp, coord, owner) = coordinator_with_limits(one_interactive_slot());
-        let coord = Arc::new(coord);
         let _runner = coord
             .spawn_on(&tokio::runtime::Handle::current())
             .expect("spawn lane");
@@ -3698,22 +3696,21 @@ mod tests {
             .open_session(&owner, &SessionOpenArgs::default(), &cancel)
             .await
             .expect("open session");
-        let poll = tokio::spawn({
-            let coord = Arc::clone(&coord);
-            let owner = owner.clone();
-            let cancel = cancel.clone();
-            async move {
-                coord
-                    .read(
-                        &owner,
-                        session,
-                        Request::EventsTail(Box::new(poll_args(1500))),
-                        &cancel,
-                    )
-                    .await
-            }
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let poll = coord.read(
+            &owner,
+            session,
+            Request::EventsTail(Box::new(poll_args(1500))),
+            &cancel,
+        );
+        tokio::pin!(poll);
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(poll.as_mut(), cx).is_pending(),
+                "the long poll must park before the competing read",
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
         let _listed = refs_list(
             &coord,
             &owner,
@@ -3726,7 +3723,7 @@ mod tests {
             },
         )
         .await;
-        let parked = poll.await.expect("poll joins").expect("poll serves");
+        let parked = poll.await.expect("poll serves");
         assert!(
             matches!(parked, Reply::EventsTail(_)),
             "poll answers its own reply"
@@ -3738,7 +3735,6 @@ mod tests {
     #[tokio::test]
     async fn parked_poll_refuses_a_session_that_lost_authority() {
         let (_temp, coord, owner) = coordinator();
-        let coord = Arc::new(coord);
         let _runner = coord
             .spawn_on(&tokio::runtime::Handle::current())
             .expect("spawn lane");
@@ -3747,27 +3743,26 @@ mod tests {
             .open_session(&owner, &SessionOpenArgs::default(), &cancel)
             .await
             .expect("open session");
-        let poll = tokio::spawn({
-            let coord = Arc::clone(&coord);
-            let owner = owner.clone();
-            let cancel = cancel.clone();
-            async move {
-                coord
-                    .read(
-                        &owner,
-                        session,
-                        Request::EventsTail(Box::new(poll_args(1500))),
-                        &cancel,
-                    )
-                    .await
-            }
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let poll = coord.read(
+            &owner,
+            session,
+            Request::EventsTail(Box::new(poll_args(1500))),
+            &cancel,
+        );
+        tokio::pin!(poll);
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(poll.as_mut(), cx).is_pending(),
+                "the long poll must park before the session closes",
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
         coord
             .close_session(session, &cancel)
             .await
             .expect("close session");
-        let outcome = poll.await.expect("poll joins");
+        let outcome = poll.await;
         let err = outcome.expect_err("a closed session must not finish the poll");
         assert_eq!(err.code, ErrorCode::EForbidden);
     }

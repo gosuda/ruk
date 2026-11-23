@@ -44,10 +44,10 @@ use ruk_core::coord::{
 use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::heads::Head;
 use ruk_core::protocol::{
-    BoundedList, ChangeRef, Method, MutationOutcome, PushAtomicity, PushReconcileReply,
-    PushRefOutcome, PushRefStatus, PushReply, PushSource, PushState, ReceiptRef,
-    ReconcileObservation, ReconcileVerdict, RemoteExpect, RemoteSpec, Reply, ReplyEnvelope,
-    Request, RequestDigest, Timestamp,
+    BoundedList, ChangeRef, ErrorDetail, ErrorReply, Method, MutationOutcome, PushAtomicity,
+    PushReconcileReply, PushRefOutcome, PushRefStatus, PushReply, PushSource, PushState,
+    ReceiptRef, ReconcileObservation, ReconcileVerdict, RemoteExpect, RemoteSpec, Reply,
+    ReplyEnvelope, Request, RequestDigest, Timestamp,
 };
 use ruk_core::records::Records;
 use ruk_core::refdata::{RefName, RefTarget};
@@ -202,7 +202,7 @@ impl<'a> PushJob<'a> {
             .collect();
         self.refs
             .registry
-            .push_guard_check(self.repo_path, &ref_names)?;
+            .push_guard_check(self.repo_path, url.as_bytes(), &ref_names)?;
 
         // Discovery plus translation runs on the bulkhead: store reads and
         // network I/O never block the lane. Each phase arms its own
@@ -231,6 +231,8 @@ impl<'a> PushJob<'a> {
             .transport
             .run(move || job.send_updates(prepared, &bridge))
             .await??;
+        let mut facts = vec![sent.terminal_fact];
+        facts.extend(sent.refusal_fact);
         let reply = Reply::Push(Box::new(sent.reply));
         // The send already moved bytes: terminal bookkeeping runs on a
         // detached token, so invocation cancellation cannot lose an
@@ -247,7 +249,7 @@ impl<'a> PushJob<'a> {
                     request,
                     reply: reply.clone(),
                     objects: Vec::new(),
-                    facts: vec![sent.terminal_fact],
+                    facts,
                     workspace_fence: None,
                     ref_transaction: None,
                     ref_dependencies: Vec::new(),
@@ -256,7 +258,10 @@ impl<'a> PushJob<'a> {
                 &terminal_cancel,
             )
             .await?;
-        encode_reply(Some(request_id), stored)
+        encode_reply(
+            Some(request_id),
+            restore_http_refusal(self.coordinator.store(), stored)?,
+        )
     }
 
     /// Serves one hosted `push.reconcile` invocation: observes the
@@ -314,12 +319,13 @@ impl<'a> PushJob<'a> {
         // first (`PushState` is `Copy`, so this reads nothing twice).
         let plan_state = wire_state(plan.state);
         let job = self.snapshot();
-        let observations = self
+        let (observations, remote) = self
             .refs
             .transport
             .run(move || {
                 let advertised = job.discover(&remote, &bridge)?;
                 map_observations(kind, &plan, &advertised)
+                    .map(|observations| (observations, plan.remote))
             })
             .await??;
 
@@ -343,7 +349,7 @@ impl<'a> PushJob<'a> {
                     request,
                     reply: reply.clone(),
                     objects: Vec::new(),
-                    facts: vec![reconciliation_marker_fact(plan_id)],
+                    facts: vec![reconciliation_marker_fact(store, plan_id)?],
                     workspace_fence: None,
                     ref_transaction: None,
                     ref_dependencies: Vec::new(),
@@ -354,7 +360,7 @@ impl<'a> PushJob<'a> {
             .await?;
         self.refs
             .registry
-            .note_push_reconciled(self.repo_path, plan_id, &observed_refs)?;
+            .note_push_reconciled(self.repo_path, &remote, plan_id, &observed_refs)?;
         encode_reply(Some(request_id), stored)
     }
 
@@ -362,7 +368,9 @@ impl<'a> PushJob<'a> {
     /// retry never re-sends.
     fn replay_committed(&self, request: &Request) -> Result<Option<Reply>, CoreError> {
         let wall = jiff::Timestamp::now();
-        receipt::replay_if_committed(self.coordinator.store(), self.session, request, wall)
+        receipt::replay_if_committed(self.coordinator.store(), self.session, request, wall)?
+            .map(|reply| restore_http_refusal(self.coordinator.store(), reply))
+            .transpose()
     }
 
     /// Snapshots the blocking-safe half of the job for the bulkhead
@@ -552,11 +560,7 @@ impl BlockingJob {
 
     /// Sends the translated updates and returns the terminal reply plus
     /// the chained fact. A withheld batch skips the network: its plan is
-    /// already `Rejected` with the sibling refusals recorded. A send
-    /// failure before the first persist propagates as the job error; once
-    /// the plan leaves `Prepared`, the terminal `Uncertain` reply commits
-    /// and the cause goes to the daemon log, since the reply model carries
-    /// no error slot.
+    /// already `Rejected` with the sibling refusals recorded.
     fn send_updates(
         &self,
         prepared: TranslatedPush,
@@ -626,6 +630,18 @@ impl BlockingJob {
                 self.finish_send(plan, state, refs, &secrets)
             }
             Err(err) => {
+                if plan.state == PlanState::Rejected
+                    && matches!(err.detail.as_deref(), Some(ErrorDetail::Http { .. }))
+                {
+                    let refusal_fact = http_refusal_fact(plan.id, &err)?;
+                    let mut outcomes = plan.outcomes.clone();
+                    outcomes.append(&mut early);
+                    let (state, refs) =
+                        map_outcomes(plan.state, &plan.updates, &outcomes, &secrets)?;
+                    let mut sent = self.finish_send(plan, state, refs, &secrets)?;
+                    sent.refusal_fact = Some(refusal_fact);
+                    return Ok(sent);
+                }
                 if plan.state == PlanState::Prepared {
                     return Err(err);
                 }
@@ -661,6 +677,7 @@ impl BlockingJob {
         // plan's block must not depend on the lane half surviving.
         self.registry.note_push_terminal(
             &self.repo,
+            &plan.remote,
             plan_id,
             &names,
             state == PushState::Uncertain,
@@ -673,6 +690,7 @@ impl BlockingJob {
                 refs: BoundedList::complete(refs)?,
             },
             terminal_fact,
+            refusal_fact: None,
         })
     }
 
@@ -1122,17 +1140,102 @@ pub(crate) fn reconciliation_marker_key(plan: PlanId) -> Vec<u8> {
     key
 }
 
-pub(crate) fn reconciliation_marker_fact(plan: PlanId) -> FactMutation {
-    FactMutation {
-        table: FactTable::RemoteObservations,
-        key: reconciliation_marker_key(plan),
-        expected: FactExpectation::Any,
-        value: Some(vec![RECONCILIATION_MARKER_VERSION]),
+pub(crate) fn reconciliation_marker_fact(
+    store: &Store,
+    plan: PlanId,
+) -> Result<FactMutation, CoreError> {
+    let key = reconciliation_marker_key(plan);
+    let previous = store.fact(FactTable::RemoteObservations, &key)?;
+    if previous
+        .as_ref()
+        .is_some_and(|value| value != &[RECONCILIATION_MARKER_VERSION])
+    {
+        return Err(CoreError::new(
+            ErrorCode::ECorrupt,
+            format!("stored reconciliation marker for plan {plan} is corrupt"),
+        ));
     }
+    Ok(FactMutation {
+        table: FactTable::RemoteObservations,
+        key,
+        expected: previous.map_or(FactExpectation::Absent, FactExpectation::Value),
+        value: Some(vec![RECONCILIATION_MARKER_VERSION]),
+    })
 }
 
 fn encode_reply(id: Option<RequestId>, reply: Reply) -> Result<Vec<u8>, CoreError> {
     ipc::encode_control(&ReplyEnvelope::success(id, reply))
+}
+
+const HTTP_REFUSAL_PREFIX: &[u8] = b"push-http-refusal\x00";
+const HTTP_REFUSAL_VERSION: u8 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpRefusalRecord {
+    version: u8,
+    error: ErrorReply,
+}
+
+fn http_refusal_key(plan: PlanId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(HTTP_REFUSAL_PREFIX.len() + plan.as_bytes().len());
+    key.extend_from_slice(HTTP_REFUSAL_PREFIX);
+    key.extend_from_slice(plan.as_bytes());
+    key
+}
+
+fn http_refusal_fact(plan: PlanId, error: &CoreError) -> Result<FactMutation, CoreError> {
+    let record = HttpRefusalRecord {
+        version: HTTP_REFUSAL_VERSION,
+        error: ErrorReply::from_core(error),
+    };
+    Ok(FactMutation {
+        table: FactTable::RemoteObservations,
+        key: http_refusal_key(plan),
+        expected: FactExpectation::Absent,
+        value: Some(ipc::encode_control(&record)?),
+    })
+}
+
+fn restore_http_refusal(store: &Store, reply: Reply) -> Result<Reply, CoreError> {
+    let Reply::Push(push) = &reply else {
+        return Ok(reply);
+    };
+    let Some(bytes) = store.fact(FactTable::RemoteObservations, &http_refusal_key(push.plan))?
+    else {
+        return Ok(reply);
+    };
+    let record: HttpRefusalRecord = ipc::decode_control(&bytes).map_err(|err| {
+        CoreError::new(
+            ErrorCode::ECorrupt,
+            format!(
+                "stored HTTP refusal for plan {} is malformed: {err}",
+                push.plan
+            ),
+        )
+    })?;
+    if record.version != HTTP_REFUSAL_VERSION
+        || push.state != PushState::Rejected
+        || !record.error.fixes.is_empty()
+        || !matches!(
+            record.error.detail,
+            Some(ErrorDetail::Http {
+                status: ..200 | 300..500,
+                ..
+            })
+        )
+    {
+        return Err(CoreError::new(
+            ErrorCode::ECorrupt,
+            format!("stored HTTP refusal for plan {} is inconsistent", push.plan),
+        ));
+    }
+    Err(CoreError {
+        code: record.error.code,
+        message: record.error.message,
+        hints: record.error.hints,
+        detail: record.error.detail.map(Box::new),
+    })
 }
 
 pub(crate) fn to_core(err: GitError) -> CoreError {
@@ -1155,6 +1258,7 @@ struct HttpAdv {
 struct SentPush {
     reply: PushReply,
     terminal_fact: ruk_core::store::FactMutation,
+    refusal_fact: Option<FactMutation>,
 }
 
 #[cfg(test)]
@@ -1510,33 +1614,119 @@ mod tests {
         std::fs::create_dir_all(&root).expect("scratch fits");
         let registry = Registry::new(vec![root.clone()]).expect("registry builds");
         let name = b"refs/heads/main".to_vec();
+        let remote = b"https://mirror.example/repo.git";
         registry
-            .push_guard_check(&root, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, std::slice::from_ref(&name))
             .expect("clean ref passes");
         let blocking = PlanId::generate();
         registry
-            .note_push_terminal(&root, blocking, std::slice::from_ref(&name), true)
+            .note_push_terminal(&root, remote, blocking, std::slice::from_ref(&name), true)
             .expect("uncertain records");
         let err = registry
-            .push_guard_check(&root, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, std::slice::from_ref(&name))
             .expect_err("uncertain blocks");
         assert_eq!(err.code, ErrorCode::EPushUncertain);
         assert!(err.to_string().contains(&blocking.to_string()));
+        let Some(ruk_core::protocol::ErrorDetail::Push { plan, state, refs }) =
+            err.detail.as_deref()
+        else {
+            panic!("uncertain guard must identify its plan in typed detail");
+        };
+        assert_eq!(*plan, blocking);
+        assert_eq!(*state, PushState::Uncertain);
+        assert_eq!(refs.items.len(), 1);
+        assert_eq!(refs.items[0].remote_ref.as_bytes(), name);
+        assert_eq!(refs.items[0].status, PushRefStatus::Uncertain);
         registry
-            .note_push_terminal(&root, blocking, std::slice::from_ref(&name), false)
+            .note_push_terminal(&root, remote, blocking, std::slice::from_ref(&name), false)
             .expect("confirmed clears");
         registry
-            .push_guard_check(&root, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, std::slice::from_ref(&name))
             .expect("confirmed passes");
         registry
-            .note_push_terminal(&root, blocking, std::slice::from_ref(&name), true)
+            .note_push_terminal(&root, remote, blocking, std::slice::from_ref(&name), true)
             .expect("uncertain records again");
         registry
-            .note_push_reconciled(&root, blocking, std::slice::from_ref(&name))
+            .note_push_reconciled(&root, remote, blocking, std::slice::from_ref(&name))
             .expect("reconcile clears");
         registry
-            .push_guard_check(&root, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, std::slice::from_ref(&name))
             .expect("reconciled passes");
+    }
+
+    #[tokio::test]
+    async fn reconciliation_markers_commit_through_the_lane() {
+        use ruk_core::protocol::{Mutation, PushReconcileArgs, SessionOpenArgs};
+
+        let plan = PlanId::generate();
+        let root = std::env::temp_dir().join(format!("ruk-push-marker-{plan}"));
+        std::fs::create_dir_all(&root).expect("scratch fits");
+        let store = Arc::new(
+            Store::create(
+                &root.join(".ruk"),
+                HashKind::Sha256,
+                Arc::new(ruk_core::store::PreparationBudget::reference_defaults()),
+            )
+            .expect("store creates"),
+        );
+        let principal = Principal::from_peer_uid(1000);
+        let coordinator =
+            HostedCoordinator::open(Arc::clone(&store), principal.clone(), root.clone())
+                .expect("coordinator opens");
+        let runner = coordinator
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("lane starts");
+        let (_hold, cancel) = cancellation();
+        let (session, _) = coordinator
+            .open_session(&principal, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("session opens");
+        for _ in 0..2 {
+            let request_id = RequestId::generate();
+            coordinator
+                .submit_prepared(
+                    &principal,
+                    PreparedMutation {
+                        session,
+                        request_id,
+                        request: Request::PushReconcile(Box::new(Mutation {
+                            request_id,
+                            args: PushReconcileArgs { plan },
+                        })),
+                        reply: Reply::PushReconcile(Box::new(PushReconcileReply {
+                            outcome: pending_outcome(session, request_id),
+                            plan,
+                            state: PushState::Uncertain,
+                            observations: BoundedList::complete(Vec::new()).expect("empty fits"),
+                        })),
+                        objects: Vec::new(),
+                        facts: vec![reconciliation_marker_fact(&store, plan).expect("marker")],
+                        workspace_fence: None,
+                        ref_transaction: None,
+                        ref_dependencies: Vec::new(),
+                        on_behalf_of: None,
+                    },
+                    &cancel,
+                )
+                .await
+                .expect("initial and repeated observations commit");
+            assert_eq!(
+                store
+                    .fact(
+                        FactTable::RemoteObservations,
+                        &reconciliation_marker_key(plan)
+                    )
+                    .expect("marker reads"),
+                Some(vec![RECONCILIATION_MARKER_VERSION])
+            );
+        }
+        coordinator.shutdown();
+        if let Err(err) = runner.await.expect("runner joins") {
+            assert_eq!(err.code, ErrorCode::ECancelled, "{err}");
+        }
+        drop(coordinator);
+        drop(store);
+        std::fs::remove_dir_all(root).expect("scratch removed");
     }
 
     #[test]
@@ -1545,27 +1735,28 @@ mod tests {
         std::fs::create_dir_all(&root).expect("scratch fits");
         let registry = Registry::new(vec![root.clone()]).expect("registry builds");
         let name = b"refs/heads/main".to_vec();
+        let remote = b"https://mirror.example/repo.git";
         let first = PlanId::generate();
         let second = PlanId::generate();
         registry
-            .note_push_terminal(&root, first, std::slice::from_ref(&name), true)
+            .note_push_terminal(&root, remote, first, std::slice::from_ref(&name), true)
             .expect("first plan blocks");
         registry
-            .note_push_terminal(&root, second, std::slice::from_ref(&name), true)
+            .note_push_terminal(&root, remote, second, std::slice::from_ref(&name), true)
             .expect("second plan takes the block");
         registry
-            .note_push_reconciled(&root, first, std::slice::from_ref(&name))
+            .note_push_reconciled(&root, remote, first, std::slice::from_ref(&name))
             .expect("other plan's reconcile runs");
         let err = registry
-            .push_guard_check(&root, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, std::slice::from_ref(&name))
             .expect_err("other plan's reconcile keeps the block");
         assert_eq!(err.code, ErrorCode::EPushUncertain);
         assert!(err.to_string().contains(&second.to_string()));
         registry
-            .note_push_reconciled(&root, second, std::slice::from_ref(&name))
+            .note_push_reconciled(&root, remote, second, std::slice::from_ref(&name))
             .expect("owning plan's reconcile runs");
         registry
-            .push_guard_check(&root, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, std::slice::from_ref(&name))
             .expect("owning plan's reconcile clears");
     }
 
@@ -1599,6 +1790,108 @@ mod tests {
 
         let reply = ErrorReply::from_core(&core);
         assert_eq!(reply.detail, Some((**box_detail).clone()));
+    }
+
+    #[test]
+    fn http_refusal_records_preserve_typed_errors_and_reject_corruption() {
+        let plan = PlanId::generate();
+        let root = std::env::temp_dir().join(format!("ruk-push-refusal-{plan}"));
+        std::fs::create_dir_all(&root).expect("scratch fits");
+        let store = Store::create(
+            &root.join(".ruk"),
+            HashKind::Sha256,
+            Arc::new(ruk_core::store::PreparationBudget::reference_defaults()),
+        )
+        .expect("store creates");
+        let reply = Reply::Push(Box::new(PushReply {
+            outcome: pending_outcome(SessionId::generate(), RequestId::generate()),
+            plan,
+            state: PushState::Rejected,
+            refs: BoundedList::complete(Vec::new()).expect("empty fits"),
+        }));
+        assert_eq!(
+            restore_http_refusal(&store, reply.clone()).expect("legacy rejection replays"),
+            reply
+        );
+        let error = to_core(GitError::Http {
+            detail: "rate limited".to_owned(),
+            status: 429,
+            retry_after_seconds: Some(120),
+            location: None,
+            body_preview: "retry later".to_owned(),
+        });
+        store
+            .publish(
+                Vec::new(),
+                &[http_refusal_fact(plan, &error).expect("refusal encodes")],
+                ruk_core::store::EventSource::LocalPush,
+                &ruk_core::store::EventContext::default(),
+            )
+            .expect("refusal persists");
+        assert_eq!(
+            restore_http_refusal(&store, reply.clone()).expect_err("typed refusal replays"),
+            error
+        );
+        let reconciled = Reply::PushReconcile(Box::new(PushReconcileReply {
+            outcome: pending_outcome(SessionId::generate(), RequestId::generate()),
+            plan,
+            state: PushState::Rejected,
+            observations: BoundedList::complete(Vec::new()).expect("empty fits"),
+        }));
+        assert_eq!(
+            restore_http_refusal(&store, reconciled.clone()).expect("reconcile stays a reply"),
+            reconciled
+        );
+        let invalid_version = ipc::encode_control(&HttpRefusalRecord {
+            version: HTTP_REFUSAL_VERSION + 1,
+            error: ErrorReply::from_core(&error),
+        })
+        .expect("version encodes");
+        let invalid_detail = ipc::encode_control(&HttpRefusalRecord {
+            version: HTTP_REFUSAL_VERSION,
+            error: ErrorReply::from_core(&CoreError::new(ErrorCode::EIo, "not HTTP")),
+        })
+        .expect("detail encodes");
+        let mut success = ErrorReply::from_core(&error);
+        success.detail = Some(ErrorDetail::http_detail(200, None, None, "success"));
+        let invalid_status = ipc::encode_control(&HttpRefusalRecord {
+            version: HTTP_REFUSAL_VERSION,
+            error: success,
+        })
+        .expect("status encodes");
+        for bytes in [
+            invalid_version,
+            invalid_detail,
+            invalid_status,
+            b"{".to_vec(),
+        ] {
+            let key = http_refusal_key(plan);
+            let previous = store
+                .fact(FactTable::RemoteObservations, &key)
+                .expect("previous reads")
+                .expect("previous exists");
+            store
+                .publish(
+                    Vec::new(),
+                    &[FactMutation {
+                        table: FactTable::RemoteObservations,
+                        key,
+                        expected: FactExpectation::Value(previous),
+                        value: Some(bytes),
+                    }],
+                    ruk_core::store::EventSource::LocalPush,
+                    &ruk_core::store::EventContext::default(),
+                )
+                .expect("corruption fixture persists");
+            assert_eq!(
+                restore_http_refusal(&store, reply.clone())
+                    .expect_err("invalid refusal cannot become a successful reply")
+                    .code,
+                ErrorCode::ECorrupt
+            );
+        }
+        drop(store);
+        std::fs::remove_dir_all(root).expect("scratch removed");
     }
 
     #[test]

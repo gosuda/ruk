@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ruk_core::change::RequestId;
-#[cfg(all(unix, not(test)))]
+#[cfg(unix)]
 use ruk_core::coord::per_repo::socket_path;
 use ruk_core::coord::per_repo::{self, CommitAnswer, CommitCall, ServeOutcome};
 use ruk_core::heads::Head;
@@ -66,7 +66,7 @@ impl Mode {
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Bounds spawn plus first contact with a fresh server.
-#[cfg(all(unix, not(test)))]
+#[cfg(unix)]
 const SPAWN_WAIT: Duration = Duration::from_millis(500);
 
 /// Bounds one submission exchange.
@@ -836,7 +836,6 @@ fn spawn_server(_store_dir: &Path) {}
 
 /// Polls for a serving coordinator after a spawn. Unix only: elsewhere the
 /// coordinator cannot serve, so spawns simply fall back to direct publish.
-/// Never compiled into unit tests, where spawning is stubbed out.
 ///
 /// The rendezvous is the published lock body, not the socket file: the
 /// server binds the socket before publishing, so a connectable socket
@@ -844,14 +843,13 @@ fn spawn_server(_store_dir: &Path) {}
 /// give up to a direct publish while the server is starting. Requiring
 /// both keeps racing commits on the lane. A dead owner still times out:
 /// its socket never connects, so the fallback path is unchanged.
-#[cfg(all(unix, not(test)))]
-fn wait_socket(store_dir: &Path) {
+#[cfg(unix)]
+pub(super) fn wait_socket(store_dir: &Path) {
     let sock = socket_path(store_dir);
     let end = std::time::Instant::now() + SPAWN_WAIT;
     while std::time::Instant::now() < end {
-        if per_repo::read_cli_endpoint(store_dir).is_ok()
-            && sock.exists()
-            && std::os::unix::net::UnixStream::connect(&sock).is_ok()
+        if std::os::unix::net::UnixStream::connect(&sock).is_ok()
+            && per_repo::read_cli_endpoint(store_dir).is_ok()
         {
             return;
         }

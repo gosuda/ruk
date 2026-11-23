@@ -140,6 +140,48 @@ fn run(
     verb(ctx, &owned)
 }
 
+#[cfg(unix)]
+#[test]
+fn coordinator_rendezvous_does_not_claim_an_unserved_store() {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    for stale in [false, true] {
+        let id = NEXT_TEMP.fetch_add(1, Ordering::SeqCst);
+        let base =
+            PathBuf::from("/tmp").join(format!("ruk-coord-probe-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("short socket directory");
+        let store_dir = base.join(".ruk");
+        drop(
+            Store::create(
+                &store_dir,
+                HashKind::Sha1,
+                Arc::new(PreparationBudget::reference_defaults()),
+            )
+            .expect("create store"),
+        );
+        let lock = store_dir.join("lock");
+        let body = b"unpublished endpoint\n";
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&lock)
+            .expect("ownership file");
+        file.write_all(body).expect("unpublished body");
+        drop(file);
+        if stale {
+            drop(
+                std::os::unix::net::UnixListener::bind(store_dir.join("coordinator.sock"))
+                    .expect("stale socket"),
+            );
+        }
+        super::coordinator::wait_socket(&store_dir);
+        assert_eq!(std::fs::read(&lock).expect("ownership body"), body);
+        std::fs::remove_dir_all(base).expect("cleanup");
+    }
+}
+
 #[test]
 fn verb_table_covers_advertised_names() {
     assert_eq!(VERBS.len(), 128);
@@ -2155,9 +2197,12 @@ fn push_over_smart_http_reports_status() {
             .as_bytes(),
     ));
     adv.extend_from_slice(b"0000");
-    // side-band-64k was advertised, so the report rides channel 1.
-    let mut report = pkt_frame(b"\x01unpack ok\n");
-    report.extend_from_slice(&pkt_frame(b"\x01ok refs/heads/main\n"));
+    let mut status = pkt_frame(b"unpack ok\n");
+    status.extend_from_slice(&pkt_frame(b"ok refs/heads/main\n"));
+    status.extend_from_slice(b"0000");
+    let mut channel = vec![1];
+    channel.extend_from_slice(&status);
+    let mut report = pkt_frame(&channel);
     report.extend_from_slice(b"0000");
     let (base, log) = smart_http_server(vec![
         (adv, "application/x-git-receive-pack-advertisement"),
@@ -2200,8 +2245,12 @@ fn push_isolates_diverged_refs_per_ref() {
             .as_bytes(),
     ));
     adv.extend_from_slice(b"0000");
-    let mut report = pkt_frame(b"\x01unpack ok\n");
-    report.extend_from_slice(&pkt_frame(b"\x01ok refs/heads/other\n"));
+    let mut status = pkt_frame(b"unpack ok\n");
+    status.extend_from_slice(&pkt_frame(b"ok refs/heads/other\n"));
+    status.extend_from_slice(b"0000");
+    let mut channel = vec![1];
+    channel.extend_from_slice(&status);
+    let mut report = pkt_frame(&channel);
     report.extend_from_slice(b"0000");
     let (base, log) = smart_http_server(vec![
         (adv, "application/x-git-receive-pack-advertisement"),
@@ -2997,7 +3046,8 @@ fn lfs_batch_server(mode: &str) -> (u16, std::thread::JoinHandle<Vec<String>>) {
                 .unwrap_or_default()
                 .to_owned();
             paths.push(path.clone());
-            if path.ends_with("/objects/batch") {
+            let resource = path.split_once('?').map_or(path.as_str(), |(path, _)| path);
+            if resource.ends_with("/objects/batch") {
                 assert!(head.starts_with("POST "), "batch is a POST: {head:?}");
                 assert!(
                     body.windows(BATCH_HEX.len())
@@ -3075,7 +3125,8 @@ fn lfs_batch_upload_server(mode: &str) -> (u16, std::thread::JoinHandle<UploadSe
             let method = parts.next().unwrap_or_default().to_owned();
             let path = parts.next().unwrap_or_default().to_owned();
             paths.push(path.clone());
-            if path.ends_with("/objects/batch") {
+            let resource = path.split_once('?').map_or(path.as_str(), |(path, _)| path);
+            if resource.ends_with("/objects/batch") {
                 assert_eq!(method, "POST", "batch is a POST: {head:?}");
                 let text = String::from_utf8_lossy(&body);
                 assert!(
@@ -3127,7 +3178,7 @@ fn lfs_payload_sync_downloads_via_batch() {
     super::state::config_write(
         ctx.store().expect("store"),
         "lfs.url",
-        &format!("http://127.0.0.1:{port}/repo.git/info/lfs"),
+        &format!("http://127.0.0.1:{port}/repo.git/info/lfs/?token=a%23b/#local"),
     )
     .expect("lfs.url");
     let out = run(verbs_transport::lfs_payload_sync, &mut ctx, &[]).expect("sync");
@@ -3152,7 +3203,7 @@ fn lfs_payload_sync_downloads_via_batch() {
     assert_eq!(
         paths,
         vec![
-            "/repo.git/info/lfs/objects/batch".to_owned(),
+            "/repo.git/info/lfs/objects/batch?token=a%23b/".to_owned(),
             format!("/dl/{BATCH_HEX}")
         ]
     );
@@ -3196,7 +3247,7 @@ fn lfs_payload_sync_uploads_via_batch() {
     super::state::config_write(
         ctx.store().expect("store"),
         "lfs.url",
-        &format!("http://127.0.0.1:{port}/repo.git/info/lfs"),
+        &format!("http://127.0.0.1:{port}/repo.git/info/lfs/?token=a%23b/#local"),
     )
     .expect("lfs.url");
     let out = run(verbs_transport::lfs_payload_sync, &mut ctx, &["--upload"]).expect("sync");
@@ -3210,7 +3261,7 @@ fn lfs_payload_sync_uploads_via_batch() {
     assert_eq!(
         paths,
         vec![
-            "/repo.git/info/lfs/objects/batch".to_owned(),
+            "/repo.git/info/lfs/objects/batch?token=a%23b/".to_owned(),
             format!("/up/{BATCH_HEX}")
         ]
     );

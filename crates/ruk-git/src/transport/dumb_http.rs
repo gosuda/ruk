@@ -105,10 +105,7 @@ fn get(url: &str, call: RpcCall<'_>) -> Result<(u16, Vec<u8>), GitError> {
 /// lost.
 #[must_use]
 pub fn dumb_refs_url(base: &str) -> String {
-    match base.split_once('?') {
-        Some((path, query)) => format!("{path}/info/refs?{query}"),
-        None => format!("{base}/info/refs"),
-    }
+    http::endpoint_url(base, "info/refs")
 }
 
 /// Parses a dumb `info/refs` body: one `<hex><tab-or-space><name>` line per
@@ -166,10 +163,7 @@ pub fn parse_dumb_info_refs(body: &[u8], kind: HashKind) -> Result<Vec<Advertise
 /// keeping a base query string like [`dumb_refs_url`].
 #[must_use]
 pub fn dumb_head_url(base: &str) -> String {
-    match base.split_once('?') {
-        Some((path, query)) => format!("{path}/HEAD?{query}"),
-        None => format!("{base}/HEAD"),
-    }
+    http::endpoint_url(base, "HEAD")
 }
 
 /// Parses a dumb `HEAD` body: one `ref: <name>` first line names the
@@ -254,7 +248,7 @@ fn pack_names(body: &[u8]) -> Vec<String> {
 /// 404 means no pack list (pack-less repositories answer that way), which
 /// is an empty list, not an error; other error statuses propagate.
 fn list_packs(base: &str, call: RpcCall<'_>) -> Result<Vec<String>, GitError> {
-    let url = format!("{base}/objects/info/packs");
+    let url = http::endpoint_url(base, "objects/info/packs");
     let (status, body) = get(&url, call)?;
     if status == 404 {
         return Ok(Vec::new());
@@ -319,7 +313,7 @@ fn fetch_loose(
 ) -> Result<(ObjectKind, Vec<u8>), GitError> {
     let hex = oid.to_hex();
     let (fan, rest) = hex.split_at(2);
-    let url = format!("{base}/objects/{fan}/{rest}");
+    let url = http::endpoint_url(base, format_args!("objects/{fan}/{rest}"));
     let (status, body) = get(&url, call)?;
     match status {
         _ if http::is_success(status) => {}
@@ -350,7 +344,7 @@ fn fetch_pack_file(
     max_bytes: u64,
     call: RpcCall<'_>,
 ) -> Result<Option<Vec<u8>>, GitError> {
-    let url = format!("{base}/objects/pack/{name}");
+    let url = http::endpoint_url(base, format_args!("objects/pack/{name}"));
     let (status, body) = get(&url, call)?;
     if status == 404 {
         return Ok(None);
@@ -577,7 +571,7 @@ mod tests {
             "https://host.x/a.git/info/refs"
         );
         assert_eq!(
-            dumb_refs_url("https://host.x/a?token=t"),
+            dumb_refs_url("https://host.x/a/?token=t#readme"),
             "https://host.x/a/info/refs?token=t"
         );
     }
@@ -589,7 +583,7 @@ mod tests {
             "https://host.x/a.git/HEAD"
         );
         assert_eq!(
-            dumb_head_url("https://host.x/a?token=t"),
+            dumb_head_url("https://host.x/a/?token=t#readme"),
             "https://host.x/a/HEAD?token=t"
         );
         assert_eq!(
