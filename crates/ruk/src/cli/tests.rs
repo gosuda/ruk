@@ -3035,7 +3035,8 @@ fn lfs_batch_server(mode: &str) -> (u16, std::thread::JoinHandle<Vec<String>>) {
                 .unwrap_or_default()
                 .to_owned();
             paths.push(path.clone());
-            if path.ends_with("/objects/batch") {
+            let resource = path.split_once('?').map_or(path.as_str(), |(path, _)| path);
+            if resource.ends_with("/objects/batch") {
                 assert!(head.starts_with("POST "), "batch is a POST: {head:?}");
                 assert!(
                     body.windows(BATCH_HEX.len())
@@ -3113,7 +3114,8 @@ fn lfs_batch_upload_server(mode: &str) -> (u16, std::thread::JoinHandle<UploadSe
             let method = parts.next().unwrap_or_default().to_owned();
             let path = parts.next().unwrap_or_default().to_owned();
             paths.push(path.clone());
-            if path.ends_with("/objects/batch") {
+            let resource = path.split_once('?').map_or(path.as_str(), |(path, _)| path);
+            if resource.ends_with("/objects/batch") {
                 assert_eq!(method, "POST", "batch is a POST: {head:?}");
                 let text = String::from_utf8_lossy(&body);
                 assert!(
@@ -3165,7 +3167,7 @@ fn lfs_payload_sync_downloads_via_batch() {
     super::state::config_write(
         ctx.store().expect("store"),
         "lfs.url",
-        &format!("http://127.0.0.1:{port}/repo.git/info/lfs"),
+        &format!("http://127.0.0.1:{port}/repo.git/info/lfs/?token=a%23b/#local"),
     )
     .expect("lfs.url");
     let out = run(verbs_transport::lfs_payload_sync, &mut ctx, &[]).expect("sync");
@@ -3190,7 +3192,7 @@ fn lfs_payload_sync_downloads_via_batch() {
     assert_eq!(
         paths,
         vec![
-            "/repo.git/info/lfs/objects/batch".to_owned(),
+            "/repo.git/info/lfs/objects/batch?token=a%23b/".to_owned(),
             format!("/dl/{BATCH_HEX}")
         ]
     );
@@ -3234,7 +3236,7 @@ fn lfs_payload_sync_uploads_via_batch() {
     super::state::config_write(
         ctx.store().expect("store"),
         "lfs.url",
-        &format!("http://127.0.0.1:{port}/repo.git/info/lfs"),
+        &format!("http://127.0.0.1:{port}/repo.git/info/lfs/?token=a%23b/#local"),
     )
     .expect("lfs.url");
     let out = run(verbs_transport::lfs_payload_sync, &mut ctx, &["--upload"]).expect("sync");
@@ -3248,7 +3250,7 @@ fn lfs_payload_sync_uploads_via_batch() {
     assert_eq!(
         paths,
         vec![
-            "/repo.git/info/lfs/objects/batch".to_owned(),
+            "/repo.git/info/lfs/objects/batch?token=a%23b/".to_owned(),
             format!("/up/{BATCH_HEX}")
         ]
     );
