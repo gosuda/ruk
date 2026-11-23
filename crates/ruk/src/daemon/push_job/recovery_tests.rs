@@ -167,9 +167,9 @@ fn uncertain_plan(remote: &[u8], reported: bool) -> PushPlanRecord {
 
 fn advertisement(plan: &PushPlanRecord) -> Vec<u8> {
     let mut body = Vec::new();
-    pktline::send(&mut body, b"# service=git-receive-pack\n").expect("service packet");
-    body.extend_from_slice(b"0000");
-    pktline::send(
+    pktline::encode_data(&mut body, b"# service=git-receive-pack\n").expect("service packet");
+    pktline::encode_flush(&mut body);
+    pktline::encode_data(
         &mut body,
         format!(
             "{} refs/heads/main\0report-status object-format=sha256\n",
@@ -179,7 +179,7 @@ fn advertisement(plan: &PushPlanRecord) -> Vec<u8> {
     )
     .expect("requested ref packet");
     for update in &plan.reported_updates {
-        pktline::send(
+        pktline::encode_data(
             &mut body,
             format!(
                 "{} {}\n",
@@ -190,7 +190,7 @@ fn advertisement(plan: &PushPlanRecord) -> Vec<u8> {
         )
         .expect("reported ref packet");
     }
-    body.extend_from_slice(b"0000");
+    pktline::encode_flush(&mut body);
     body
 }
 
@@ -257,7 +257,7 @@ async fn legacy_reconcile_requires_an_original_destination() {
             .push_guard_check(
                 &fixture.path,
                 b"https://original.example/repo.git",
-                &[plan.updates[0].name.clone()],
+                std::slice::from_ref(&plan.updates[0].name),
             )
             .expect_err("wildcard remains")
             .code,
@@ -379,7 +379,11 @@ async fn legacy_reconcile_binds_and_observes_reported_refs() {
         fixture
             .refs
             .registry
-            .push_guard_check(&fixture.path, remote.as_bytes(), &[update.name.clone()])
+            .push_guard_check(
+                &fixture.path,
+                remote.as_bytes(),
+                std::slice::from_ref(&update.name),
+            )
             .expect("observed requested and reported refs release their owner");
     }
     fixture.finish().await;
@@ -424,7 +428,11 @@ async fn legacy_reconcile_writer_race_preserves_guard_and_marker() {
             fixture
                 .refs
                 .registry
-                .push_guard_check(&fixture.path, remote.as_bytes(), &[update.name.clone()])
+                .push_guard_check(
+                    &fixture.path,
+                    remote.as_bytes(),
+                    std::slice::from_ref(&update.name)
+                )
                 .expect_err("failed publication retains every wildcard guard")
                 .code,
             ErrorCode::EPushUncertain
@@ -514,7 +522,7 @@ async fn legacy_reconcile_after_lost_completion_releases_committed_binding() {
                 .push_guard_check(
                     &fixture.path,
                     remote.as_bytes(),
-                    &[plan.updates[0].name.clone()]
+                    std::slice::from_ref(&plan.updates[0].name)
                 )
                 .expect_err("in-memory wildcard still awaits completion")
                 .code,
@@ -553,7 +561,11 @@ async fn legacy_reconcile_after_lost_completion_releases_committed_binding() {
             fixture
                 .refs
                 .registry
-                .push_guard_check(&fixture.path, remote.as_bytes(), &[update.name.clone()])
+                .push_guard_check(
+                    &fixture.path,
+                    remote.as_bytes(),
+                    std::slice::from_ref(&update.name),
+                )
                 .expect("receipt replay releases each committed wildcard owner");
         }
         fixture.finish().await;

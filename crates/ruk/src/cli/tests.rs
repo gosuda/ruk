@@ -849,10 +849,10 @@ fn clone_fetch_push_local_cycle() {
     run(verbs_stage::add, &mut copy_ctx, &["d.txt"]).expect("add");
     run(verbs_history::commit, &mut copy_ctx, &["-m", "downstream"]).expect("commit");
     run(verbs_transport::push, &mut copy_ctx, &["origin", "main"]).expect("push");
-    let plan = only_push_plan(&copy_ctx);
+    let mut src_ctx = repo_ctx(&root, test_env(&base));
+    let plan = only_push_plan(&src_ctx);
     assert_eq!(plan.remote, root.as_os_str().as_encoded_bytes());
     assert!(plan.remote_is_resolved);
-    let mut src_ctx = repo_ctx(&root, test_env(&base));
     let out = run(verbs_history::log, &mut src_ctx, &["--oneline"]).expect("log");
     assert!(String::from_utf8_lossy(&out).contains("downstream"));
     let _ = std::fs::remove_dir_all(&base);
@@ -1015,14 +1015,14 @@ fn push_mirror_syncs_refs_and_deletes_stale() {
         .expect("remote add");
         let out = run(verbs_transport::push, &mut src_ctx, &["--mirror", "origin"])
             .expect("push --mirror");
-        let plan = only_push_plan(&src_ctx);
-        assert_eq!(plan.remote, dst.as_os_str().as_encoded_bytes());
-        assert!(plan.remote_is_resolved);
         let text = String::from_utf8_lossy(&out).into_owned();
         assert!(text.contains("ok refs/heads/feat"), "got {text}");
     }
     {
         let mut dst_ctx = repo_ctx(&dst, test_env(&dst));
+        let plan = only_push_plan(&dst_ctx);
+        assert_eq!(plan.remote, dst.as_os_str().as_encoded_bytes());
+        assert!(plan.remote_is_resolved);
         let out = run(verbs_branch::show_ref, &mut dst_ctx, &[]).expect("show-ref");
         let text = String::from_utf8_lossy(&out).into_owned();
         assert!(text.contains("refs/heads/feat"), "got {text}");

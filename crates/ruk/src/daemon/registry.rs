@@ -47,6 +47,8 @@ struct RepoEntry {
     last_used: Instant,
 }
 
+type UncertainPushGuards = HashMap<(PathBuf, Option<Oid>, Vec<u8>), HashSet<PlanId>>;
+
 /// The mutable handle table behind [`Registry`].
 struct RegistryInner {
     /// Opaque handle to repository entry.
@@ -64,7 +66,7 @@ struct RegistryInner {
     /// plan reaches a terminal `Confirmed`/`Rejected` state or a reconcile
     /// observes the remote and clears the block. Restored from durable
     /// `PushPlans` rows when the repository is opened.
-    uncertain_pushes: HashMap<(PathBuf, Option<Oid>, Vec<u8>), HashSet<PlanId>>,
+    uncertain_pushes: UncertainPushGuards,
     /// Push idempotency keys with a job past replay: `(session, request
     /// id)` to the entry its waiters sleep on. A duplicate waits for
     /// the owner's terminal receipt instead of sending twice, so two
@@ -2432,7 +2434,7 @@ impl Registry {
 
     /// Restores outstanding uncertain push guards from durable plan state.
     fn restore_uncertain_pushes(
-        uncertain_pushes: &mut HashMap<(PathBuf, Option<Oid>, Vec<u8>), HashSet<PlanId>>,
+        uncertain_pushes: &mut UncertainPushGuards,
         canonical: &Path,
         store: &Store,
     ) -> Result<(), CoreError> {
