@@ -83,6 +83,16 @@ pub fn url_authority(url: &str) -> Result<String, GitError> {
     Ok(format!("{}:{}", parsed.host, parsed.port))
 }
 
+/// Appends a relative service path before the base query, discarding its fragment.
+#[must_use]
+pub fn endpoint_url(base: &str, path: impl std::fmt::Display) -> String {
+    let base = base.split_once('#').map_or(base, |(before, _)| before);
+    match base.split_once('?') {
+        Some((base, query)) => format!("{}/{path}?{query}", base.trim_end_matches('/')),
+        None => format!("{}/{path}", base.trim_end_matches('/')),
+    }
+}
+
 /// An `Authorization` header from the LFS auth environment, when set.
 ///
 /// `GIT_LFS_AUTH_BEARER` wins and is sent verbatim as `Bearer <value>`;
@@ -1887,6 +1897,45 @@ mod tests {
         assert!(parse_url("ftp://host.x/a").is_err());
         assert!(parse_url("http:///a").is_err());
         assert!(parse_url("http://host.x:abc/a").is_err());
+    }
+
+    #[test]
+    fn service_paths_precede_base_queries_and_fragments() {
+        use super::super::dumb_http::{dumb_head_url, dumb_refs_url};
+        use super::super::smart_http::{SmartService, refs_url, rpc_url};
+
+        let base = "http://host.test/repo.git/?token=a%23b#readme?ignored";
+        let cases = [
+            (
+                refs_url(base, SmartService::UploadPack),
+                "/repo.git/info/refs?service=git-upload-pack&token=a%23b",
+            ),
+            (
+                rpc_url(base, SmartService::UploadPack),
+                "/repo.git/git-upload-pack?token=a%23b",
+            ),
+            (dumb_refs_url(base), "/repo.git/info/refs?token=a%23b"),
+            (dumb_head_url(base), "/repo.git/HEAD?token=a%23b"),
+            (
+                endpoint_url(base, "objects/info/packs"),
+                "/repo.git/objects/info/packs?token=a%23b",
+            ),
+            (
+                endpoint_url(&endpoint_url(base, "info/lfs"), "objects/batch"),
+                "/repo.git/info/lfs/objects/batch?token=a%23b",
+            ),
+            (
+                endpoint_url("http://host.test/lfs/#configured", "objects/batch"),
+                "/lfs/objects/batch",
+            ),
+        ];
+        for (url, target) in cases {
+            let parsed = parse_url(&url).expect("service URL");
+            let mut output = Vec::new();
+            send_head(&mut output, "GET", &parsed, &[], None).expect("request");
+            let head = String::from_utf8(output).expect("ASCII head");
+            assert!(head.starts_with(&format!("GET {target} HTTP/1.1\r\n")));
+        }
     }
 
     #[test]

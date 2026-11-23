@@ -122,7 +122,8 @@ impl SmartService {
 /// [`http::url_authority`], which owns URL validation).
 pub fn normalize_base(url: &str) -> Result<String, GitError> {
     http::url_authority(url)?;
-    let base = url.trim_end_matches('/');
+    let base = url.split_once('#').map_or(url, |(before, _)| before);
+    let base = base.trim_end_matches('/');
     if base.is_empty() {
         return Err(GitError::Invalid {
             detail: format!("http remote {url:?} has no usable base"),
@@ -136,17 +137,19 @@ pub fn normalize_base(url: &str) -> Result<String, GitError> {
 /// so no server-side parameter is lost.
 #[must_use]
 pub fn refs_url(base: &str, service: SmartService) -> String {
+    let base = base.split_once('#').map_or(base, |(before, _)| before);
     let (path, query) = match base.split_once('?') {
         Some((path, query)) => (path, format!("&{query}")),
         None => (base, String::new()),
     };
+    let path = path.trim_end_matches('/');
     format!("{path}/info/refs?service={}{query}", service.name())
 }
 
 /// The RPC URL: `<base>/<svc>`.
 #[must_use]
 pub fn rpc_url(base: &str, service: SmartService) -> String {
-    format!("{base}/{}", service.name())
+    http::endpoint_url(base, service.name())
 }
 
 /// Builds owned request headers from `extra_headers` (resolved
@@ -1351,7 +1354,7 @@ mod tests {
     #[test]
     fn base_and_url_shapes() {
         assert_eq!(
-            normalize_base("https://host.x/a.git/").expect("base"),
+            normalize_base("https://host.x/a.git/#readme").expect("base"),
             "https://host.x/a.git"
         );
         assert_eq!(
@@ -2048,6 +2051,7 @@ mod tests {
             body,
             false,
         )]);
+        let base = normalize_base(&format!("{base}#readme")).expect("base");
         let adv = discover(
             &base,
             SmartService::UploadPack,

@@ -3577,7 +3577,7 @@ fn sync_via_batch_at(call: BatchDownload<'_>) -> Result<(), GitError> {
         auth,
     } = call;
 
-    let batch_url = format!("{}/objects/batch", endpoint.trim_end_matches('/'));
+    let batch_url = http::endpoint_url(endpoint, "objects/batch");
     let tls_roots = tls_roots_for(ctx)?;
     let request = http::batch_request_body(pending)?;
     let mut headers: Vec<(String, String)> = vec![
@@ -3987,7 +3987,7 @@ fn lfs_endpoint_for_remote(ctx: &Ctx, remote_label: &str) -> Option<String> {
 fn derive_lfs_endpoint(fetch_url: &str) -> Option<String> {
     let lower = fetch_url.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
-        Some(format!("{}/info/lfs", fetch_url.trim_end_matches('/')))
+        Some(ruk_git::transport::http::endpoint_url(fetch_url, "info/lfs"))
     } else {
         None
     }
@@ -4054,7 +4054,7 @@ fn sync_via_batch_upload_at(
     if present.is_empty() {
         return Ok(());
     }
-    let batch_url = format!("{}/objects/batch", endpoint.trim_end_matches('/'));
+    let batch_url = http::endpoint_url(endpoint, "objects/batch");
     let tls_roots = tls_roots_for(ctx)?;
     let request = http::batch_upload_request_body(present)?;
     let mut headers: Vec<(String, String)> = vec![
@@ -4816,6 +4816,23 @@ mod lfs_auth_tests {
     use super::*;
     use ruk_git::transport::credentials::{TransportAuth, TransportAuthKind};
     use std::collections::HashMap;
+
+    #[test]
+    fn derived_lfs_endpoints_preserve_queries_and_drop_fragments() {
+        for (remote, endpoint) in [
+            (
+                "https://git.example/repo.git/#readme",
+                "https://git.example/repo.git/info/lfs",
+            ),
+            (
+                "https://git.example/repo.git/?token=a%23b#readme",
+                "https://git.example/repo.git/info/lfs?token=a%23b",
+            ),
+        ] {
+            assert_eq!(derive_lfs_endpoint(remote).as_deref(), Some(endpoint));
+        }
+        assert!(derive_lfs_endpoint("ssh://git.example/repo.git#readme").is_none());
+    }
 
     #[test]
     fn explicit_policy_yields_header_on_matching_origin() {
