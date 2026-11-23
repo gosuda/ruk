@@ -332,6 +332,7 @@ struct Url {
     secure: bool,
     host: String,
     authority: String,
+    ip: Option<std::net::IpAddr>,
     port: u16,
     path: String,
 }
@@ -374,7 +375,7 @@ fn parse_url(url: &str) -> Result<Url, GitError> {
     // `rsplit` always yields one item; the empty host fails below.
     let hostport: &str = authority.rsplit('@').next().unwrap_or_default();
     let default_port = if secure { 443 } else { 80 };
-    let (host, port, authority) = if let Some(bracketed) = hostport.strip_prefix('[') {
+    let (host, port, authority, ip) = if let Some(bracketed) = hostport.strip_prefix('[') {
         let end = bracketed.find(']').ok_or_else(|| invalid("bad ipv6"))?;
         let port = match bracketed[end + 1..].strip_prefix(':') {
             Some(text) => {
@@ -396,11 +397,11 @@ fn parse_url(url: &str) -> Result<Url, GitError> {
             }
             None => host,
         };
-        if address.parse::<std::net::Ipv6Addr>().is_err() {
-            return Err(invalid("bad ipv6"));
-        }
+        let ip = address
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| invalid("bad ipv6"))?;
         let authority = format!("[{address}]{}", &bracketed[end + 1..]);
-        (host.to_owned(), port, authority)
+        (host.to_owned(), port, authority, Some(ip.into()))
     } else if let Some((host, port_text)) = hostport.rsplit_once(':') {
         if host.is_empty() {
             return Err(invalid("empty host"));
@@ -412,9 +413,14 @@ fn parse_url(url: &str) -> Result<Url, GitError> {
             return Err(invalid("bad port"));
         }
         let port = port_text.parse::<u16>().map_err(|_| invalid("bad port"))?;
-        (host.to_owned(), port, hostport.to_owned())
+        (host.to_owned(), port, hostport.to_owned(), host.parse().ok())
     } else {
-        (hostport.to_owned(), default_port, hostport.to_owned())
+        (
+            hostport.to_owned(),
+            default_port,
+            hostport.to_owned(),
+            hostport.parse().ok(),
+        )
     };
     if host.is_empty() {
         return Err(invalid("empty host"));
@@ -423,6 +429,7 @@ fn parse_url(url: &str) -> Result<Url, GitError> {
         secure,
         host,
         authority,
+        ip,
         port,
         path,
     })
@@ -676,15 +683,7 @@ fn connect(
     if !parsed.secure {
         return Ok(Stream::Plain(socket));
     }
-    let name = if let Ok(ip) = parsed.host.parse::<std::net::IpAddr>() {
-        rustls::pki_types::ServerName::IpAddress(ip.into())
-    } else {
-        rustls::pki_types::ServerName::try_from(parsed.host.clone()).map_err(|_| {
-            GitError::Invalid {
-                detail: format!("bad tls server name {:?}", parsed.host),
-            }
-        })?
-    };
+    let name = tls_server_name(parsed)?;
     let connection = rustls::ClientConnection::new(
         match tls_roots {
             Some(pem) => tls_config_with_roots(pem)?,
@@ -702,6 +701,17 @@ fn connect(
         detail: format!("tls handshake with {} failed: {err}", parsed.host),
     })?;
     Ok(Stream::Tls(Box::new(tls)))
+}
+
+fn tls_server_name(parsed: &Url) -> Result<rustls::pki_types::ServerName<'static>, GitError> {
+    match parsed.ip {
+        Some(ip) => Ok(rustls::pki_types::ServerName::IpAddress(ip.into())),
+        None => rustls::pki_types::ServerName::try_from(parsed.host.clone()).map_err(|_| {
+            GitError::Invalid {
+                detail: format!("bad tls server name {:?}", parsed.host),
+            }
+        }),
+    }
 }
 
 /// Writes one HTTP/1.1 request head: method line, Host, caller headers,
@@ -2007,6 +2017,30 @@ mod tests {
             assert_eq!(parsed.port, 8080);
             assert_eq!(parsed.authority, "[fe80::1]:8080");
         }
+    }
+
+    #[test]
+    fn tls_identity_uses_the_bare_ip_address() {
+        use rustls::pki_types::ServerName;
+
+        for (url, address) in [
+            ("https://[fe80::1%3]/repo", "fe80::1"),
+            ("https://[fe80::1%eth0]:8443/repo", "fe80::1"),
+            ("https://[fe80::1]/repo", "fe80::1"),
+            ("https://127.0.0.1:8443/repo", "127.0.0.1"),
+        ] {
+            let parsed = parse_url(url).expect("URL");
+            let ip: std::net::IpAddr = address.parse().expect("IP address");
+            assert_eq!(
+                tls_server_name(&parsed).expect("TLS identity"),
+                ServerName::IpAddress(ip.into())
+            );
+        }
+        let parsed = parse_url("https://host.test/repo").expect("DNS URL");
+        assert_eq!(
+            tls_server_name(&parsed).expect("DNS identity"),
+            ServerName::try_from("host.test").expect("DNS name")
+        );
     }
 
     #[test]
