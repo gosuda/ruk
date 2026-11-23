@@ -24,6 +24,7 @@ use ruk_core::MAX_CONTROL_FRAME_BYTES;
 use ruk_core::change::{PlanId, RequestId, SessionId};
 use ruk_core::coord::{HostedCoordinator, Principal, cancellation};
 use ruk_core::error::{CoreError, ErrorCode};
+use ruk_core::ids::{HashKind, Oid};
 use ruk_core::protocol::{BoundedList, ErrorDetail, PushRefOutcome, PushRefStatus};
 use ruk_core::refdata::RefName;
 use ruk_core::search::{SearchPool, SearchPoolConfig};
@@ -56,12 +57,13 @@ struct RegistryInner {
     /// removes. Cleared once the rename lands or fails.
     deleting: HashSet<PathBuf>,
     /// Refs blocked by an unresolved push plan: `(canonical repo path,
-    /// ref name)` to the `Uncertain` plan that owns the block. A new push
+    /// destination digest, ref name)` to the `Uncertain` plan that owns
+    /// the block. A new push
     /// to a blocked ref refuses with `E_PUSH_UNCERTAIN` until the owning
     /// plan reaches a terminal `Confirmed`/`Rejected` state or a reconcile
     /// observes the remote and clears the block. Restored from durable
     /// `PushPlans` rows when the repository is opened.
-    uncertain_pushes: HashMap<(PathBuf, Vec<u8>), PlanId>,
+    uncertain_pushes: HashMap<(PathBuf, Oid, Vec<u8>), PlanId>,
     /// Push idempotency keys with a job past replay: `(session, request
     /// id)` to the entry its waiters sleep on. A duplicate waits for
     /// the owner's terminal receipt instead of sending twice, so two
@@ -118,6 +120,99 @@ impl fmt::Debug for Registry {
             .field("entries", &entries)
             .finish()
     }
+}
+
+fn push_destination(remote: &[u8]) -> Result<Oid, CoreError> {
+    use ruk_git::transport::{http, net, smart_http};
+
+    let remote = std::str::from_utf8(remote)
+        .map_err(|_| CoreError::new(ErrorCode::ECorrupt, "push destination is not UTF-8"))?;
+    let endpoint = net::parse_endpoint(remote)
+        .map_err(|_| CoreError::new(ErrorCode::EInvalid, "push destination is invalid"))?;
+    let (transport, host, port, user, path) = match endpoint {
+        net::Endpoint::Http { secure, url } => {
+            let base = smart_http::normalize_base(&url)
+                .map_err(|_| CoreError::new(ErrorCode::EInvalid, "HTTP push destination is invalid"))?;
+            let authority = http::url_authority(&base)
+                .map_err(|_| CoreError::new(ErrorCode::EInvalid, "HTTP push authority is invalid"))?;
+            let (host, port) = authority
+                .rsplit_once(':')
+                .expect("HTTP authority includes its numeric port");
+            let port = port.parse::<u16>().expect("HTTP authority port is valid");
+            let (_, address) = base.split_once("://").expect("HTTP base has a scheme");
+            let path = address.find(['/', '?']).map_or("", |at| &address[at..]);
+            (
+                if secure { 4 } else { 3 },
+                host.to_owned(),
+                port,
+                String::new(),
+                path.as_bytes().to_vec(),
+            )
+        }
+        net::Endpoint::Ssh {
+            host,
+            port,
+            user,
+            path,
+        } => (
+            1,
+            host,
+            port.unwrap_or(22),
+            user.unwrap_or_default(),
+            path.into_bytes(),
+        ),
+        net::Endpoint::Git { host, port, path } => (
+            2,
+            host,
+            port.unwrap_or(9418),
+            String::new(),
+            path.into_bytes(),
+        ),
+        net::Endpoint::Local { path } => {
+            let absolute = std::path::absolute(path)
+                .map_err(|_| CoreError::new(ErrorCode::EIo, "push destination path is unavailable"))?;
+            let mut path = PathBuf::new();
+            for component in absolute.components() {
+                match component {
+                    std::path::Component::ParentDir => {
+                        path.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    other => path.push(other.as_os_str()),
+                }
+            }
+            let bytes = path.as_os_str().as_encoded_bytes().to_vec();
+            #[cfg(windows)]
+            let bytes = bytes.to_ascii_lowercase();
+            (0, String::new(), 0, String::new(), bytes)
+        }
+    };
+    let host = host.trim_matches(['[', ']']);
+    let (address, zone) = host
+        .split_once('%')
+        .map_or((host, None), |(address, zone)| (address, Some(zone)));
+    let mut host = address.parse::<std::net::IpAddr>().map_or_else(
+        |_| address.trim_end_matches('.').to_ascii_lowercase(),
+        |ip| ip.to_string(),
+    );
+    if let Some(zone) = zone {
+        host.push('%');
+        host.push_str(zone);
+    }
+    Ok(HashKind::Sha256.hash_parts(&[
+        b"ruk-push-destination-v1\0",
+        &[transport],
+        &u64::try_from(host.len())
+            .expect("host length fits u64")
+            .to_le_bytes(),
+        host.as_bytes(),
+        &port.to_le_bytes(),
+        &u64::try_from(user.len())
+            .expect("user length fits u64")
+            .to_le_bytes(),
+        user.as_bytes(),
+        &path,
+    ])?)
 }
 
 impl Registry {
@@ -335,18 +430,24 @@ impl Registry {
 
     /// Refuses a push whose ref is blocked by an unresolved plan: returns
     /// the owning `Uncertain` plan when any of `refs` is blocked for
-    /// `repo`, so the job fails `E_PUSH_UNCERTAIN` before sending.
+    /// `repo` and `remote`, so the job fails `E_PUSH_UNCERTAIN` before sending.
     ///
     /// # Errors
     /// `E_PUSH_UNCERTAIN` naming the blocking plan, `E_IO` when the guard
-    /// lock is poisoned.
-    pub(crate) fn push_guard_check(&self, repo: &Path, refs: &[Vec<u8>]) -> Result<(), CoreError> {
+    /// lock is poisoned, or a destination parsing error.
+    pub(crate) fn push_guard_check(
+        &self,
+        repo: &Path,
+        remote: &[u8],
+        refs: &[Vec<u8>],
+    ) -> Result<(), CoreError> {
+        let destination = push_destination(remote)?;
         let inner = self
             .inner
             .lock()
             .map_err(|_| CoreError::new(ErrorCode::EIo, "push guard lock is poisoned"))?;
         for name in refs {
-            let key = (repo.to_path_buf(), name.clone());
+            let key = (repo.to_path_buf(), destination, name.clone());
             if let Some(plan) = inner.uncertain_pushes.get(&key) {
                 let noun = String::from_utf8_lossy(name);
                 return Err(CoreError::new(
@@ -367,24 +468,26 @@ impl Registry {
     }
 
     /// Records the terminal state of one push plan on the guard: an
-    /// `Uncertain` plan blocks its refs, while `Confirmed`/`Rejected`
+    /// `Uncertain` plan blocks its remote refs, while `Confirmed`/`Rejected`
     /// clears the entries that plan owns so the next push may proceed.
     ///
     /// # Errors
-    /// `E_IO` when the guard lock is poisoned.
+    /// `E_IO` when the guard lock is poisoned, or a destination parsing error.
     pub(crate) fn note_push_terminal(
         &self,
         repo: &Path,
+        remote: &[u8],
         plan: PlanId,
         refs: &[Vec<u8>],
         uncertain: bool,
     ) -> Result<(), CoreError> {
+        let destination = push_destination(remote)?;
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| CoreError::new(ErrorCode::EIo, "push guard lock is poisoned"))?;
         for name in refs {
-            let key = (repo.to_path_buf(), name.clone());
+            let key = (repo.to_path_buf(), destination, name.clone());
             if uncertain {
                 inner.uncertain_pushes.insert(key, plan);
             } else if inner.uncertain_pushes.get(&key) == Some(&plan) {
@@ -401,19 +504,21 @@ impl Registry {
     /// [`Registry::note_push_terminal`].
     ///
     /// # Errors
-    /// `E_IO` when the guard lock is poisoned.
+    /// `E_IO` when the guard lock is poisoned, or a destination parsing error.
     pub(crate) fn note_push_reconciled(
         &self,
         repo: &Path,
+        remote: &[u8],
         plan: PlanId,
         refs: &[Vec<u8>],
     ) -> Result<(), CoreError> {
+        let destination = push_destination(remote)?;
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| CoreError::new(ErrorCode::EIo, "push guard lock is poisoned"))?;
         for name in refs {
-            let key = (repo.to_path_buf(), name.clone());
+            let key = (repo.to_path_buf(), destination, name.clone());
             if inner.uncertain_pushes.get(&key) == Some(&plan) {
                 inner.uncertain_pushes.remove(&key);
             }
@@ -2284,7 +2389,7 @@ impl Registry {
 
     /// Restores outstanding uncertain push guards from durable plan state.
     fn restore_uncertain_pushes(
-        uncertain_pushes: &mut HashMap<(PathBuf, Vec<u8>), PlanId>,
+        uncertain_pushes: &mut HashMap<(PathBuf, Oid, Vec<u8>), PlanId>,
         canonical: &Path,
         store: &Store,
     ) -> Result<(), CoreError> {
@@ -2324,8 +2429,9 @@ impl Registry {
                         }
                     };
                     if !reconciled {
+                        let destination = push_destination(&plan.remote)?;
                         for update in &plan.updates {
-                            let key = (canonical.to_path_buf(), update.name.clone());
+                            let key = (canonical.to_path_buf(), destination, update.name.clone());
                             uncertain_pushes.insert(key, plan.id);
                         }
                     }
@@ -4387,6 +4493,143 @@ mod tests {
     }
 
     #[test]
+    fn push_destination_normalizes_transport_aliases_without_credentials() {
+        for aliases in [
+            &[
+                "https://mirror.example/repo.git",
+                "https://MIRROR.EXAMPLE.:443/repo.git/#readme",
+                "https://alice:CANARY@mirror.example/repo.git",
+            ][..],
+            &[
+                "https://mirror.example/repo.git?repo=first",
+                "https://bob:OTHER@MIRROR.EXAMPLE:443/repo.git/?repo=first#readme",
+            ][..],
+            &[
+                "http://[2001:db8::1]/repo.git",
+                "http://[2001:0db8:0:0:0:0:0:1]:80/repo.git/",
+            ][..],
+            &[
+                "ssh://alice@mirror.example/repo.git",
+                "ssh://alice:CANARY@MIRROR.EXAMPLE:22/repo.git",
+                "alice@mirror.example:/repo.git",
+            ][..],
+            &[
+                "git://mirror.example/repo.git",
+                "git://MIRROR.EXAMPLE:9418/repo.git",
+            ][..],
+        ] {
+            let expected = push_destination(aliases[0].as_bytes()).expect("destination parses");
+            for alias in aliases {
+                assert_eq!(
+                    push_destination(alias.as_bytes()).expect("alias parses"),
+                    expected,
+                );
+            }
+        }
+        let relative = b"guard-destination";
+        let absolute = std::path::absolute("./guard-destination").expect("absolute path");
+        assert_eq!(
+            push_destination(relative).expect("relative destination"),
+            push_destination(absolute.to_str().expect("test path is UTF-8").as_bytes())
+                .expect("absolute destination"),
+        );
+        let destinations = [
+            "https://mirror.example/repo.git",
+            "https://mirror.example/other.git",
+            "https://other.example/repo.git",
+            "https://mirror.example:8443/repo.git",
+            "https://mirror.example/repo.git?repo=first",
+            "https://mirror.example/repo.git?repo=second",
+            "http://mirror.example/repo.git",
+            "ssh://mirror.example/repo.git",
+            "ssh://alice@mirror.example/repo.git",
+            "ssh://bob@mirror.example/repo.git",
+            "alice@mirror.example:repo.git",
+            "bob@mirror.example:repo.git",
+            "git://mirror.example/repo.git",
+        ];
+        let keys: HashSet<_> = destinations
+            .iter()
+            .map(|remote| push_destination(remote.as_bytes()).expect("destination parses"))
+            .collect();
+        assert_eq!(keys.len(), destinations.len());
+        let err = push_destination(b"https://alice:CANARY@host:bad/repo?token=SECRET")
+            .expect_err("malformed destination fails");
+        assert!(!err.to_string().contains("CANARY"));
+        assert!(!err.to_string().contains("SECRET"));
+    }
+
+    #[test]
+    fn uncertain_push_guards_isolate_destinations_and_plan_ownership() {
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("registry opens");
+        let names = vec![b"refs/heads/main".to_vec()];
+        let first_remote = b"https://first.example/private.git?repo=FIRST";
+        let first_alias = b"https://FIRST.EXAMPLE:443/private.git/?repo=FIRST#readme";
+        let second_remote = b"https://second.example/private.git?repo=SECOND";
+        let query_remote = b"https://first.example/private.git?repo=SECOND";
+        let first = PlanId::generate();
+        let second = PlanId::generate();
+        let query_plan = PlanId::generate();
+        registry
+            .note_push_terminal(&root, first_remote, first, &names, true)
+            .expect("first destination blocks");
+        registry
+            .push_guard_check(&root, second_remote, &names)
+            .expect("other private destination remains independent");
+        registry
+            .push_guard_check(&root, query_remote, &names)
+            .expect("query-routed destination remains independent");
+        let err = registry
+            .push_guard_check(&root, first_alias, &names)
+            .expect_err("same destination alias remains blocked");
+        assert_eq!(err.code, ErrorCode::EPushUncertain);
+        assert!(!err.to_string().contains("FIRST"));
+        registry
+            .note_push_terminal(&root, second_remote, second, &names, true)
+            .expect("second destination blocks independently");
+        registry
+            .note_push_terminal(&root, query_remote, query_plan, &names, true)
+            .expect("query-routed destination blocks independently");
+        registry
+            .note_push_reconciled(&root, second_remote, first, &names)
+            .expect("another plan cannot clear second destination");
+        assert_eq!(
+            registry
+                .push_guard_check(&root, second_remote, &names)
+                .expect_err("second plan still blocks")
+                .code,
+            ErrorCode::EPushUncertain,
+        );
+        registry
+            .note_push_reconciled(&root, first_alias, first, &names)
+            .expect("first destination reconciles");
+        registry
+            .push_guard_check(&root, first_remote, &names)
+            .expect("first destination clears");
+        assert_eq!(
+            registry
+                .push_guard_check(&root, query_remote, &names)
+                .expect_err("query-routed destination stays blocked")
+                .code,
+            ErrorCode::EPushUncertain,
+        );
+        assert_eq!(
+            registry
+                .push_guard_check(&root, second_remote, &names)
+                .expect_err("other destination stays blocked")
+                .code,
+            ErrorCode::EPushUncertain,
+        );
+        registry
+            .note_push_terminal(&root, second_remote, second, &names, false)
+            .expect("second destination reaches terminal state");
+        registry
+            .push_guard_check(&root, second_remote, &names)
+            .expect("second destination clears");
+    }
+
+    #[test]
     fn open_restores_uncertain_push_guards_across_restart() {
         use ruk_core::HashKind;
         use ruk_core::change::PlanId;
@@ -4411,7 +4654,14 @@ mod tests {
             old: HashKind::Sha256.zero_oid(),
             new: HashKind::Sha256.zero_oid(),
         }];
-        let mut plan = PushPlanRecord::prepare(plan_id, b"origin".to_vec(), false, updates);
+        let remote = b"https://mirror.example/first.git?repo=FIRST";
+        let alias = b"https://MIRROR.EXAMPLE:443/first.git/?repo=FIRST#readme";
+        let other_remote = b"https://mirror.example/second.git?repo=SECOND";
+        let other_plan_id = PlanId::generate();
+        let mut other =
+            PushPlanRecord::prepare(other_plan_id, other_remote.to_vec(), false, updates.clone());
+        other.begin_send().expect("other plan starts sending");
+        let mut plan = PushPlanRecord::prepare(plan_id, remote.to_vec(), false, updates);
         plan.begin_send().expect("begin_send");
         plan.mark_uncertain();
         let mutation = plan
@@ -4420,11 +4670,16 @@ mod tests {
         store
             .publish(
                 Vec::new(),
-                &[mutation],
+                &[
+                    mutation,
+                    other
+                        .persist_mutation(HashKind::Sha256, None)
+                        .expect("other plan encodes"),
+                ],
                 EventSource::LocalPush,
                 &EventContext::default(),
             )
-            .expect("plan persists");
+            .expect("plans persist");
         drop(store);
 
         let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
@@ -4439,20 +4694,36 @@ mod tests {
             .expect("open restores repository and guards");
 
         let err = registry
-            .push_guard_check(&path, std::slice::from_ref(&guarded_ref))
+            .push_guard_check(&path, alias, std::slice::from_ref(&guarded_ref))
             .expect_err("uncertain push plan guards ref after restart");
         assert_eq!(err.code, ErrorCode::EPushUncertain);
         assert!(err.to_string().contains(&plan_id.to_string()));
 
         registry
-            .push_guard_check(&path, std::slice::from_ref(&unguarded_ref))
+            .push_guard_check(&path, remote, std::slice::from_ref(&unguarded_ref))
             .expect("unguarded ref passes");
 
+        let other_err = registry
+            .push_guard_check(&path, other_remote, std::slice::from_ref(&guarded_ref))
+            .expect_err("other destination restores its own sending plan");
+        assert!(other_err.to_string().contains(&other_plan_id.to_string()));
         registry
-            .note_push_reconciled(&path, plan_id, std::slice::from_ref(&guarded_ref))
+            .push_guard_check(
+                &path,
+                b"https://mirror.example/third.git",
+                std::slice::from_ref(&guarded_ref),
+            )
+            .expect("unrelated destination remains unblocked after restart");
+
+        registry
+            .note_push_reconciled(&path, remote, plan_id, std::slice::from_ref(&guarded_ref))
             .expect("reconcile clears guard");
         registry
-            .push_guard_check(&path, std::slice::from_ref(&guarded_ref))
+            .push_guard_check(&path, alias, std::slice::from_ref(&guarded_ref))
             .expect("cleared ref passes");
+        let other_err = registry
+            .push_guard_check(&path, other_remote, std::slice::from_ref(&guarded_ref))
+            .expect_err("reconciling first destination preserves second destination");
+        assert!(other_err.to_string().contains(&other_plan_id.to_string()));
     }
 }
