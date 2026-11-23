@@ -468,7 +468,7 @@ impl ReceivePolicy for HostPolicy {
         }
         let mut landed_commands: Vec<HookCommand> = Vec::new();
         for (command, verdict) in state.commands.iter().zip(state.verdicts.iter()) {
-            let landed_now = match verdict {
+            let landed_command = match verdict {
                 RefVerdict::Accept => {
                     let key = (
                         command.old.as_str(),
@@ -478,9 +478,9 @@ impl ReceivePolicy for HostPolicy {
                     match outstanding.get_mut(&key) {
                         Some(count) if *count > 0 => {
                             *count -= 1;
-                            true
+                            Some(key)
                         }
-                        _ => false,
+                        _ => None,
                     }
                 }
                 RefVerdict::Divert { alternate, .. } => {
@@ -496,20 +496,20 @@ impl ReceivePolicy for HostPolicy {
                                 && *entry_new == new.as_str()
                                 && *entry_name == name.as_str()
                         }) {
-                        Some((_, count)) => {
+                        Some((key, count)) => {
                             *count -= 1;
-                            true
+                            Some(*key)
                         }
-                        None => false,
+                        None => None,
                     }
                 }
-                RefVerdict::Reject { .. } | RefVerdict::RejectPush { .. } => false,
+                RefVerdict::Reject { .. } | RefVerdict::RejectPush { .. } => None,
             };
-            if landed_now {
+            if let Some((old, new, name)) = landed_command {
                 landed_commands.push(HookCommand {
-                    name: command.name.clone(),
-                    old: command.old.clone(),
-                    new: command.new.clone(),
+                    name: name.to_owned(),
+                    old: old.to_owned(),
+                    new: new.to_owned(),
                     authorized: command.authorized,
                 });
             }
@@ -539,6 +539,90 @@ mod tests {
         assert!(is_review_ref("refs/changes/1/patchset/2"));
         assert!(!is_review_ref("refs/changesx/1"));
         assert!(!is_review_ref("refs/heads/main"));
+    }
+
+    #[test]
+    fn post_receive_reports_landed_diverted_refs_once() {
+        let (client, _server) = hook_bridge();
+        let policy = HostPolicy::new(Capabilities::default(), Duration::from_secs(1), client);
+        let old = "1".repeat(40);
+        let new = "2".repeat(40);
+        let review_ref = "refs/changes/7/patchset/2";
+        let diverted = || StoredCommand {
+            name: "refs/for/main".to_owned(),
+            old: "0".repeat(40),
+            new: new.clone(),
+            authorized: true,
+            live: true,
+        };
+        let verdict = |name: &str| RefVerdict::Divert {
+            alternate: AlternateRef {
+                refname: name.as_bytes().to_vec(),
+                old_oid: None,
+                new_oid: None,
+                forced: false,
+            },
+            write_through_cas: true,
+        };
+        *policy.state.lock().expect("hook state lock") = Some(PreState {
+            commands: vec![
+                diverted(),
+                diverted(),
+                diverted(),
+                StoredCommand {
+                    name: "refs/heads/main".to_owned(),
+                    old: old.clone(),
+                    new: new.clone(),
+                    authorized: true,
+                    live: true,
+                },
+            ],
+            verdicts: vec![
+                verdict(review_ref),
+                verdict(review_ref),
+                verdict("refs/changes/8/patchset/1"),
+                RefVerdict::Accept,
+            ],
+            new_commits: vec![new.clone()],
+            new_commits_truncated: false,
+            pack_bytes: 42,
+            push_options: vec!["topic=example".to_owned()],
+        });
+        let lines = format!("{old} {new} {review_ref}\n{old} {new} refs/heads/main\n");
+        let landed = LandedRefs {
+            lines: &lines,
+            push_options: &[],
+            push_options_negotiated: false,
+            quarantine: None,
+        };
+
+        policy.post_receive(&landed);
+
+        let call = policy.take_post_receive().expect("landed callback");
+        assert_eq!(call.phase, HookPhase::PostReceive);
+        assert_eq!(
+            call.commands,
+            vec![
+                HookCommand {
+                    name: review_ref.to_owned(),
+                    old: old.clone(),
+                    new: new.clone(),
+                    authorized: true,
+                },
+                HookCommand {
+                    name: "refs/heads/main".to_owned(),
+                    old,
+                    new: new.clone(),
+                    authorized: true,
+                },
+            ]
+        );
+        assert_eq!(call.new_commits, vec![new]);
+        assert_eq!(call.pack_bytes, 42);
+        assert_eq!(call.push_options, vec!["topic=example"]);
+        assert!(policy.take_post_receive().is_none());
+        policy.post_receive(&landed);
+        assert!(policy.take_post_receive().is_none());
     }
 
     #[test]

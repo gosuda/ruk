@@ -1890,22 +1890,22 @@ impl HostedCoordinator {
             }
             let empty: Vec<&[u8]> = Vec::new();
             let lines = split_lines(&bytes);
-            let (old_lines, new_lines, old_label, new_label) = match old {
+            let (old_lines, new_lines, old_path, new_path) = match old {
                 Some(_) => (
                     lines.as_slice(),
                     empty.as_slice(),
-                    format!("a/{}", String::from_utf8_lossy(path.as_bytes())),
-                    String::from("/dev/null"),
+                    Some(path.as_bytes()),
+                    None,
                 ),
                 None => (
                     empty.as_slice(),
                     lines.as_slice(),
-                    String::from("/dev/null"),
-                    format!("b/{}", String::from_utf8_lossy(path.as_bytes())),
+                    None,
+                    Some(path.as_bytes()),
                 ),
             };
             let ops = lcs_align(old_lines, new_lines)?;
-            let patch = unified_patch(&old_label, &new_label, old_lines, new_lines, &ops);
+            let patch = unified_patch(old_path, new_path, old_lines, new_lines, &ops);
             let inline = super::reads::inline_body(patch)?;
             return Ok(DiffBody::Unified { patch: inline });
         };
@@ -1920,10 +1920,9 @@ impl HostedCoordinator {
         let old_lines = split_lines(&old_bytes);
         let new_lines = split_lines(&new_bytes);
         let ops = lcs_align(&old_lines, &new_lines)?;
-        let label = String::from_utf8_lossy(path.as_bytes()).into_owned();
         let patch = unified_patch(
-            &format!("a/{label}"),
-            &format!("b/{label}"),
+            Some(path.as_bytes()),
+            Some(path.as_bytes()),
             &old_lines,
             &new_lines,
             &ops,
