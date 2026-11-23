@@ -140,8 +140,6 @@ fn scrub_outcomes(outcomes: Vec<RefOutcome>) -> Vec<RefOutcome> {
         .collect()
 }
 
-/// Keeps the SSH login identity needed to reconnect, while removing passwords.
-/// Other labels retain the general userinfo sanitizer without URL normalization.
 fn scrub_plan_remote(remote: &[u8]) -> Vec<u8> {
     if let Ok(mut url) = gix_url::parse(remote)
         && url.scheme == gix_url::Scheme::Ssh

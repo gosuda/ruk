@@ -202,7 +202,7 @@ impl<'a> PushJob<'a> {
             .collect();
         self.refs
             .registry
-            .push_guard_check(self.repo_path, &ref_names)?;
+            .push_guard_check(self.repo_path, url.as_bytes(), &ref_names)?;
 
         // Discovery plus translation runs on the bulkhead: store reads and
         // network I/O never block the lane. Each phase arms its own
@@ -319,12 +319,13 @@ impl<'a> PushJob<'a> {
         // first (`PushState` is `Copy`, so this reads nothing twice).
         let plan_state = wire_state(plan.state);
         let job = self.snapshot();
-        let observations = self
+        let (observations, remote) = self
             .refs
             .transport
             .run(move || {
                 let advertised = job.discover(&remote, &bridge)?;
                 map_observations(kind, &plan, &advertised)
+                    .map(|observations| (observations, plan.remote))
             })
             .await??;
 
@@ -359,7 +360,7 @@ impl<'a> PushJob<'a> {
             .await?;
         self.refs
             .registry
-            .note_push_reconciled(self.repo_path, plan_id, &observed_refs)?;
+            .note_push_reconciled(self.repo_path, &remote, plan_id, &observed_refs)?;
         encode_reply(Some(request_id), stored)
     }
 
@@ -676,6 +677,7 @@ impl BlockingJob {
         // plan's block must not depend on the lane half surviving.
         self.registry.note_push_terminal(
             &self.repo,
+            &plan.remote,
             plan_id,
             &names,
             state == PushState::Uncertain,
@@ -1612,15 +1614,16 @@ mod tests {
         std::fs::create_dir_all(&root).expect("scratch fits");
         let registry = Registry::new(vec![root.clone()]).expect("registry builds");
         let name = b"refs/heads/main".to_vec();
+        let remote = b"https://mirror.example/repo.git";
         registry
-            .push_guard_check(&root, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, std::slice::from_ref(&name))
             .expect("clean ref passes");
         let blocking = PlanId::generate();
         registry
-            .note_push_terminal(&root, blocking, std::slice::from_ref(&name), true)
+            .note_push_terminal(&root, remote, blocking, std::slice::from_ref(&name), true)
             .expect("uncertain records");
         let err = registry
-            .push_guard_check(&root, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, std::slice::from_ref(&name))
             .expect_err("uncertain blocks");
         assert_eq!(err.code, ErrorCode::EPushUncertain);
         assert!(err.to_string().contains(&blocking.to_string()));
@@ -1635,19 +1638,19 @@ mod tests {
         assert_eq!(refs.items[0].remote_ref.as_bytes(), name);
         assert_eq!(refs.items[0].status, PushRefStatus::Uncertain);
         registry
-            .note_push_terminal(&root, blocking, std::slice::from_ref(&name), false)
+            .note_push_terminal(&root, remote, blocking, std::slice::from_ref(&name), false)
             .expect("confirmed clears");
         registry
-            .push_guard_check(&root, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, std::slice::from_ref(&name))
             .expect("confirmed passes");
         registry
-            .note_push_terminal(&root, blocking, std::slice::from_ref(&name), true)
+            .note_push_terminal(&root, remote, blocking, std::slice::from_ref(&name), true)
             .expect("uncertain records again");
         registry
-            .note_push_reconciled(&root, blocking, std::slice::from_ref(&name))
+            .note_push_reconciled(&root, remote, blocking, std::slice::from_ref(&name))
             .expect("reconcile clears");
         registry
-            .push_guard_check(&root, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, std::slice::from_ref(&name))
             .expect("reconciled passes");
     }
 
@@ -1732,27 +1735,28 @@ mod tests {
         std::fs::create_dir_all(&root).expect("scratch fits");
         let registry = Registry::new(vec![root.clone()]).expect("registry builds");
         let name = b"refs/heads/main".to_vec();
+        let remote = b"https://mirror.example/repo.git";
         let first = PlanId::generate();
         let second = PlanId::generate();
         registry
-            .note_push_terminal(&root, first, std::slice::from_ref(&name), true)
+            .note_push_terminal(&root, remote, first, std::slice::from_ref(&name), true)
             .expect("first plan blocks");
         registry
-            .note_push_terminal(&root, second, std::slice::from_ref(&name), true)
+            .note_push_terminal(&root, remote, second, std::slice::from_ref(&name), true)
             .expect("second plan takes the block");
         registry
-            .note_push_reconciled(&root, first, std::slice::from_ref(&name))
+            .note_push_reconciled(&root, remote, first, std::slice::from_ref(&name))
             .expect("other plan's reconcile runs");
         let err = registry
-            .push_guard_check(&root, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, std::slice::from_ref(&name))
             .expect_err("other plan's reconcile keeps the block");
         assert_eq!(err.code, ErrorCode::EPushUncertain);
         assert!(err.to_string().contains(&second.to_string()));
         registry
-            .note_push_reconciled(&root, second, std::slice::from_ref(&name))
+            .note_push_reconciled(&root, remote, second, std::slice::from_ref(&name))
             .expect("owning plan's reconcile runs");
         registry
-            .push_guard_check(&root, std::slice::from_ref(&name))
+            .push_guard_check(&root, remote, std::slice::from_ref(&name))
             .expect("owning plan's reconcile clears");
     }
 
