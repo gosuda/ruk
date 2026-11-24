@@ -503,6 +503,39 @@ fn branch_checkout_merge_fast_forward() {
 }
 
 #[test]
+fn hash_object_help_respects_argument_boundaries() {
+    let base = temp_base("hash-object-help-boundary");
+    let body = b"help-shaped filename\n";
+    std::fs::write(base.join("--help"), body).expect("help-shaped filename");
+    let expected = format!(
+        "{}\n",
+        HashKind::Sha1
+            .hash_git_object("blob", body)
+            .expect("object id")
+            .to_hex()
+    )
+    .into_bytes();
+    for verb in ["hash-object", "git-hash-object"] {
+        let (stdout, stderr) =
+            run_argv(test_env(&base), &["ruk", verb, "--help"]).expect("command help");
+        assert!(stdout.starts_with(b"ruk hash-object - "));
+        assert!(stderr.is_empty());
+        let (stdout, stderr) =
+            run_argv(test_env(&base), &["ruk", verb, "--", "--help"]).expect("hash help filename");
+        assert_eq!(stdout, expected);
+        assert!(stderr.is_empty());
+        let err = run_argv(test_env(&base), &["ruk", verb, "-t", "--help"])
+            .expect_err("help is an object type value");
+        assert!(matches!(
+            err,
+            ruk_git::GitError::Invalid { detail }
+                if detail == "unknown object type \"--help\""
+        ));
+    }
+    std::fs::remove_dir_all(base).expect("cleanup");
+}
+
+#[test]
 fn hash_object_reads_format_while_store_is_open() {
     for kind in [HashKind::Sha1, HashKind::Sha256] {
         let base = temp_base("hash-object-held-store");

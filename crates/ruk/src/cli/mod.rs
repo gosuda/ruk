@@ -401,7 +401,7 @@ pub(crate) fn run_inner(
     let entry = dispatch::lookup(&verb).ok_or_else(|| GitError::Unsupported {
         command: verb.clone(),
     })?;
-    if verb_args.iter().any(|arg| arg == "--help") {
+    if verb_args.first().is_some_and(|arg| arg == "--help") {
         return Ok((dispatch::help_text(Some(entry)), Vec::new()));
     }
     let hash_only = entry.name == "hash-object" && !verbs_objects::hash_object_writes(&verb_args)?;
