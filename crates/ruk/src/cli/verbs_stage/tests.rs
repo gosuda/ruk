@@ -164,11 +164,7 @@ fn add_all_from_nested_directory_uses_repository_relative_walk_paths() {
     )
     .expect("add all from nested directory");
     assert_eq!(
-        run(
-            &base,
-            &["-C", root.to_str().expect("root"), "ls-files"],
-        )
-        .expect("index"),
+        run(&base, &["-C", root.to_str().expect("root"), "ls-files"],).expect("index"),
         b"nested/child.txt\nroot.txt\n"
     );
     std::fs::remove_dir_all(base).expect("cleanup");
@@ -182,8 +178,11 @@ fn absolute_worktree_alias_preserves_final_symlink() {
     let (base, root) = init("worktree-alias");
     let alias = base.join("alias");
     symlink(&root, &alias).expect("worktree alias");
-    std::fs::write(base.join("outside"), b"outside content must not be staged\n")
-        .expect("outside file");
+    std::fs::write(
+        base.join("outside"),
+        b"outside content must not be staged\n",
+    )
+    .expect("outside file");
     symlink("../outside", root.join("link")).expect("final symlink");
     let operand = alias.join("link");
     run(
@@ -228,11 +227,8 @@ fn intermediate_symlink_escape_is_rejected_before_staging() {
     symlink(&outside, root.join("escape")).expect("intermediate symlink");
     let absolute = root.join("escape").join("private");
     for operand in ["escape/private", absolute.to_str().expect("absolute path")] {
-        let err = run(
-            &base,
-            &["-C", root.to_str().expect("root"), "add", operand],
-        )
-        .expect_err("outside parent");
+        let err = run(&base, &["-C", root.to_str().expect("root"), "add", operand])
+            .expect_err("outside parent");
         assert!(matches!(
             err,
             GitError::Invalid { detail } if detail.contains("outside the repository")
@@ -241,12 +237,9 @@ fn intermediate_symlink_escape_is_rejected_before_staging() {
     symlink(base.join("absent"), root.join("dangling")).expect("dangling parent");
     assert!(super::normalize_staging_path(&root.join("dangling").join("file")).is_err());
     assert!(
-        run(
-            &base,
-            &["-C", root.to_str().expect("root"), "ls-files"],
-        )
-        .expect("unchanged index")
-        .is_empty()
+        run(&base, &["-C", root.to_str().expect("root"), "ls-files"],)
+            .expect("unchanged index")
+            .is_empty()
     );
     assert_eq!(
         std::fs::read(outside.join("private")).expect("unchanged outside file"),

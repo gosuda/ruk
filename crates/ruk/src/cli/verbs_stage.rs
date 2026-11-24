@@ -271,11 +271,9 @@ pub(crate) fn repo_path_of(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitError> 
     let base = std::fs::canonicalize(&ctx.file_base).map_err(|err| GitError::Io {
         detail: format!("resolving worktree {}: {err}", ctx.file_base.display()),
     })?;
-    let relative = joined
-        .strip_prefix(&base)
-        .map_err(|_| GitError::Invalid {
-            detail: format!("pathspec {text:?} is outside the repository"),
-        })?;
+    let relative = joined.strip_prefix(&base).map_err(|_| GitError::Invalid {
+        detail: format!("pathspec {text:?} is outside the repository"),
+    })?;
     let mut parts: Vec<u8> = Vec::new();
     for component in relative.components() {
         match component {

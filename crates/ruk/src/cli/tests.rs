@@ -574,8 +574,8 @@ fn command_help_preserves_repository_state() {
     drop(held);
     assert_eq!(snapshot(), before);
     for (verb, flag) in [("status", "--short"), ("add", "--all"), ("commit", "--all")] {
-        let (stdout, stderr) = run_argv(test_env(&root), &["ruk", verb, flag, "--help"])
-            .expect("help after a switch");
+        let (stdout, stderr) =
+            run_argv(test_env(&root), &["ruk", verb, flag, "--help"]).expect("help after a switch");
         assert!(stdout.starts_with(format!("ruk {verb} - ").as_bytes()));
         assert!(stderr.is_empty());
         assert_eq!(snapshot(), before);
