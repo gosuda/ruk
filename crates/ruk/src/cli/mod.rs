@@ -401,10 +401,19 @@ pub(crate) fn run_inner(
     let entry = dispatch::lookup(&verb).ok_or_else(|| GitError::Unsupported {
         command: verb.clone(),
     })?;
+    let help = || (dispatch::help_text(Some(entry)), Vec::new());
     if verb_args.first().is_some_and(|arg| arg == "--help") {
-        return Ok((dispatch::help_text(Some(entry)), Vec::new()));
+        return Ok(help());
     }
-    let hash_only = entry.name == "hash-object" && !verbs_objects::hash_object_writes(&verb_args)?;
+    let hash_only = if entry.name == "hash-object" {
+        match verbs_objects::hash_object_writes(&verb_args) {
+            Ok(write) => !write,
+            Err(GitError::HelpRequested) => return Ok(help()),
+            Err(err) => return Err(err),
+        }
+    } else {
+        false
+    };
     let mut ctx = if hash_only {
         open_hash_ctx(env, git_dir, work_tree, bare, cli_config, egress)?
     } else {
@@ -413,8 +422,11 @@ pub(crate) fn run_inner(
             env, git_dir, work_tree, bare, cli_config, needs_repo, egress,
         )?
     };
-    let stdout = (entry.run)(&mut ctx, &verb_args)?;
-    Ok((stdout, std::mem::take(&mut ctx.stderr)))
+    match (entry.run)(&mut ctx, &verb_args) {
+        Ok(stdout) => Ok((stdout, std::mem::take(&mut ctx.stderr))),
+        Err(GitError::HelpRequested) => Ok(help()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Parsed leading globals: collected options, the verb, and its arguments.
@@ -784,6 +796,9 @@ pub(crate) fn collect(args: &[String], specs: &[FlagSpec]) -> Result<Collected, 
         if arg == "--" {
             out.positionals.extend_from_slice(&args[index + 1..]);
             return Ok(out);
+        }
+        if arg == "--help" {
+            return Err(GitError::HelpRequested);
         }
         if arg.starts_with("--") {
             index = collect_long(args, index, specs, &mut out)?;

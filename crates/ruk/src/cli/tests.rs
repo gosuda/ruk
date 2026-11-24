@@ -515,24 +515,83 @@ fn hash_object_help_respects_argument_boundaries() {
             .to_hex()
     )
     .into_bytes();
+    let help_args: &[&[&str]] = &[&["--help"], &["--stdin", "--help"]];
+    let type_args: &[&[&str]] = &[
+        &["-t", "--help"],
+        &["--type", "--help"],
+        &["-t--help"],
+        &["--type=--help"],
+    ];
     for verb in ["hash-object", "git-hash-object"] {
-        let (stdout, stderr) =
-            run_argv(test_env(&base), &["ruk", verb, "--help"]).expect("command help");
-        assert!(stdout.starts_with(b"ruk hash-object - "));
-        assert!(stderr.is_empty());
+        for args in help_args {
+            let mut env = test_env(&base);
+            env.vars.insert("GIT_DIR".to_owned(), "missing".to_owned());
+            env.stdin = Some(body.to_vec());
+            let mut argv = vec!["ruk", verb];
+            argv.extend_from_slice(args);
+            let (stdout, stderr) = run_argv(env, &argv).expect("help before repository access");
+            assert!(stdout.starts_with(b"ruk hash-object - "));
+            assert!(stderr.is_empty());
+        }
         let (stdout, stderr) =
             run_argv(test_env(&base), &["ruk", verb, "--", "--help"]).expect("hash help filename");
         assert_eq!(stdout, expected);
         assert!(stderr.is_empty());
-        let err = run_argv(test_env(&base), &["ruk", verb, "-t", "--help"])
-            .expect_err("help is an object type value");
-        assert!(matches!(
-            err,
-            ruk_git::GitError::Invalid { detail }
-                if detail == "unknown object type \"--help\""
-        ));
+        for args in type_args {
+            let mut argv = vec!["ruk", verb];
+            argv.extend_from_slice(args);
+            let err = run_argv(test_env(&base), &argv).expect_err("help is an object type value");
+            assert!(matches!(
+                err,
+                ruk_git::GitError::Invalid { detail }
+                    if detail == "unknown object type \"--help\""
+            ));
+        }
     }
     std::fs::remove_dir_all(base).expect("cleanup");
+}
+
+#[test]
+fn command_help_preserves_repository_state() {
+    let (root, _) = seeded_repo("command-help-boundary", "tracked.txt", b"before\n");
+    std::fs::write(root.join("tracked.txt"), b"after\n").expect("modified worktree");
+    let snapshot = || {
+        let store = open_store(&root);
+        (
+            store.generation().expect("generation"),
+            super::state::scan_index(&store, store.hash_kind()).expect("index"),
+            super::state::head_oid(&store).expect("HEAD"),
+        )
+    };
+    let before = snapshot();
+    let held = open_store(&root);
+    for verb in ["status", "add", "commit"] {
+        let (stdout, stderr) =
+            run_argv(test_env(&root), &["ruk", verb, "--help"]).expect("help with held store");
+        assert!(stdout.starts_with(format!("ruk {verb} - ").as_bytes()));
+        assert!(stderr.is_empty());
+    }
+    drop(held);
+    assert_eq!(snapshot(), before);
+    for (verb, flag) in [("status", "--short"), ("add", "--all"), ("commit", "--all")] {
+        let (stdout, stderr) = run_argv(test_env(&root), &["ruk", verb, flag, "--help"])
+            .expect("help after a switch");
+        assert!(stdout.starts_with(format!("ruk {verb} - ").as_bytes()));
+        assert!(stderr.is_empty());
+        assert_eq!(snapshot(), before);
+    }
+    assert_eq!(
+        std::fs::read(root.join("tracked.txt")).expect("unchanged worktree"),
+        b"after\n"
+    );
+    run_argv(test_env(&root), &["ruk", "add", "tracked.txt"]).expect("stage changed file");
+    run_argv(test_env(&root), &["ruk", "commit", "-m", "--help"])
+        .expect("commit literal help message");
+    let (stdout, stderr) =
+        run_argv(test_env(&root), &["ruk", "log", "--format=%s"]).expect("commit subjects");
+    assert_eq!(stdout, b"--help\nseed\n");
+    assert!(stderr.is_empty());
+    std::fs::remove_dir_all(root.parent().expect("parent")).expect("cleanup");
 }
 
 #[test]
