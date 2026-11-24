@@ -104,9 +104,9 @@ impl CliEnv {
 ///
 /// `root` holds `.ruk/`; `file_base` is where worktree files are read and
 /// written (`--work-tree` moves it, like `git --work-tree`). A bare
-/// repository refuses worktree verbs the way Git does. Repository-optional
-/// verbs (`init`, `clone`, `hash-object`) run without an open store and open
-/// the stores they need themselves.
+/// repository refuses worktree verbs the way Git does. `init` and `clone`
+/// open their own stores; `hash-object` discovers an existing repository
+/// and requires one only when writing.
 pub(crate) struct Ctx {
     /// The open native store, when the verb needs a repository.
     pub(crate) store: Option<Store>,
@@ -396,15 +396,16 @@ pub(crate) fn run_inner(
     if verb_args.iter().any(|arg| arg == "--help") {
         return Ok((dispatch::help_text(Some(entry)), Vec::new()));
     }
-    let mut ctx = open_ctx(
-        env,
-        git_dir,
-        work_tree,
-        bare,
-        cli_config,
-        entry.needs_repo,
-        egress,
-    )?;
+    let needs_repo = if entry.name == "hash-object" {
+        let write = verbs_objects::hash_object_writes(&verb_args)?;
+        if !write && git_dir.is_none() {
+            git_dir = discover_root(&env.cwd, bare);
+        }
+        write || git_dir.is_some()
+    } else {
+        entry.needs_repo
+    };
+    let mut ctx = open_ctx(env, git_dir, work_tree, bare, cli_config, needs_repo, egress)?;
     let stdout = (entry.run)(&mut ctx, &verb_args)?;
     Ok((stdout, std::mem::take(&mut ctx.stderr)))
 }
@@ -628,24 +629,23 @@ fn find_root(start: &Path, git_dir: Option<&Path>, bare: bool) -> Result<PathBuf
             detail: format!("not a ruk repository: {}", dir.display()),
         });
     }
-    if bare {
-        if start.join(".ruk").is_dir() {
-            return Ok(start.to_path_buf());
-        }
-        return Err(GitError::Invalid {
-            detail: "not a ruk repository".to_owned(),
-        });
-    }
-    let mut current = Some(start);
-    while let Some(dir) = current {
-        if dir.join(".ruk").is_dir() {
-            return Ok(dir.to_path_buf());
-        }
-        current = dir.parent();
-    }
-    Err(GitError::Invalid {
-        detail: "not a ruk repository (no .ruk found upward)".to_owned(),
+    discover_root(start, bare).ok_or_else(|| GitError::Invalid {
+        detail: if bare {
+            "not a ruk repository".to_owned()
+        } else {
+            "not a ruk repository (no .ruk found upward)".to_owned()
+        },
     })
+}
+
+fn discover_root(start: &Path, bare: bool) -> Option<PathBuf> {
+    if bare {
+        return start.join(".ruk").is_dir().then(|| start.to_path_buf());
+    }
+    start
+        .ancestors()
+        .find(|dir| dir.join(".ruk").is_dir())
+        .map(Path::to_path_buf)
 }
 
 /// One flag declaration for [`collect`]: its long name, short alias, and

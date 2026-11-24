@@ -37,10 +37,12 @@ use super::tree::{
 };
 use super::{Ctx, FlagSpec, collect, line};
 
-/// Hashes bytes as an object id, optionally storing the object.
-///
-/// Oracle: `git/builtin/hash-object.c`.
-pub(crate) fn hash_object(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+pub(crate) fn hash_object_writes(args: &[String]) -> Result<bool, GitError> {
+    let (opts, _) = hash_object_options(args)?;
+    Ok(opts.is_set("write"))
+}
+
+fn hash_object_options(args: &[String]) -> Result<(super::Collected, String), GitError> {
     let specs = [
         FlagSpec {
             long: "write",
@@ -65,6 +67,14 @@ pub(crate) fn hash_object(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Git
             detail: format!("unknown object type {object_type:?}"),
         });
     }
+    Ok((opts, object_type))
+}
+
+/// Hashes bytes as an object id, optionally storing the object.
+///
+/// Oracle: `git/builtin/hash-object.c`.
+pub(crate) fn hash_object(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let (opts, object_type) = hash_object_options(args)?;
     let mut inputs: Vec<Vec<u8>> = Vec::new();
     if opts.positionals.is_empty() || opts.is_set("stdin") {
         inputs.push(super::read_stdin_bytes(&ctx.env)?);
