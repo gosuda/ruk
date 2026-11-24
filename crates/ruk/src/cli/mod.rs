@@ -405,7 +405,9 @@ pub(crate) fn run_inner(
     } else {
         entry.needs_repo
     };
-    let mut ctx = open_ctx(env, git_dir, work_tree, bare, cli_config, needs_repo, egress)?;
+    let mut ctx = open_ctx(
+        env, git_dir, work_tree, bare, cli_config, needs_repo, egress,
+    )?;
     let stdout = (entry.run)(&mut ctx, &verb_args)?;
     Ok((stdout, std::mem::take(&mut ctx.stderr)))
 }
