@@ -10179,3 +10179,47 @@ fn wave_l_stat_cache_trust_rule() {
         super::state::StatTrust::Rehash
     ));
 }
+
+#[test]
+fn two_revision_diff_survives_obstructed_worktree_parent() {
+    let base = temp_base("diff-obstructed-parent");
+    let env = test_env(&base);
+    let mut ctx = Ctx {
+        store: None,
+        root: base.clone(),
+        file_base: base.clone(),
+        kind: None,
+        env: env.clone(),
+        bare: false,
+        cli_config: Vec::new(),
+        stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private(),
+    };
+    verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
+    let root = base.join("repo");
+    std::fs::create_dir_all(root.join("docs/guide")).expect("guide directory");
+    std::fs::write(root.join("docs/guide/intro.md"), b"first\n").expect("seed file");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_stage::add, &mut ctx, &["docs/guide/intro.md"]).expect("add seed");
+    run(verbs_history::commit, &mut ctx, &["-m", "seed"]).expect("commit seed");
+    std::fs::write(root.join("docs/guide/intro.md"), b"second\n").expect("revise file");
+    run(verbs_stage::add, &mut ctx, &["docs/guide/intro.md"]).expect("add revision");
+    run(verbs_history::commit, &mut ctx, &["-m", "revise intro"]).expect("commit revision");
+    // A regular file where the historical directory was: both stored trees
+    // still carry docs/guide/intro.md, and the pathspec conversion must not
+    // read the obstructed worktree parent.
+    std::fs::remove_dir_all(root.join("docs")).expect("remove directory");
+    std::fs::write(root.join("docs"), b"obstruction\n").expect("obstructing file");
+    let out = run(
+        verbs_history::diff,
+        &mut ctx,
+        &["HEAD~1", "HEAD", "--", "docs/guide/intro.md"],
+    )
+    .expect("historical diff with obstructed parent");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(
+        text.contains("docs/guide/intro.md") && text.contains("+second"),
+        "unexpected diff: {text:?}"
+    );
+    std::fs::remove_dir_all(base).expect("cleanup");
+}

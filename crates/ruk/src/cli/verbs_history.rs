@@ -7435,9 +7435,19 @@ pub(crate) fn diff(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         },
     };
     path_texts.extend(dash_paths);
+    // Two-revision diffs compare stored trees only: convert pathspecs
+    // lexically so a worktree parent obstructed by a regular file cannot fail
+    // the conversion of a stored path.
+    let tree_to_tree = rev_b.is_some();
     let paths: Vec<RepoPath> = path_texts
         .iter()
-        .map(|text| super::verbs_stage::repo_path_of(ctx, text.as_bytes()))
+        .map(|text| {
+            if tree_to_tree {
+                super::verbs_stage::repo_path_lexical(ctx, text.as_bytes())
+            } else {
+                super::verbs_stage::repo_path_of(ctx, text.as_bytes())
+            }
+        })
         .collect::<Result<_, _>>()?;
     let staged = opts.is_set("cached") || opts.is_set("staged");
     // Only tree/tree and tree/index pairs rename-pair: worktree additions
