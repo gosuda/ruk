@@ -592,8 +592,14 @@ fn hash_object_reads_format_while_store_is_open() {
             std::fs::read(&format_path).expect("unchanged format"),
             format_before
         );
-        assert_eq!(store.generation().expect("unchanged generation"), generation_before);
-        assert_eq!(store.iter_objects().expect("unchanged objects"), objects_before);
+        assert_eq!(
+            store.generation().expect("unchanged generation"),
+            generation_before
+        );
+        assert_eq!(
+            store.iter_objects().expect("unchanged objects"),
+            objects_before
+        );
         #[cfg(unix)]
         assert_eq!(
             std::fs::read(&metadata_path).expect("unchanged metadata"),
@@ -657,8 +663,14 @@ fn hash_object_rejects_invalid_format_without_opening_store() {
             std::fs::read(&format_path).expect("unchanged invalid format"),
             bytes
         );
-        assert_eq!(store.generation().expect("unchanged generation"), generation_before);
-        assert_eq!(store.iter_objects().expect("unchanged objects"), objects_before);
+        assert_eq!(
+            store.generation().expect("unchanged generation"),
+            generation_before
+        );
+        assert_eq!(
+            store.iter_objects().expect("unchanged objects"),
+            objects_before
+        );
         #[cfg(unix)]
         assert_eq!(
             std::fs::read(&metadata_path).expect("unchanged metadata"),
@@ -673,8 +685,14 @@ fn hash_object_rejects_invalid_format_without_opening_store() {
         assert!(matches!(err, ruk_git::GitError::Io { .. }));
     }
     assert!(!format_path.exists());
-    assert_eq!(store.generation().expect("unchanged generation"), generation_before);
-    assert_eq!(store.iter_objects().expect("unchanged objects"), objects_before);
+    assert_eq!(
+        store.generation().expect("unchanged generation"),
+        generation_before
+    );
+    assert_eq!(
+        store.iter_objects().expect("unchanged objects"),
+        objects_before
+    );
     #[cfg(unix)]
     assert_eq!(
         std::fs::read(&metadata_path).expect("unchanged metadata"),
