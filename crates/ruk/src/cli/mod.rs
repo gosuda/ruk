@@ -353,12 +353,15 @@ pub(crate) fn run_inner(
     for global in globals {
         match global {
             Global::ChangeDir(dir) => {
+                let dir = env.cwd.join(dir);
                 if !dir.is_dir() {
                     return Err(GitError::Io {
                         detail: format!("cannot change to {}", dir.display()),
                     });
                 }
-                env.cwd = dir;
+                env.cwd = std::fs::canonicalize(&dir).map_err(|err| GitError::Io {
+                    detail: format!("cannot change to {}: {err}", dir.display()),
+                })?;
             }
             Global::Define(key, value) => cli_config.push((key, value)),
             Global::GitDir(dir) => git_dir = Some(dir),
@@ -371,6 +374,11 @@ pub(crate) fn run_inner(
     {
         git_dir = Some(PathBuf::from(value));
     }
+    env.cwd = std::path::absolute(&env.cwd).map_err(|err| GitError::Io {
+        detail: format!("cannot resolve working directory: {err}"),
+    })?;
+    git_dir = git_dir.map(|dir| env.cwd.join(dir));
+    work_tree = work_tree.map(|dir| env.cwd.join(dir));
     let Some(verb) = verb else {
         return Err(GitError::Invalid {
             detail: "no command given; see 'ruk help'".to_owned(),

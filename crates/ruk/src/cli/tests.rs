@@ -503,6 +503,124 @@ fn branch_checkout_merge_fast_forward() {
 }
 
 #[test]
+fn hash_object_resolves_sequential_and_dot_directories() {
+    let base = temp_base("hash-object-relative-cwd");
+    let root = base.join("repo");
+    let nested = root.join("nested").join("deep");
+    std::fs::create_dir_all(&nested).expect("nested directory");
+    drop(
+        Store::create(
+            &root.join(".ruk"),
+            HashKind::Sha256,
+            Arc::new(PreparationBudget::reference_defaults()),
+        )
+        .expect("create store"),
+    );
+    for (cwd, dirs, verb) in [
+        (&root, &["nested", "deep"][..], "hash-object"),
+        (&nested, &["."][..], "git-hash-object"),
+    ] {
+        let body = format!("{verb} with {dirs:?}\n").into_bytes();
+        std::fs::write(nested.join("payload"), &body).expect("payload");
+        let hex = HashKind::Sha256
+            .hash_git_object("blob", &body)
+            .expect("object id")
+            .to_hex();
+        let expected = format!("{hex}\n").into_bytes();
+        let mut argv = vec!["ruk"];
+        for dir in dirs {
+            argv.extend(["-C", *dir]);
+        }
+        argv.extend([verb, "payload"]);
+        let (stdout, stderr) = run_argv(test_env(cwd), &argv).expect("hash");
+        assert_eq!(stdout, expected);
+        assert!(stderr.is_empty());
+        argv.insert(argv.len() - 1, "-w");
+        let (stdout, stderr) = run_argv(test_env(cwd), &argv).expect("write");
+        assert_eq!(stdout, expected);
+        assert!(stderr.is_empty());
+        let (stdout, _) =
+            run_argv(test_env(&root), &["ruk", "cat-file", "-p", &hex]).expect("stored object");
+        assert_eq!(stdout, body);
+    }
+    std::fs::remove_dir_all(base).expect("cleanup");
+}
+
+#[test]
+fn hash_object_relative_git_dir_writes_only_selected_repository() {
+    let base = temp_base("hash-object-selected-repository");
+    let original = base.join("original");
+    let selected = base.join("selected");
+    for (root, kind) in [(&original, HashKind::Sha1), (&selected, HashKind::Sha256)] {
+        std::fs::create_dir_all(root).expect("repository directory");
+        drop(
+            Store::create(
+                &root.join(".ruk"),
+                kind,
+                Arc::new(PreparationBudget::reference_defaults()),
+            )
+            .expect("create store"),
+        );
+    }
+    for from_env in [false, true] {
+        let body = format!("selected repository, environment={from_env}\n").into_bytes();
+        std::fs::write(selected.join("payload"), &body).expect("payload");
+        let hex = HashKind::Sha256
+            .hash_git_object("blob", &body)
+            .expect("object id")
+            .to_hex();
+        let mut env = test_env(&original);
+        let mut argv = vec!["ruk", "-C", selected.to_str().expect("utf8 path")];
+        if from_env {
+            env.vars.insert("GIT_DIR".to_owned(), ".ruk".to_owned());
+        } else {
+            argv.extend(["--git-dir", ".ruk"]);
+        }
+        argv.extend(["hash-object", "-w", "payload"]);
+        let (stdout, stderr) = run_argv(env, &argv).expect("write selected repository");
+        assert_eq!(stdout, format!("{hex}\n").into_bytes());
+        assert!(stderr.is_empty());
+        let (stdout, _) =
+            run_argv(test_env(&selected), &["ruk", "cat-file", "-p", &hex]).expect("stored object");
+        assert_eq!(stdout, body);
+        let original_store = open_store(&original);
+        assert!(
+            original_store
+                .iter_objects()
+                .expect("original objects")
+                .is_empty()
+        );
+    }
+    std::fs::remove_dir_all(base).expect("cleanup");
+}
+
+#[test]
+fn relative_work_tree_uses_effective_directory() {
+    let (root, _) = seeded_repo("relative-work-tree", "tracked.txt", b"before\n");
+    let work_tree = root.join("worktree");
+    std::fs::create_dir_all(&work_tree).expect("worktree");
+    std::fs::write(work_tree.join("tracked.txt"), b"after\n").expect("changed file");
+    let (stdout, stderr) = run_argv(
+        test_env(root.parent().expect("parent")),
+        &[
+            "ruk",
+            "-C",
+            root.to_str().expect("utf8 path"),
+            "--git-dir",
+            ".ruk",
+            "--work-tree",
+            "worktree",
+            "status",
+            "--porcelain",
+        ],
+    )
+    .expect("status in selected worktree");
+    assert_eq!(stdout, b" M tracked.txt\n");
+    assert!(stderr.is_empty());
+    std::fs::remove_dir_all(root.parent().expect("parent")).expect("cleanup");
+}
+
+#[test]
 fn hash_object_discovers_repository_for_hashing_and_writing() {
     for kind in [HashKind::Sha1, HashKind::Sha256] {
         let base = temp_base("hash-object-discovery");
