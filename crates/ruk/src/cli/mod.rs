@@ -105,8 +105,8 @@ impl CliEnv {
 /// `root` holds `.ruk/`; `file_base` is where worktree files are read and
 /// written (`--work-tree` moves it, like `git --work-tree`). A bare
 /// repository refuses worktree verbs the way Git does. `init` and `clone`
-/// open their own stores; `hash-object` discovers an existing repository
-/// and requires one only when writing.
+/// open their own stores; `hash-object` reads an existing repository's
+/// format header and opens its store only when writing.
 pub(crate) struct Ctx {
     /// The open native store, when the verb needs a repository.
     pub(crate) store: Option<Store>,
@@ -114,7 +114,7 @@ pub(crate) struct Ctx {
     pub(crate) root: PathBuf,
     /// Base directory for worktree file access.
     pub(crate) file_base: PathBuf,
-    /// Object format of the open repository.
+    /// Object format of the selected repository.
     pub(crate) kind: Option<HashKind>,
     /// Process environment snapshot.
     pub(crate) env: CliEnv,
@@ -404,18 +404,15 @@ pub(crate) fn run_inner(
     if verb_args.iter().any(|arg| arg == "--help") {
         return Ok((dispatch::help_text(Some(entry)), Vec::new()));
     }
-    let needs_repo = if entry.name == "hash-object" {
-        let write = verbs_objects::hash_object_writes(&verb_args)?;
-        if !write && git_dir.is_none() {
-            git_dir = discover_root(&env.cwd, bare);
-        }
-        write || git_dir.is_some()
+    let hash_only = entry.name == "hash-object" && !verbs_objects::hash_object_writes(&verb_args)?;
+    let mut ctx = if hash_only {
+        open_hash_ctx(env, git_dir, work_tree, bare, cli_config, egress)?
     } else {
-        entry.needs_repo
+        let needs_repo = entry.needs_repo || entry.name == "hash-object";
+        open_ctx(
+            env, git_dir, work_tree, bare, cli_config, needs_repo, egress,
+        )?
     };
-    let mut ctx = open_ctx(
-        env, git_dir, work_tree, bare, cli_config, needs_repo, egress,
-    )?;
     let stdout = (entry.run)(&mut ctx, &verb_args)?;
     Ok((stdout, std::mem::take(&mut ctx.stderr)))
 }
@@ -518,6 +515,52 @@ fn parse_config_env(pair: &str) -> Result<(String, String), GitError> {
         .map_err(|_| GitError::Invalid {
             detail: format!("config-env {var:?} is not set"),
         })
+}
+
+fn open_hash_ctx(
+    env: CliEnv,
+    git_dir: Option<PathBuf>,
+    work_tree: Option<PathBuf>,
+    bare: bool,
+    cli_config: Vec<(String, String)>,
+    egress: ruk_git::transport::net::EgressPolicy,
+) -> Result<Ctx, GitError> {
+    let root = if git_dir.is_some() {
+        Some(find_root(&env.cwd, git_dir.as_deref(), bare)?)
+    } else {
+        discover_root(&env.cwd, bare)
+    };
+    if root.is_some()
+        && let Some(work_tree) = &work_tree
+        && !work_tree.is_dir()
+    {
+        return Err(GitError::Io {
+            detail: format!("work tree {} is not a directory", work_tree.display()),
+        });
+    }
+    let kind = if let Some(root) = &root {
+        let path = root.join(".ruk").join(Store::format_file());
+        let file = std::fs::File::open(&path).map_err(|err| GitError::Io {
+            detail: format!("opening {}: {err}", path.display()),
+        })?;
+        let bytes = tree::read_bounded(file, 128)?;
+        Some(Store::parses_format(&bytes).map_err(GitError::from)?.kind)
+    } else {
+        None
+    };
+    let root = root.unwrap_or_else(|| work_tree.clone().unwrap_or_else(|| env.cwd.clone()));
+    let file_base = work_tree.unwrap_or_else(|| root.clone());
+    Ok(Ctx {
+        store: None,
+        root,
+        file_base,
+        kind,
+        env,
+        bare,
+        cli_config,
+        stderr: Vec::new(),
+        egress,
+    })
 }
 
 /// Discovers the repository root and opens its store.

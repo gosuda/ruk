@@ -503,6 +503,156 @@ fn branch_checkout_merge_fast_forward() {
 }
 
 #[test]
+fn hash_object_reads_format_while_store_is_open() {
+    for kind in [HashKind::Sha1, HashKind::Sha256] {
+        let base = temp_base("hash-object-held-store");
+        let root = base.join("repo");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).expect("nested directory");
+        let store_dir = root.join(".ruk");
+        let store = Store::create(
+            &store_dir,
+            kind,
+            Arc::new(PreparationBudget::reference_defaults()),
+        )
+        .expect("create held store");
+        let format_path = store_dir.join(Store::format_file());
+        let permissions = std::fs::metadata(&format_path)
+            .expect("format metadata")
+            .permissions();
+        let mut read_only = permissions.clone();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(&format_path, read_only).expect("read-only format");
+        let format_before = std::fs::read(&format_path).expect("format bytes");
+        let generation_before = store.generation().expect("generation");
+        let objects_before = store.iter_objects().expect("objects");
+        #[cfg(unix)]
+        let metadata_path = store_dir.join("meta.redb");
+        #[cfg(unix)]
+        let metadata_before = std::fs::read(&metadata_path).expect("metadata bytes");
+        let body = b"hash without opening metadata\n";
+        let expected = format!(
+            "{}\n",
+            kind.hash_git_object("blob", body)
+                .expect("object id")
+                .to_hex()
+        )
+        .into_bytes();
+        for (cwd, verb, explicit) in [
+            (&root, "hash-object", false),
+            (&nested, "git-hash-object", false),
+            (&nested, "hash-object", true),
+        ] {
+            let mut env = test_env(cwd);
+            env.stdin = Some(body.to_vec());
+            let option = format!("--git-dir={}", store_dir.display());
+            let mut argv = vec!["ruk"];
+            if explicit {
+                argv.push(&option);
+            }
+            argv.extend_from_slice(&[verb, "--stdin"]);
+            let (stdout, stderr) = run_argv(env, &argv).expect("hash with held store");
+            assert_eq!(stdout, expected);
+            assert!(stderr.is_empty());
+        }
+        assert_eq!(
+            std::fs::read(&format_path).expect("unchanged format"),
+            format_before
+        );
+        assert_eq!(store.generation().expect("unchanged generation"), generation_before);
+        assert_eq!(store.iter_objects().expect("unchanged objects"), objects_before);
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read(&metadata_path).expect("unchanged metadata"),
+            metadata_before
+        );
+        std::fs::set_permissions(&format_path, permissions).expect("restore permissions");
+        drop(store);
+        std::fs::remove_dir_all(base).expect("cleanup");
+    }
+}
+
+#[test]
+fn hash_object_rejects_invalid_format_without_opening_store() {
+    let base = temp_base("hash-object-invalid-format");
+    let store_dir = base.join(".ruk");
+    let store = Store::create(
+        &store_dir,
+        HashKind::Sha256,
+        Arc::new(PreparationBudget::reference_defaults()),
+    )
+    .expect("create held store");
+    let format_path = store_dir.join(Store::format_file());
+    let original = std::fs::read(&format_path).expect("format bytes");
+    let generation_before = store.generation().expect("generation");
+    let objects_before = store.iter_objects().expect("objects");
+    #[cfg(unix)]
+    let metadata_path = store_dir.join("meta.redb");
+    #[cfg(unix)]
+    let metadata_before = std::fs::read(&metadata_path).expect("metadata bytes");
+    for bytes in [
+        Vec::new(),
+        b"ruk-store 1\nobject-format sha256\n".to_vec(),
+        vec![0xff],
+        vec![b'x'; 128],
+        vec![b'x'; 129],
+    ] {
+        std::fs::write(&format_path, &bytes).expect("invalid format");
+        for verb in ["hash-object", "git-hash-object"] {
+            for explicit in [false, true] {
+                let mut env = test_env(&base);
+                env.stdin = Some(b"hash input\n".to_vec());
+                if explicit {
+                    env.vars.insert("GIT_DIR".to_owned(), ".ruk".to_owned());
+                }
+                let err =
+                    run_argv(env.clone(), &["ruk", verb, "--stdin"]).expect_err("invalid format");
+                if bytes.len() > 128 {
+                    assert!(matches!(err, ruk_git::GitError::Limit { .. }));
+                } else {
+                    assert!(matches!(err, ruk_git::GitError::Version { .. }));
+                }
+                let err = run_argv(env, &["ruk", verb, "--unknown"])
+                    .expect_err("options precede format reads");
+                assert!(matches!(
+                    err,
+                    ruk_git::GitError::Invalid { detail } if detail == "unknown option --unknown"
+                ));
+            }
+        }
+        assert_eq!(
+            std::fs::read(&format_path).expect("unchanged invalid format"),
+            bytes
+        );
+        assert_eq!(store.generation().expect("unchanged generation"), generation_before);
+        assert_eq!(store.iter_objects().expect("unchanged objects"), objects_before);
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read(&metadata_path).expect("unchanged metadata"),
+            metadata_before
+        );
+    }
+    std::fs::remove_file(&format_path).expect("remove format");
+    for verb in ["hash-object", "git-hash-object"] {
+        let mut env = test_env(&base);
+        env.stdin = Some(b"hash input\n".to_vec());
+        let err = run_argv(env, &["ruk", verb, "--stdin"]).expect_err("missing format");
+        assert!(matches!(err, ruk_git::GitError::Io { .. }));
+    }
+    assert!(!format_path.exists());
+    assert_eq!(store.generation().expect("unchanged generation"), generation_before);
+    assert_eq!(store.iter_objects().expect("unchanged objects"), objects_before);
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::read(&metadata_path).expect("unchanged metadata"),
+        metadata_before
+    );
+    std::fs::write(&format_path, original).expect("restore format");
+    drop(store);
+    std::fs::remove_dir_all(base).expect("cleanup");
+}
+
+#[test]
 fn hash_object_resolves_sequential_and_dot_directories() {
     let base = temp_base("hash-object-relative-cwd");
     let root = base.join("repo");
