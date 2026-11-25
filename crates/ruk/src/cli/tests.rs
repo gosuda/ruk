@@ -571,15 +571,26 @@ fn command_help_preserves_repository_state() {
         assert!(stdout.starts_with(format!("ruk {verb} - ").as_bytes()));
         assert!(stderr.is_empty());
     }
-    drop(held);
-    assert_eq!(snapshot(), before);
+    let held_before = (
+        held.generation().expect("generation"),
+        super::state::scan_index(&held, held.hash_kind()).expect("index"),
+        super::state::head_oid(&held).expect("HEAD"),
+    );
+    assert_eq!(held_before, before);
     for (verb, flag) in [("status", "--short"), ("add", "--all"), ("commit", "--all")] {
         let (stdout, stderr) =
             run_argv(test_env(&root), &["ruk", verb, flag, "--help"]).expect("help after a switch");
         assert!(stdout.starts_with(format!("ruk {verb} - ").as_bytes()));
         assert!(stderr.is_empty());
-        assert_eq!(snapshot(), before);
+        let current = (
+            held.generation().expect("generation"),
+            super::state::scan_index(&held, held.hash_kind()).expect("index"),
+            super::state::head_oid(&held).expect("HEAD"),
+        );
+        assert_eq!(current, held_before);
     }
+    drop(held);
+    assert_eq!(snapshot(), before);
     assert_eq!(
         std::fs::read(root.join("tracked.txt")).expect("unchanged worktree"),
         b"after\n"
