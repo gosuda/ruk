@@ -3175,7 +3175,12 @@ fn reset_paths_intent(ctx: &Ctx, paths: &[String], tree: Oid) -> Result<(), GitE
     let mut mutations = Vec::new();
     let mut needs_empty = false;
     for wanted in paths {
-        let path = super::verbs_stage::repo_path_of(ctx, wanted.as_bytes())?;
+        let lexical = super::verbs_stage::repo_path_lexical(ctx, wanted.as_bytes())?;
+        let path = if target.contains_key(lexical.as_bytes()) {
+            lexical
+        } else {
+            super::verbs_stage::repo_path_of(ctx, wanted.as_bytes())?
+        };
         let before = read_path_rows(store, kind, &path)?;
         let after = match target.get(path.as_bytes()) {
             Some((mode, oid)) => {

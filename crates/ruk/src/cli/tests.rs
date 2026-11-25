@@ -10264,3 +10264,33 @@ fn diff_no_index_help_probe_leaves_output_alone() {
     );
     let _ = std::fs::remove_dir_all(base);
 }
+
+#[cfg(unix)]
+#[test]
+fn reset_intent_accepts_symlinked_parent_for_stored_path() {
+    let (root, env) = seeded_repo("reset-intent-symlink", "seed.txt", b"seed\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::create_dir(root.join("docs")).expect("docs dir");
+    std::fs::write(root.join("docs/intro.md"), b"one\n").expect("one");
+    run(verbs_stage::add, &mut ctx, &["docs/intro.md"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "docs"]).expect("commit");
+    std::fs::remove_file(root.join("docs/intro.md")).expect("remove");
+    std::fs::remove_dir(root.join("docs")).expect("rmdir");
+    let outside = root.parent().expect("parent").join("outside-target");
+    std::fs::create_dir_all(&outside).expect("outside");
+    std::os::unix::fs::symlink(&outside, root.join("docs")).expect("symlink parent");
+    run(
+        verbs_branch::reset,
+        &mut ctx,
+        &["-N", "--", "docs/intro.md"],
+    )
+    .expect("intent under symlinked parent for stored path");
+    assert!(
+        std::fs::symlink_metadata(root.join("docs"))
+            .expect("meta")
+            .file_type()
+            .is_symlink()
+    );
+    assert!(run(verbs_branch::reset, &mut ctx, &["-N", "--", "docs/new.md"],).is_err());
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
