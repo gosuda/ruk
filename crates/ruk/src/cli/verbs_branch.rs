@@ -2878,6 +2878,9 @@ pub(crate) fn restore(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
     }
     let staged = opts.is_set("staged");
     let worktree = opts.is_set("worktree") || !staged;
+    if staged && worktree {
+        validate_combined_restore(ctx, &opts, store, kind)?;
+    }
     if staged {
         let tree = match opts.single("source")? {
             Some(rev) => {
@@ -2892,6 +2895,73 @@ pub(crate) fn restore(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
         restore_worktree(ctx, &opts)?;
     }
     Ok(Vec::new())
+}
+
+fn validate_combined_restore(
+    ctx: &Ctx,
+    opts: &super::Collected,
+    store: &Store,
+    kind: HashKind,
+) -> Result<(), GitError> {
+    let mut paths = Vec::new();
+    for positional in &opts.positionals {
+        paths.push(super::verbs_stage::repo_path_of(
+            ctx,
+            positional.as_bytes(),
+        )?);
+    }
+    let mut entries = std::collections::BTreeMap::new();
+    let tree = match opts.single("source")? {
+        Some(rev) => {
+            let oid = resolve_rev(store, kind, &rev)?;
+            peel_to_tree(store, kind, oid)?
+        }
+        None => head_tree_committed(ctx)?,
+    };
+    for (path, _, oid) in flatten_tree(store, kind, tree)? {
+        entries.insert(path, oid);
+    }
+    for (positional, path) in opts.positionals.iter().zip(paths.iter()) {
+        if !entries.contains_key(path.as_bytes()) {
+            return Err(GitError::NotFound {
+                detail: format!("pathspec did not match: {positional:?}"),
+            });
+        }
+        validate_worktree_parent(ctx, path)?;
+    }
+    Ok(())
+}
+
+fn validate_worktree_parent(ctx: &Ctx, path: &RepoPath) -> Result<(), GitError> {
+    let full = super::tree::join_base(&ctx.file_base, path.as_bytes())?;
+    let mut dir = full.parent();
+    while let Some(candidate) = dir {
+        if candidate == ctx.file_base {
+            break;
+        }
+        match std::fs::symlink_metadata(candidate) {
+            Ok(meta) => {
+                if !meta.file_type().is_dir() {
+                    return Err(GitError::Io {
+                        detail: format!(
+                            "creating {}: {} is not a directory",
+                            full.display(),
+                            candidate.display()
+                        ),
+                    });
+                }
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(GitError::Io {
+                    detail: format!("resolving {}: {err}", candidate.display()),
+                });
+            }
+        }
+        dir = candidate.parent();
+    }
+    Ok(())
 }
 
 /// Reads the committed `HEAD` tree, refusing an unborn branch for staged
@@ -2914,8 +2984,6 @@ fn restore_staged(ctx: &Ctx, opts: &super::Collected, tree: Oid) -> Result<(), G
     let (workspace, raw) = load_or_default(store)?;
     let mut mutations = Vec::new();
     for positional in &opts.positionals {
-        // Staged restores name index and tree entries only: convert pathspecs
-        // lexically so an obstructed worktree parent cannot fail the conversion.
         let path = super::verbs_stage::repo_path_lexical(ctx, positional.as_bytes())?;
         let before = read_path_rows(store, kind, &path)?;
         let after = target

@@ -7522,6 +7522,65 @@ fn wave_j_reset_keep_and_intent() {
     assert!(err.to_string().contains("interactive"), "got {err:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
+
+#[test]
+fn combined_restore_blocked_parent_leaves_index_unchanged() {
+    let (root, env) = seeded_repo("restore-blocked", "seed.txt", b"seed\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::create_dir(root.join("docs")).expect("docs dir");
+    std::fs::write(root.join("docs/intro.md"), b"one\n").expect("one");
+    run(verbs_stage::add, &mut ctx, &["docs/intro.md"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "docs"]).expect("commit");
+    std::fs::write(root.join("docs/intro.md"), b"two\n").expect("two");
+    run(verbs_stage::add, &mut ctx, &["docs/intro.md"]).expect("stage two");
+    std::fs::remove_file(root.join("docs/intro.md")).expect("remove");
+    std::fs::remove_dir(root.join("docs")).expect("rmdir");
+    std::fs::write(root.join("docs"), b"BLOCK\n").expect("block");
+    let before = super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+        .expect("scan");
+    let err = run(
+        verbs_branch::restore,
+        &mut ctx,
+        &["--staged", "--worktree", "--", "docs/intro.md"],
+    )
+    .expect_err("blocked combined restore");
+    let after = super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+        .expect("scan");
+    assert_eq!(
+        before, after,
+        "blocked combined restore changed the index: {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("docs")).expect("block intact"),
+        b"BLOCK\n"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn reset_intent_accepts_obstructed_parent() {
+    let (root, env) = seeded_repo("reset-intent-blocked", "seed.txt", b"seed\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::create_dir(root.join("docs")).expect("docs dir");
+    std::fs::write(root.join("docs/intro.md"), b"one\n").expect("one");
+    run(verbs_stage::add, &mut ctx, &["docs/intro.md"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "docs"]).expect("commit");
+    std::fs::remove_file(root.join("docs/intro.md")).expect("remove");
+    std::fs::remove_dir(root.join("docs")).expect("rmdir");
+    std::fs::write(root.join("docs"), b"BLOCK\n").expect("block");
+    run(
+        verbs_branch::reset,
+        &mut ctx,
+        &["-N", "--", "docs/intro.md"],
+    )
+    .expect("intent under obstruction");
+    assert_eq!(
+        std::fs::read(root.join("docs")).expect("block intact"),
+        b"BLOCK\n"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
 // ---------------------------------------------------------------------------
 // Wave J (DiffFlags): diff/show flag parity -- each flag must alter bytes,
 // selected pairs, file output, or status, or fail loudly.
