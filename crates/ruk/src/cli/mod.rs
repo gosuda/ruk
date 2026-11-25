@@ -405,6 +405,25 @@ pub(crate) fn run_inner(
     if verb_args.first().is_some_and(|arg| arg == "--help") {
         return Ok(help());
     }
+    if entry.needs_repo && verb_args.iter().any(|arg| arg == "--help") {
+        let mut probe = Ctx {
+            store: None,
+            root: env.cwd.clone(),
+            file_base: work_tree.clone().unwrap_or_else(|| env.cwd.clone()),
+            kind: None,
+            env: env.clone(),
+            bare,
+            cli_config: cli_config.clone(),
+            stderr: Vec::new(),
+            egress: egress.clone(),
+        };
+        if matches!(
+            (entry.run)(&mut probe, &verb_args),
+            Err(GitError::HelpRequested)
+        ) {
+            return Ok(help());
+        }
+    }
     let hash_only = if entry.name == "hash-object" {
         match verbs_objects::hash_object_writes(&verb_args) {
             Ok(write) => !write,

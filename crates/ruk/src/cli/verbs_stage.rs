@@ -258,22 +258,30 @@ pub(crate) fn file_mode_of(_meta: &std::fs::Metadata) -> FileMode {
 }
 
 /// Maps CLI bytes to a validated repository path under the file base.
+///
+/// The parent chain is canonicalized so missing parents still resolve and a
+/// symlinked `-C` directory keeps working. An intermediate symlink below the
+/// worktree root is then rejected outright (see
+/// [`reject_rewritten_intermediate_symlink`]): resolving it would rewrite the
+/// repository-relative suffix to a different index row. The final component
+/// stays unresolved, so a symlink file itself stages and removes as a link.
 pub(crate) fn repo_path_of(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitError> {
     let text = std::str::from_utf8(raw).map_err(|_| GitError::Invalid {
         detail: "pathspec is not valid UTF-8".to_owned(),
     })?;
-    let joined = if std::path::Path::new(text).is_absolute() {
+    let unjoined = if std::path::Path::new(text).is_absolute() {
         std::path::PathBuf::from(text)
     } else {
         ctx.env.cwd.join(text)
     };
-    let joined = normalize_staging_path(&joined)?;
+    let joined = normalize_staging_path(&unjoined)?;
     let base = std::fs::canonicalize(&ctx.file_base).map_err(|err| GitError::Io {
         detail: format!("resolving worktree {}: {err}", ctx.file_base.display()),
     })?;
     let relative = joined.strip_prefix(&base).map_err(|_| GitError::Invalid {
         detail: format!("pathspec {text:?} is outside the repository"),
     })?;
+    reject_rewritten_intermediate_symlink(&unjoined, &base, text)?;
     let mut parts: Vec<u8> = Vec::new();
     for component in relative.components() {
         match component {
@@ -323,6 +331,135 @@ fn normalize_staging_path(path: &std::path::Path) -> Result<std::path::PathBuf, 
             Err(err) => return Err(path_error(err)),
         }
     }
+}
+
+/// Converts a CLI operand to a repository path without reading the worktree.
+///
+/// Pure lexical conversion for index- and tree-only callers (two-revision
+/// `diff`, staged restores): a worktree parent obstructed by a regular file
+/// must not fail the conversion of a stored path. Only the worktree-root
+/// boundary is resolved against the filesystem, so a symlinked `-C`
+/// directory keeps working; `..` above the root is outside the repository.
+/// The returned name is literal: no component is resolved or rejected.
+pub(crate) fn repo_path_lexical(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitError> {
+    let text = std::str::from_utf8(raw).map_err(|_| GitError::Invalid {
+        detail: "pathspec is not valid UTF-8".to_owned(),
+    })?;
+    let joined = if std::path::Path::new(text).is_absolute() {
+        std::path::PathBuf::from(text)
+    } else {
+        ctx.env.cwd.join(text)
+    };
+    let base = std::fs::canonicalize(&ctx.file_base).map_err(|err| GitError::Io {
+        detail: format!("resolving worktree {}: {err}", ctx.file_base.display()),
+    })?;
+    let Some((_, suffix)) = split_at_worktree_root(&joined, &base) else {
+        return Err(GitError::Invalid {
+            detail: format!("pathspec {text:?} is outside the repository"),
+        });
+    };
+    let dot = std::ffi::OsStr::new(".");
+    let dotdot = std::ffi::OsStr::new("..");
+    let mut stack: Vec<std::ffi::OsString> = Vec::new();
+    for part in suffix {
+        if part.as_os_str() == dot {
+            continue;
+        }
+        if part.as_os_str() == dotdot {
+            if stack.pop().is_none() {
+                return Err(GitError::Invalid {
+                    detail: format!("pathspec {text:?} is outside the repository"),
+                });
+            }
+            continue;
+        }
+        stack.push(part);
+    }
+    let mut parts: Vec<u8> = Vec::new();
+    for part in &stack {
+        if !parts.is_empty() {
+            parts.push(b'/');
+        }
+        parts.extend_from_slice(part.as_encoded_bytes());
+    }
+    RepoPath::new(parts).map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))
+}
+
+/// Finds the worktree-root boundary inside a lexical path.
+///
+/// Returns the shortest leading prefix of `joined` that exists and
+/// canonicalizes to `base`, with the remaining lexical components below it.
+/// Resolving only this prefix maps a worktree alias (a symlinked `-C`
+/// directory) to the root without rewriting the repository-relative suffix,
+/// whose intermediate symlinks callers check separately.
+fn split_at_worktree_root(
+    joined: &std::path::Path,
+    base: &std::path::Path,
+) -> Option<(std::path::PathBuf, Vec<std::ffi::OsString>)> {
+    use std::path::Component;
+    let mut head: Vec<Component<'_>> = Vec::new();
+    for component in joined.components() {
+        head.push(component);
+        let mut prefix = std::path::PathBuf::new();
+        for part in &head {
+            prefix.push(part.as_os_str());
+        }
+        let resolved = match std::fs::canonicalize(&prefix) {
+            Ok(resolved) => resolved,
+            Err(_) => continue,
+        };
+        if resolved != base {
+            continue;
+        }
+        let mut suffix = Vec::new();
+        for rest in joined.components().skip(head.len()) {
+            match rest {
+                Component::Normal(part) => suffix.push(part.to_os_string()),
+                Component::CurDir => suffix.push(std::ffi::OsString::from(".")),
+                Component::ParentDir => suffix.push(std::ffi::OsString::from("..")),
+                Component::RootDir | Component::Prefix(_) => return None,
+            }
+        }
+        return Some((prefix, suffix));
+    }
+    None
+}
+
+/// Rejects operands that reach their canonical path through an intermediate
+/// symlink below the worktree root.
+///
+/// `normalize_staging_path` canonicalizes the parent, so `alias/file` (where
+/// `alias` points inside the worktree) arrives rewritten to the target: `rm`
+/// would then delete the target file and its index row for a name that was
+/// never tracked, and `--cached` would drop the wrong row. Any intermediate
+/// symlink below the root boundary is a hard error; the final component
+/// stays unresolved so a symlink file itself stages and removes as a link.
+fn reject_rewritten_intermediate_symlink(
+    unjoined: &std::path::Path,
+    base: &std::path::Path,
+    text: &str,
+) -> Result<(), GitError> {
+    let Some((boundary, suffix)) = split_at_worktree_root(unjoined, base) else {
+        return Ok(());
+    };
+    let mut acc = boundary;
+    let mut parts = suffix.iter().peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        acc.push(part);
+        if acc
+            .symlink_metadata()
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(GitError::Invalid {
+                detail: format!("pathspec {text:?} passes through symlink {part:?}"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Renders a path for diagnostics.

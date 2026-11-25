@@ -2914,7 +2914,9 @@ fn restore_staged(ctx: &Ctx, opts: &super::Collected, tree: Oid) -> Result<(), G
     let (workspace, raw) = load_or_default(store)?;
     let mut mutations = Vec::new();
     for positional in &opts.positionals {
-        let path = super::verbs_stage::repo_path_of(ctx, positional.as_bytes())?;
+        // Staged restores name index and tree entries only: convert pathspecs
+        // lexically so an obstructed worktree parent cannot fail the conversion.
+        let path = super::verbs_stage::repo_path_lexical(ctx, positional.as_bytes())?;
         let before = read_path_rows(store, kind, &path)?;
         let after = target
             .get(path.as_bytes())

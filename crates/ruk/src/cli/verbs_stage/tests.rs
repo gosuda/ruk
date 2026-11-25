@@ -247,3 +247,44 @@ fn intermediate_symlink_escape_is_rejected_before_staging() {
     );
     std::fs::remove_dir_all(base).expect("cleanup");
 }
+
+#[cfg(unix)]
+#[test]
+fn removal_through_intermediate_symlink_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let (base, root) = init("symlink-rm");
+    let real = root.join("real");
+    std::fs::create_dir(&real).expect("real directory");
+    std::fs::write(real.join("file"), b"unstaged edits\n").expect("tracked file");
+    let root_text = root.to_str().expect("root");
+    run(&base, &["-C", root_text, "add", "real/file"]).expect("add target");
+    symlink("real", root.join("alias")).expect("intermediate symlink");
+    for operand in ["rm alias/file", "rm --cached alias/file"] {
+        let mut argv = vec!["-C", root_text];
+        argv.extend(operand.split(' '));
+        let err = run(&base, &argv).expect_err("untracked alias path");
+        assert!(
+            matches!(
+                err,
+                GitError::Invalid { ref detail } if detail.contains("passes through symlink")
+            ),
+            "unexpected error for {operand:?}: {err:?}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(real.join("file")).expect("target bytes"),
+        b"unstaged edits\n"
+    );
+    assert_eq!(
+        run(&base, &["-C", root_text, "ls-files"]).expect("index"),
+        b"real/file\n"
+    );
+    run(&base, &["-C", root_text, "rm", "real/file"]).expect("remove tracked path");
+    assert!(
+        run(&base, &["-C", root_text, "ls-files"])
+            .expect("empty index")
+            .is_empty()
+    );
+    std::fs::remove_dir_all(base).expect("cleanup");
+}
