@@ -1411,6 +1411,9 @@ fn write_output_file(
     let Some(path) = opts.single("output")? else {
         return Ok(bytes);
     };
+    if ctx.store.is_none() {
+        return Ok(Vec::new());
+    }
     let full = ctx.env.cwd.join(&path);
     std::fs::write(&full, &bytes).map_err(|err| GitError::Io {
         detail: format!("writing --output {}: {err}", full.display()),

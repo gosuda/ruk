@@ -10234,3 +10234,33 @@ fn two_revision_diff_survives_obstructed_worktree_parent() {
     );
     std::fs::remove_dir_all(base).expect("cleanup");
 }
+
+#[test]
+fn diff_no_index_help_probe_leaves_output_alone() {
+    let base = temp_base("diff-noindex-probe-output");
+    std::fs::write(base.join("a.txt"), b"alpha\n").expect("a");
+    std::fs::write(base.join("b.txt"), b"beta\n").expect("b");
+    std::fs::write(base.join("--help"), b"before\n").expect("output file");
+    let err = run_argv(
+        test_env(&base),
+        &[
+            "ruk",
+            "diff",
+            "--no-index",
+            "--output",
+            "--help",
+            "a.txt",
+            "b.txt",
+        ],
+    )
+    .expect_err("discovery fails outside a repository");
+    assert!(
+        matches!(err, ruk_git::GitError::Invalid { ref detail } if detail.contains("not a ruk repository")),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(base.join("--help")).expect("output intact"),
+        b"before\n"
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
