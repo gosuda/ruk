@@ -140,6 +140,15 @@ fn run(
     verb(ctx, &owned)
 }
 
+fn run_argv(env: CliEnv, args: &[&str]) -> Result<(Vec<u8>, Vec<u8>), ruk_git::GitError> {
+    let owned: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    super::run_inner(
+        &owned,
+        env,
+        ruk_git::transport::net::EgressPolicy::deny_private(),
+    )
+}
+
 #[cfg(unix)]
 #[test]
 fn coordinator_rendezvous_does_not_claim_an_unserved_store() {
@@ -491,6 +500,573 @@ fn branch_checkout_merge_fast_forward() {
     assert!(String::from_utf8_lossy(&out).contains("Fast-forward"));
     assert!(root.join("next.txt").exists());
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn hash_object_help_respects_argument_boundaries() {
+    let base = temp_base("hash-object-help-boundary");
+    let body = b"help-shaped filename\n";
+    std::fs::write(base.join("--help"), body).expect("help-shaped filename");
+    let expected = format!(
+        "{}\n",
+        HashKind::Sha1
+            .hash_git_object("blob", body)
+            .expect("object id")
+            .to_hex()
+    )
+    .into_bytes();
+    let help_args: &[&[&str]] = &[&["--help"], &["--stdin", "--help"]];
+    let type_args: &[&[&str]] = &[
+        &["-t", "--help"],
+        &["--type", "--help"],
+        &["-t--help"],
+        &["--type=--help"],
+    ];
+    for verb in ["hash-object", "git-hash-object"] {
+        for args in help_args {
+            let mut env = test_env(&base);
+            env.vars.insert("GIT_DIR".to_owned(), "missing".to_owned());
+            env.stdin = Some(body.to_vec());
+            let mut argv = vec!["ruk", verb];
+            argv.extend_from_slice(args);
+            let (stdout, stderr) = run_argv(env, &argv).expect("help before repository access");
+            assert!(stdout.starts_with(b"ruk hash-object - "));
+            assert!(stderr.is_empty());
+        }
+        let (stdout, stderr) =
+            run_argv(test_env(&base), &["ruk", verb, "--", "--help"]).expect("hash help filename");
+        assert_eq!(stdout, expected);
+        assert!(stderr.is_empty());
+        for args in type_args {
+            let mut argv = vec!["ruk", verb];
+            argv.extend_from_slice(args);
+            let err = run_argv(test_env(&base), &argv).expect_err("help is an object type value");
+            assert!(matches!(
+                err,
+                ruk_git::GitError::Invalid { detail }
+                    if detail == "unknown object type \"--help\""
+            ));
+        }
+    }
+    std::fs::remove_dir_all(base).expect("cleanup");
+}
+
+#[test]
+fn command_help_preserves_repository_state() {
+    let (root, _) = seeded_repo("command-help-boundary", "tracked.txt", b"before\n");
+    std::fs::write(root.join("tracked.txt"), b"after\n").expect("modified worktree");
+    let snapshot = || {
+        let store = open_store(&root);
+        (
+            store.generation().expect("generation"),
+            super::state::scan_index(&store, store.hash_kind()).expect("index"),
+            super::state::head_oid(&store).expect("HEAD"),
+        )
+    };
+    let before = snapshot();
+    let held = open_store(&root);
+    for verb in ["status", "add", "commit"] {
+        let (stdout, stderr) =
+            run_argv(test_env(&root), &["ruk", verb, "--help"]).expect("help with held store");
+        assert!(stdout.starts_with(format!("ruk {verb} - ").as_bytes()));
+        assert!(stderr.is_empty());
+    }
+    drop(held);
+    assert_eq!(snapshot(), before);
+    for (verb, flag) in [("status", "--short"), ("add", "--all"), ("commit", "--all")] {
+        let (stdout, stderr) =
+            run_argv(test_env(&root), &["ruk", verb, flag, "--help"]).expect("help after a switch");
+        assert!(stdout.starts_with(format!("ruk {verb} - ").as_bytes()));
+        assert!(stderr.is_empty());
+        assert_eq!(snapshot(), before);
+    }
+    assert_eq!(
+        std::fs::read(root.join("tracked.txt")).expect("unchanged worktree"),
+        b"after\n"
+    );
+    run_argv(test_env(&root), &["ruk", "add", "tracked.txt"]).expect("stage changed file");
+    run_argv(test_env(&root), &["ruk", "commit", "-m", "--help"])
+        .expect("commit literal help message");
+    let (stdout, stderr) =
+        run_argv(test_env(&root), &["ruk", "log", "--format=%s"]).expect("commit subjects");
+    assert_eq!(stdout, b"--help\nseed\n");
+    assert!(stderr.is_empty());
+    std::fs::remove_dir_all(root.parent().expect("parent")).expect("cleanup");
+}
+
+#[test]
+fn hash_object_reads_format_while_store_is_open() {
+    for kind in [HashKind::Sha1, HashKind::Sha256] {
+        let base = temp_base("hash-object-held-store");
+        let root = base.join("repo");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).expect("nested directory");
+        let store_dir = root.join(".ruk");
+        let store = Store::create(
+            &store_dir,
+            kind,
+            Arc::new(PreparationBudget::reference_defaults()),
+        )
+        .expect("create held store");
+        let format_path = store_dir.join(Store::format_file());
+        let permissions = std::fs::metadata(&format_path)
+            .expect("format metadata")
+            .permissions();
+        let mut read_only = permissions.clone();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(&format_path, read_only).expect("read-only format");
+        let format_before = std::fs::read(&format_path).expect("format bytes");
+        let generation_before = store.generation().expect("generation");
+        let objects_before = store.iter_objects().expect("objects");
+        #[cfg(unix)]
+        let metadata_path = store_dir.join("meta.redb");
+        #[cfg(unix)]
+        let metadata_before = std::fs::read(&metadata_path).expect("metadata bytes");
+        let body = b"hash without opening metadata\n";
+        let expected = format!(
+            "{}\n",
+            kind.hash_git_object("blob", body)
+                .expect("object id")
+                .to_hex()
+        )
+        .into_bytes();
+        for (cwd, verb, explicit) in [
+            (&root, "hash-object", false),
+            (&nested, "git-hash-object", false),
+            (&nested, "hash-object", true),
+        ] {
+            let mut env = test_env(cwd);
+            env.stdin = Some(body.to_vec());
+            let option = format!("--git-dir={}", store_dir.display());
+            let mut argv = vec!["ruk"];
+            if explicit {
+                argv.push(&option);
+            }
+            argv.extend_from_slice(&[verb, "--stdin"]);
+            let (stdout, stderr) = run_argv(env, &argv).expect("hash with held store");
+            assert_eq!(stdout, expected);
+            assert!(stderr.is_empty());
+        }
+        assert_eq!(
+            std::fs::read(&format_path).expect("unchanged format"),
+            format_before
+        );
+        assert_eq!(
+            store.generation().expect("unchanged generation"),
+            generation_before
+        );
+        assert_eq!(
+            store.iter_objects().expect("unchanged objects"),
+            objects_before
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read(&metadata_path).expect("unchanged metadata"),
+            metadata_before
+        );
+        std::fs::set_permissions(&format_path, permissions).expect("restore permissions");
+        drop(store);
+        std::fs::remove_dir_all(base).expect("cleanup");
+    }
+}
+
+#[test]
+fn hash_object_rejects_invalid_format_without_opening_store() {
+    let base = temp_base("hash-object-invalid-format");
+    let store_dir = base.join(".ruk");
+    let store = Store::create(
+        &store_dir,
+        HashKind::Sha256,
+        Arc::new(PreparationBudget::reference_defaults()),
+    )
+    .expect("create held store");
+    let format_path = store_dir.join(Store::format_file());
+    let original = std::fs::read(&format_path).expect("format bytes");
+    let generation_before = store.generation().expect("generation");
+    let objects_before = store.iter_objects().expect("objects");
+    #[cfg(unix)]
+    let metadata_path = store_dir.join("meta.redb");
+    #[cfg(unix)]
+    let metadata_before = std::fs::read(&metadata_path).expect("metadata bytes");
+    for bytes in [
+        Vec::new(),
+        b"ruk-store 1\nobject-format sha256\n".to_vec(),
+        vec![0xff],
+        vec![b'x'; 128],
+        vec![b'x'; 129],
+    ] {
+        std::fs::write(&format_path, &bytes).expect("invalid format");
+        for verb in ["hash-object", "git-hash-object"] {
+            for explicit in [false, true] {
+                let mut env = test_env(&base);
+                env.stdin = Some(b"hash input\n".to_vec());
+                if explicit {
+                    env.vars.insert("GIT_DIR".to_owned(), ".ruk".to_owned());
+                }
+                let err =
+                    run_argv(env.clone(), &["ruk", verb, "--stdin"]).expect_err("invalid format");
+                if bytes.len() > 128 {
+                    assert!(matches!(err, ruk_git::GitError::Limit { .. }));
+                } else {
+                    assert!(matches!(err, ruk_git::GitError::Version { .. }));
+                }
+                let err = run_argv(env, &["ruk", verb, "--unknown"])
+                    .expect_err("options precede format reads");
+                assert!(matches!(
+                    err,
+                    ruk_git::GitError::Invalid { detail } if detail == "unknown option --unknown"
+                ));
+            }
+        }
+        assert_eq!(
+            std::fs::read(&format_path).expect("unchanged invalid format"),
+            bytes
+        );
+        assert_eq!(
+            store.generation().expect("unchanged generation"),
+            generation_before
+        );
+        assert_eq!(
+            store.iter_objects().expect("unchanged objects"),
+            objects_before
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read(&metadata_path).expect("unchanged metadata"),
+            metadata_before
+        );
+    }
+    std::fs::remove_file(&format_path).expect("remove format");
+    for verb in ["hash-object", "git-hash-object"] {
+        let mut env = test_env(&base);
+        env.stdin = Some(b"hash input\n".to_vec());
+        let err = run_argv(env, &["ruk", verb, "--stdin"]).expect_err("missing format");
+        assert!(matches!(err, ruk_git::GitError::Io { .. }));
+    }
+    assert!(!format_path.exists());
+    assert_eq!(
+        store.generation().expect("unchanged generation"),
+        generation_before
+    );
+    assert_eq!(
+        store.iter_objects().expect("unchanged objects"),
+        objects_before
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::read(&metadata_path).expect("unchanged metadata"),
+        metadata_before
+    );
+    std::fs::write(&format_path, original).expect("restore format");
+    drop(store);
+    std::fs::remove_dir_all(base).expect("cleanup");
+}
+
+#[test]
+fn hash_object_resolves_sequential_and_dot_directories() {
+    let base = temp_base("hash-object-relative-cwd");
+    let root = base.join("repo");
+    let nested = root.join("nested").join("deep");
+    std::fs::create_dir_all(&nested).expect("nested directory");
+    drop(
+        Store::create(
+            &root.join(".ruk"),
+            HashKind::Sha256,
+            Arc::new(PreparationBudget::reference_defaults()),
+        )
+        .expect("create store"),
+    );
+    for (cwd, dirs, verb) in [
+        (&root, &["nested", "deep"][..], "hash-object"),
+        (&nested, &["."][..], "git-hash-object"),
+    ] {
+        let body = format!("{verb} with {dirs:?}\n").into_bytes();
+        std::fs::write(nested.join("payload"), &body).expect("payload");
+        let hex = HashKind::Sha256
+            .hash_git_object("blob", &body)
+            .expect("object id")
+            .to_hex();
+        let expected = format!("{hex}\n").into_bytes();
+        let mut argv = vec!["ruk"];
+        for dir in dirs {
+            argv.extend(["-C", *dir]);
+        }
+        argv.extend([verb, "payload"]);
+        let (stdout, stderr) = run_argv(test_env(cwd), &argv).expect("hash");
+        assert_eq!(stdout, expected);
+        assert!(stderr.is_empty());
+        argv.insert(argv.len() - 1, "-w");
+        let (stdout, stderr) = run_argv(test_env(cwd), &argv).expect("write");
+        assert_eq!(stdout, expected);
+        assert!(stderr.is_empty());
+        let (stdout, _) =
+            run_argv(test_env(&root), &["ruk", "cat-file", "-p", &hex]).expect("stored object");
+        assert_eq!(stdout, body);
+    }
+    std::fs::remove_dir_all(base).expect("cleanup");
+}
+
+#[test]
+fn hash_object_relative_git_dir_writes_only_selected_repository() {
+    let base = temp_base("hash-object-selected-repository");
+    let original = base.join("original");
+    let selected = base.join("selected");
+    for (root, kind) in [(&original, HashKind::Sha1), (&selected, HashKind::Sha256)] {
+        std::fs::create_dir_all(root).expect("repository directory");
+        drop(
+            Store::create(
+                &root.join(".ruk"),
+                kind,
+                Arc::new(PreparationBudget::reference_defaults()),
+            )
+            .expect("create store"),
+        );
+    }
+    for from_env in [false, true] {
+        let body = format!("selected repository, environment={from_env}\n").into_bytes();
+        std::fs::write(selected.join("payload"), &body).expect("payload");
+        let hex = HashKind::Sha256
+            .hash_git_object("blob", &body)
+            .expect("object id")
+            .to_hex();
+        let mut env = test_env(&original);
+        let mut argv = vec!["ruk", "-C", selected.to_str().expect("utf8 path")];
+        if from_env {
+            env.vars.insert("GIT_DIR".to_owned(), ".ruk".to_owned());
+        } else {
+            argv.extend(["--git-dir", ".ruk"]);
+        }
+        argv.extend(["hash-object", "-w", "payload"]);
+        let (stdout, stderr) = run_argv(env, &argv).expect("write selected repository");
+        assert_eq!(stdout, format!("{hex}\n").into_bytes());
+        assert!(stderr.is_empty());
+        let (stdout, _) =
+            run_argv(test_env(&selected), &["ruk", "cat-file", "-p", &hex]).expect("stored object");
+        assert_eq!(stdout, body);
+        let original_store = open_store(&original);
+        assert!(
+            original_store
+                .iter_objects()
+                .expect("original objects")
+                .is_empty()
+        );
+    }
+    std::fs::remove_dir_all(base).expect("cleanup");
+}
+
+#[test]
+fn relative_work_tree_uses_effective_directory() {
+    let (root, _) = seeded_repo("relative-work-tree", "tracked.txt", b"before\n");
+    let work_tree = root.join("worktree");
+    std::fs::create_dir_all(&work_tree).expect("worktree");
+    std::fs::write(work_tree.join("tracked.txt"), b"after\n").expect("changed file");
+    let (stdout, stderr) = run_argv(
+        test_env(root.parent().expect("parent")),
+        &[
+            "ruk",
+            "-C",
+            root.to_str().expect("utf8 path"),
+            "--git-dir",
+            ".ruk",
+            "--work-tree",
+            "worktree",
+            "status",
+            "--porcelain",
+        ],
+    )
+    .expect("status in selected worktree");
+    assert_eq!(stdout, b" M tracked.txt\n");
+    assert!(stderr.is_empty());
+    std::fs::remove_dir_all(root.parent().expect("parent")).expect("cleanup");
+}
+
+#[test]
+fn hash_object_discovers_repository_for_hashing_and_writing() {
+    for kind in [HashKind::Sha1, HashKind::Sha256] {
+        let base = temp_base("hash-object-discovery");
+        let root = base.join("repo");
+        let nested = root.join("nested").join("deep");
+        std::fs::create_dir_all(&nested).expect("nested directory");
+        drop(
+            Store::create(
+                &root.join(".ruk"),
+                kind,
+                Arc::new(PreparationBudget::reference_defaults()),
+            )
+            .expect("create store"),
+        );
+        for (cwd, body, flag, verb) in [
+            (&root, b"root object\n".as_slice(), "-w", "hash-object"),
+            (
+                &nested,
+                b"nested object\n".as_slice(),
+                "--write",
+                "git-hash-object",
+            ),
+        ] {
+            std::fs::write(cwd.join("payload"), body).expect("payload");
+            let oid = kind.hash_git_object("blob", body).expect("object id");
+            let hex = oid.to_hex();
+            let expected = format!("{hex}\n").into_bytes();
+            let (stdout, stderr) =
+                run_argv(test_env(cwd), &["ruk", verb, "payload"]).expect("hash");
+            assert_eq!(stdout, expected);
+            assert!(stderr.is_empty());
+            assert!(run_argv(test_env(&root), &["ruk", "cat-file", "-p", &hex]).is_err());
+            let (stdout, stderr) =
+                run_argv(test_env(cwd), &["ruk", verb, flag, "payload"]).expect("write");
+            assert_eq!(stdout, expected);
+            assert!(stderr.is_empty());
+            let (stdout, stderr) =
+                run_argv(test_env(&root), &["ruk", "cat-file", "-p", &hex]).expect("stored object");
+            assert_eq!(stdout, body);
+            assert!(stderr.is_empty());
+        }
+        std::fs::remove_dir_all(base).expect("cleanup");
+    }
+}
+
+#[test]
+fn hash_object_honors_explicit_repository_for_hashing_and_writing() {
+    let base = temp_base("hash-object-explicit");
+    let root = base.join("repo");
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&root).expect("repository directory");
+    std::fs::create_dir_all(&outside).expect("outside directory");
+    drop(
+        Store::create(
+            &root.join(".ruk"),
+            HashKind::Sha256,
+            Arc::new(PreparationBudget::reference_defaults()),
+        )
+        .expect("create store"),
+    );
+    for (index, git_dir) in [root.clone(), root.join(".ruk")].into_iter().enumerate() {
+        let body = format!("explicit repository {index}\n").into_bytes();
+        let hex = HashKind::Sha256
+            .hash_git_object("blob", &body)
+            .expect("object id")
+            .to_hex();
+        let expected = format!("{hex}\n").into_bytes();
+        let option = format!("--git-dir={}", git_dir.display());
+        let mut env = test_env(&outside);
+        env.stdin = Some(body.clone());
+        let (stdout, stderr) =
+            run_argv(env.clone(), &["ruk", &option, "hash-object", "--stdin"]).expect("hash");
+        assert_eq!(stdout, expected);
+        assert!(stderr.is_empty());
+        let (stdout, stderr) =
+            run_argv(env, &["ruk", &option, "hash-object", "-w", "--stdin"]).expect("write");
+        assert_eq!(stdout, expected);
+        assert!(stderr.is_empty());
+        let (stdout, stderr) =
+            run_argv(test_env(&root), &["ruk", "cat-file", "-p", &hex]).expect("stored object");
+        assert_eq!(stdout, body);
+        assert!(stderr.is_empty());
+    }
+    assert!(!outside.join(".ruk").exists());
+    std::fs::remove_dir_all(base).expect("cleanup");
+}
+
+#[test]
+fn hash_object_outside_repository_only_hashes_without_write() {
+    let base = temp_base("hash-object-outside");
+    let body = b"outside repository\n";
+    std::fs::write(base.join("-w"), body).expect("flag-shaped filename");
+    let expected = format!(
+        "{}\n",
+        HashKind::Sha1
+            .hash_git_object("blob", body)
+            .expect("object id")
+            .to_hex()
+    )
+    .into_bytes();
+    let (stdout, stderr) =
+        run_argv(test_env(&base), &["ruk", "hash-object", "--", "-w"]).expect("hash");
+    assert_eq!(stdout, expected);
+    assert!(stderr.is_empty());
+    for flag in ["-w", "--write"] {
+        let mut env = test_env(&base);
+        env.stdin = Some(body.to_vec());
+        let err =
+            run_argv(env, &["ruk", "hash-object", flag, "--stdin"]).expect_err("no repository");
+        assert!(matches!(
+            err,
+            ruk_git::GitError::Invalid { detail }
+                if detail == "not a ruk repository (no .ruk found upward)"
+        ));
+        assert!(!base.join(".ruk").exists());
+    }
+    assert_eq!(std::fs::read_dir(&base).expect("directory").count(), 1);
+    std::fs::remove_dir_all(base).expect("cleanup");
+}
+
+#[test]
+fn hash_object_refuses_invalid_explicit_repository_without_cwd_fallback() {
+    let base = temp_base("hash-object-invalid-explicit");
+    let root = base.join("repo");
+    let empty = base.join("empty");
+    std::fs::create_dir_all(&root).expect("repository directory");
+    std::fs::create_dir_all(&empty).expect("empty directory");
+    drop(
+        Store::create(
+            &root.join(".ruk"),
+            HashKind::Sha1,
+            Arc::new(PreparationBudget::reference_defaults()),
+        )
+        .expect("create store"),
+    );
+    for git_dir in [base.join("missing"), empty] {
+        for write in [false, true] {
+            let mut env = test_env(&root);
+            env.stdin = Some(b"must not publish in cwd\n".to_vec());
+            let mut argv = vec![
+                "ruk",
+                "--git-dir",
+                git_dir.to_str().expect("utf8 path"),
+                "hash-object",
+                "--stdin",
+            ];
+            if write {
+                argv.push("-w");
+            }
+            assert!(run_argv(env, &argv).is_err());
+            assert!(!git_dir.join(".ruk").exists());
+        }
+    }
+    std::fs::remove_dir_all(base).expect("cleanup");
+}
+
+#[test]
+fn hash_object_validates_options_before_opening_repository() {
+    let base = temp_base("hash-object-invalid-options");
+    let store = Store::create(
+        &base.join(".ruk"),
+        HashKind::Sha1,
+        Arc::new(PreparationBudget::reference_defaults()),
+    )
+    .expect("create store");
+    let cases: &[(&[&str], &str)] = &[
+        (&["-w", "--type=tag"], "unknown object type \"tag\""),
+        (&["-t", "-w"], "unknown object type \"-w\""),
+        (
+            &["-w", "-t", "blob", "-t", "tree"],
+            "option --type given more than once",
+        ),
+        (&["--write=value"], "option --write takes no value"),
+        (&["--unknown"], "unknown option --unknown"),
+    ];
+    for (args, expected) in cases {
+        let mut argv = vec!["ruk", "hash-object"];
+        argv.extend_from_slice(args);
+        let err = run_argv(test_env(&base), &argv).expect_err("invalid options");
+        assert!(matches!(
+            err,
+            ruk_git::GitError::Invalid { detail } if detail == *expected
+        ));
+    }
+    drop(store);
+    std::fs::remove_dir_all(base).expect("cleanup");
 }
 
 #[test]
@@ -850,6 +1426,9 @@ fn clone_fetch_push_local_cycle() {
     run(verbs_history::commit, &mut copy_ctx, &["-m", "downstream"]).expect("commit");
     run(verbs_transport::push, &mut copy_ctx, &["origin", "main"]).expect("push");
     let mut src_ctx = repo_ctx(&root, test_env(&base));
+    let plan = only_push_plan(&src_ctx);
+    assert_eq!(plan.remote, root.as_os_str().as_encoded_bytes());
+    assert!(plan.remote_is_resolved);
     let out = run(verbs_history::log, &mut src_ctx, &["--oneline"]).expect("log");
     assert!(String::from_utf8_lossy(&out).contains("downstream"));
     let _ = std::fs::remove_dir_all(&base);
@@ -1017,6 +1596,9 @@ fn push_mirror_syncs_refs_and_deletes_stale() {
     }
     {
         let mut dst_ctx = repo_ctx(&dst, test_env(&dst));
+        let plan = only_push_plan(&dst_ctx);
+        assert_eq!(plan.remote, dst.as_os_str().as_encoded_bytes());
+        assert!(plan.remote_is_resolved);
         let out = run(verbs_branch::show_ref, &mut dst_ctx, &[]).expect("show-ref");
         let text = String::from_utf8_lossy(&out).into_owned();
         assert!(text.contains("refs/heads/feat"), "got {text}");
@@ -2187,6 +2769,26 @@ fn pkt_frame(payload: &[u8]) -> Vec<u8> {
     out
 }
 
+fn only_push_plan(ctx: &Ctx) -> ruk_git::transport::push::PushPlanRecord {
+    let store = ctx.store().expect("store");
+    let page = store
+        .fact_page(
+            FactTable::PushPlans,
+            None,
+            ruk_core::store::FactPageBudget::new(2, ruk_core::MAX_CONTROL_FRAME_BYTES),
+        )
+        .expect("push plans load");
+    assert!(!page.more);
+    let [row] = page.rows.as_slice() else {
+        panic!("expected exactly one durable push plan");
+    };
+    let id = ruk_core::change::PlanId::from_bytes(
+        row.key.as_slice().try_into().expect("plan identifier"),
+    );
+    ruk_git::transport::push::PushPlanRecord::decode(id, store.hash_kind(), &row.value)
+        .expect("push plan decodes")
+}
+
 #[test]
 fn push_over_smart_http_reports_status() {
     const ZERO: &str = "0000000000000000000000000000000000000000";
@@ -2204,35 +2806,55 @@ fn push_over_smart_http_reports_status() {
     channel.extend_from_slice(&status);
     let mut report = pkt_frame(&channel);
     report.extend_from_slice(b"0000");
-    let (base, log) = smart_http_server(vec![
-        (adv, "application/x-git-receive-pack-advertisement"),
-        (report, "application/x-git-receive-pack-result"),
-    ]);
-    let (root, env) = seeded_repo("httppush", "p.txt", b"p\n");
-    let mut ctx = repo_ctx(&root, env);
-    let out = run(
-        verbs_transport::push,
-        &mut ctx,
-        &[&base, "refs/heads/main:refs/heads/main"],
-    )
-    .expect("http push");
-    assert_eq!(out, b"ok refs/heads/main\n");
-    let requests = log
-        .recv_timeout(Duration::from_secs(30))
-        .expect("server finished both RPCs");
-    assert_eq!(requests.len(), 2);
-    let (head, body) = &requests[1];
-    assert!(
-        head.starts_with("POST /a.git/git-receive-pack HTTP/1.1\r\n"),
-        "{head:?}"
-    );
-    assert!(
-        body.windows(b"refs/heads/main".len())
-            .any(|w| w == b"refs/heads/main"),
-        "no command line"
-    );
-    assert!(body.windows(4).any(|w| w == b"PACK"), "no pack bytes");
-    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+    for complete_report in [true, false] {
+        let (base, log) = smart_http_server(vec![
+            (adv.clone(), "application/x-git-receive-pack-advertisement"),
+            (
+                if complete_report {
+                    report.clone()
+                } else {
+                    Vec::new()
+                },
+                "application/x-git-receive-pack-result",
+            ),
+        ]);
+        let (root, env) = seeded_repo("httppush", "p.txt", b"p\n");
+        let mut ctx = repo_ctx(&root, env);
+        run(verbs_repo::remote, &mut ctx, &["add", "origin", &base])
+            .expect("named remote configured");
+        let out = run(
+            verbs_transport::push,
+            &mut ctx,
+            &["origin", "refs/heads/main:refs/heads/main"],
+        );
+        let plan = only_push_plan(&ctx);
+        assert_eq!(plan.remote, base.as_bytes());
+        assert!(plan.remote_is_resolved);
+        assert!(plan.destination_is_known());
+        if complete_report {
+            assert_eq!(out.expect("http push"), b"ok refs/heads/main\n");
+            assert_eq!(plan.state, ruk_git::transport::push::PushState::Confirmed);
+        } else {
+            out.expect_err("missing report leaves the push uncertain");
+            assert_eq!(plan.state, ruk_git::transport::push::PushState::Uncertain);
+        }
+        let requests = log
+            .recv_timeout(Duration::from_secs(30))
+            .expect("server finished both RPCs");
+        assert_eq!(requests.len(), 2);
+        let (head, body) = &requests[1];
+        assert!(
+            head.starts_with("POST /a.git/git-receive-pack HTTP/1.1\r\n"),
+            "{head:?}"
+        );
+        assert!(
+            body.windows(b"refs/heads/main".len())
+                .any(|w| w == b"refs/heads/main"),
+            "no command line"
+        );
+        assert!(body.windows(4).any(|w| w == b"PACK"), "no pack bytes");
+        let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+    }
 }
 
 #[test]

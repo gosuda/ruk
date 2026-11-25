@@ -47,6 +47,8 @@ struct RepoEntry {
     last_used: Instant,
 }
 
+type UncertainPushGuards = HashMap<(PathBuf, Option<Oid>, Vec<u8>), HashSet<PlanId>>;
+
 /// The mutable handle table behind [`Registry`].
 struct RegistryInner {
     /// Opaque handle to repository entry.
@@ -57,13 +59,14 @@ struct RegistryInner {
     /// removes. Cleared once the rename lands or fails.
     deleting: HashSet<PathBuf>,
     /// Refs blocked by an unresolved push plan: `(canonical repo path,
-    /// destination digest, ref name)` to the `Uncertain` plan that owns
-    /// the block. A new push
+    /// optional destination digest, ref name)` to the `Uncertain` plans
+    /// that own the block. An unknown legacy destination blocks every
+    /// destination for that ref. A new push
     /// to a blocked ref refuses with `E_PUSH_UNCERTAIN` until the owning
     /// plan reaches a terminal `Confirmed`/`Rejected` state or a reconcile
     /// observes the remote and clears the block. Restored from durable
     /// `PushPlans` rows when the repository is opened.
-    uncertain_pushes: HashMap<(PathBuf, Oid, Vec<u8>), PlanId>,
+    uncertain_pushes: UncertainPushGuards,
     /// Push idempotency keys with a job past replay: `(session, request
     /// id)` to the entry its waiters sleep on. A duplicate waits for
     /// the owner's terminal receipt instead of sending twice, so two
@@ -122,19 +125,52 @@ impl fmt::Debug for Registry {
     }
 }
 
-fn push_destination(remote: &[u8]) -> Result<Oid, CoreError> {
+fn push_destination(
+    remote: &[u8],
+    ssh_identity: Option<&ruk_core::protocol::PushSshIdentity>,
+) -> Result<Oid, CoreError> {
     use ruk_git::transport::{http, net, smart_http};
 
-    let remote = std::str::from_utf8(remote)
-        .map_err(|_| CoreError::new(ErrorCode::ECorrupt, "push destination is not UTF-8"))?;
-    let endpoint = net::parse_endpoint(remote)
-        .map_err(|_| CoreError::new(ErrorCode::EInvalid, "push destination is invalid"))?;
+    let endpoint = match std::str::from_utf8(remote) {
+        Ok(remote) => net::restore_push_destination(remote, ssh_identity)
+            .map_err(|_| CoreError::new(ErrorCode::EInvalid, "push destination is invalid"))?,
+        Err(_) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt as _;
+
+                if ssh_identity.is_some() {
+                    return Err(CoreError::new(
+                        ErrorCode::EInvalid,
+                        "local push destination carries SSH identity",
+                    ));
+                }
+                let path = Path::new(std::ffi::OsStr::from_bytes(remote));
+                if !path.is_absolute() {
+                    return Err(CoreError::new(
+                        ErrorCode::ECorrupt,
+                        "push destination is not UTF-8 or an absolute local path",
+                    ));
+                }
+                net::Endpoint::Local {
+                    path: path.to_path_buf(),
+                }
+            }
+            #[cfg(not(unix))]
+            return Err(CoreError::new(
+                ErrorCode::ECorrupt,
+                "push destination is not UTF-8",
+            ));
+        }
+    };
     let (transport, host, port, user, path) = match endpoint {
         net::Endpoint::Http { secure, url } => {
-            let base = smart_http::normalize_base(&url)
-                .map_err(|_| CoreError::new(ErrorCode::EInvalid, "HTTP push destination is invalid"))?;
-            let authority = http::url_authority(&base)
-                .map_err(|_| CoreError::new(ErrorCode::EInvalid, "HTTP push authority is invalid"))?;
+            let base = smart_http::normalize_base(&url).map_err(|_| {
+                CoreError::new(ErrorCode::EInvalid, "HTTP push destination is invalid")
+            })?;
+            let authority = http::url_authority(&base).map_err(|_| {
+                CoreError::new(ErrorCode::EInvalid, "HTTP push authority is invalid")
+            })?;
             let (host, port) = authority
                 .rsplit_once(':')
                 .expect("HTTP authority includes its numeric port");
@@ -144,7 +180,7 @@ fn push_destination(remote: &[u8]) -> Result<Oid, CoreError> {
             (
                 if secure { 4 } else { 3 },
                 host.to_owned(),
-                port,
+                Some(port),
                 String::new(),
                 path.as_bytes().to_vec(),
             )
@@ -154,25 +190,20 @@ fn push_destination(remote: &[u8]) -> Result<Oid, CoreError> {
             port,
             user,
             path,
-        } => (
-            1,
-            host,
-            port.unwrap_or(22),
-            user.unwrap_or_default(),
-            path.into_bytes(),
-        ),
+        } => (1, host, port, user.unwrap_or_default(), path.into_bytes()),
         net::Endpoint::Git { host, port, path } => (
             2,
             host,
-            port.unwrap_or(9418),
+            Some(port.unwrap_or(9418)),
             String::new(),
             path.into_bytes(),
         ),
         net::Endpoint::Local { path } => {
-            let path = std::path::absolute(path)
-                .map_err(|_| CoreError::new(ErrorCode::EIo, "push destination path is unavailable"))?;
+            let path = std::path::absolute(path).map_err(|_| {
+                CoreError::new(ErrorCode::EIo, "push destination path is unavailable")
+            })?;
             let bytes = path.as_os_str().as_encoded_bytes().to_vec();
-            (0, String::new(), 0, String::new(), bytes)
+            (0, String::new(), None, String::new(), bytes)
         }
     };
     let host = host.trim_matches(['[', ']']);
@@ -188,13 +219,14 @@ fn push_destination(remote: &[u8]) -> Result<Oid, CoreError> {
         host.push_str(zone);
     }
     Ok(HashKind::Sha256.hash_parts(&[
-        b"ruk-push-destination-v1\0",
+        b"ruk-push-destination-v3\0",
         &[transport],
         &u64::try_from(host.len())
             .expect("host length fits u64")
             .to_le_bytes(),
         host.as_bytes(),
-        &port.to_le_bytes(),
+        &[u8::from(port.is_some())],
+        &port.unwrap_or_default().to_le_bytes(),
         &u64::try_from(user.len())
             .expect("user length fits u64")
             .to_le_bytes(),
@@ -427,29 +459,43 @@ impl Registry {
         &self,
         repo: &Path,
         remote: &[u8],
+        ssh_identity: Option<&ruk_core::protocol::PushSshIdentity>,
         refs: &[Vec<u8>],
     ) -> Result<(), CoreError> {
-        let destination = push_destination(remote)?;
+        let destination = push_destination(remote, ssh_identity)?;
         let inner = self
             .inner
             .lock()
             .map_err(|_| CoreError::new(ErrorCode::EIo, "push guard lock is poisoned"))?;
         for name in refs {
-            let key = (repo.to_path_buf(), destination, name.clone());
-            if let Some(plan) = inner.uncertain_pushes.get(&key) {
-                let noun = String::from_utf8_lossy(name);
-                return Err(CoreError::new(
-                    ErrorCode::EPushUncertain,
-                    format!("ref {noun} is blocked by uncertain push plan {plan}"),
-                )
-                .with_detail(ErrorDetail::Push {
-                    plan: *plan,
-                    state: ruk_core::protocol::PushState::Uncertain,
-                    refs: BoundedList::complete(vec![PushRefOutcome {
-                        remote_ref: RefName::new(name.clone())?,
-                        status: PushRefStatus::Uncertain,
-                    }])?,
-                }));
+            for destination in [Some(destination), None] {
+                let key = (repo.to_path_buf(), destination, name.clone());
+                if let Some(plan) = inner
+                    .uncertain_pushes
+                    .get(&key)
+                    .and_then(|plans| plans.iter().next())
+                {
+                    let noun = String::from_utf8_lossy(name);
+                    let detail = if destination.is_some() {
+                        format!("ref {noun} is blocked by uncertain push plan {plan}")
+                    } else {
+                        format!(
+                            "ref {noun} is blocked by uncertain push plan {plan}: finish push.reconcile for this plan and consume every page; supply a verified original_remote only if the saved destination is unknown"
+                        )
+                    };
+                    return Err(
+                        CoreError::new(ErrorCode::EPushUncertain, detail).with_detail(
+                            ErrorDetail::Push {
+                                plan: *plan,
+                                state: ruk_core::protocol::PushState::Uncertain,
+                                refs: BoundedList::complete(vec![PushRefOutcome {
+                                    remote_ref: RefName::new(name.clone())?,
+                                    status: PushRefStatus::Uncertain,
+                                }])?,
+                            },
+                        ),
+                    );
+                }
             }
         }
         Ok(())
@@ -465,22 +511,22 @@ impl Registry {
         &self,
         repo: &Path,
         remote: &[u8],
+        ssh_identity: Option<&ruk_core::protocol::PushSshIdentity>,
         plan: PlanId,
         refs: &[Vec<u8>],
         uncertain: bool,
     ) -> Result<(), CoreError> {
-        let destination = push_destination(remote)?;
+        if !uncertain {
+            return self.note_push_reconciled(repo, remote, ssh_identity, plan, refs);
+        }
+        let destination = push_destination(remote, ssh_identity)?;
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| CoreError::new(ErrorCode::EIo, "push guard lock is poisoned"))?;
         for name in refs {
-            let key = (repo.to_path_buf(), destination, name.clone());
-            if uncertain {
-                inner.uncertain_pushes.insert(key, plan);
-            } else if inner.uncertain_pushes.get(&key) == Some(&plan) {
-                inner.uncertain_pushes.remove(&key);
-            }
+            let key = (repo.to_path_buf(), Some(destination), name.clone());
+            inner.uncertain_pushes.entry(key).or_default().insert(plan);
         }
         Ok(())
     }
@@ -497,17 +543,40 @@ impl Registry {
         &self,
         repo: &Path,
         remote: &[u8],
+        ssh_identity: Option<&ruk_core::protocol::PushSshIdentity>,
         plan: PlanId,
         refs: &[Vec<u8>],
     ) -> Result<(), CoreError> {
-        let destination = push_destination(remote)?;
+        let destination = push_destination(remote, ssh_identity)?;
+        self.clear_push_guards(repo, Some(destination), plan, refs)
+    }
+
+    pub(crate) fn note_legacy_push_reconciled(
+        &self,
+        repo: &Path,
+        plan: PlanId,
+        refs: &[Vec<u8>],
+    ) -> Result<(), CoreError> {
+        self.clear_push_guards(repo, None, plan, refs)
+    }
+
+    fn clear_push_guards(
+        &self,
+        repo: &Path,
+        destination: Option<Oid>,
+        plan: PlanId,
+        refs: &[Vec<u8>],
+    ) -> Result<(), CoreError> {
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| CoreError::new(ErrorCode::EIo, "push guard lock is poisoned"))?;
         for name in refs {
             let key = (repo.to_path_buf(), destination, name.clone());
-            if inner.uncertain_pushes.get(&key) == Some(&plan) {
+            if let Some(plans) = inner.uncertain_pushes.get_mut(&key)
+                && plans.remove(&plan)
+                && plans.is_empty()
+            {
                 inner.uncertain_pushes.remove(&key);
             }
         }
@@ -670,6 +739,91 @@ impl Registry {
             return self.resolve_pinned(&store);
         }
         Ok(pinned)
+    }
+
+    /// Verifies that a local recovery destination names the current hosted store.
+    /// The caller must hold an active session on `coordinator`.
+    ///
+    /// # Errors
+    /// Containment failures, `E_INVALID` for a relative path, or `E_FORBIDDEN`
+    /// when the destination is not the same registered store and coordinator.
+    pub(crate) fn verify_recovery_store(
+        &self,
+        requested: &Path,
+        expected: &Path,
+        coordinator: &Arc<HostedCoordinator>,
+    ) -> Result<(), CoreError> {
+        if !requested.is_absolute() {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "local recovery destination must be absolute",
+            ));
+        }
+        let pinned = self.store_pinned(requested)?;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned"))?;
+        if pinned.path() != expected
+            || inner.deleting.contains(expected)
+            || !inner.entries.values().any(|entry| {
+                entry.path == expected
+                    && entry
+                        .coordinator
+                        .as_ref()
+                        .is_some_and(|registered| Arc::ptr_eq(registered, coordinator))
+            })
+        {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "local recovery destination must be the authenticated repository's own store",
+            ));
+        }
+        drop(inner);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let access = pinned
+            .open_path()
+            .unwrap_or_else(|| pinned.path().to_path_buf());
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let access = pinned.path().to_path_buf();
+        use std::io::Read as _;
+        const MAX_FORMAT_BYTES: u64 = 128;
+        let file = std::fs::File::open(access.join(Store::format_file())).map_err(|err| {
+            CoreError::new(
+                ErrorCode::EIo,
+                format!("local recovery store identity is not readable: {err}"),
+            )
+        })?;
+        let mut bytes = Vec::new();
+        file.take(MAX_FORMAT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|err| {
+                CoreError::new(
+                    ErrorCode::EIo,
+                    format!("local recovery store identity is not readable: {err}"),
+                )
+            })?;
+        if !u64::try_from(bytes.len()).is_ok_and(|len| len <= MAX_FORMAT_BYTES) {
+            return Err(CoreError::new(
+                ErrorCode::ECorrupt,
+                "local recovery store identity exceeds its format bound",
+            ));
+        }
+        let format = Store::parses_format(&bytes).map_err(|err| {
+            CoreError::new(
+                ErrorCode::ECorrupt,
+                format!("local recovery store identity is invalid: {err}"),
+            )
+        })?;
+        if format.id != coordinator.store().store_id()
+            || format.kind != coordinator.store().hash_kind()
+        {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "local recovery store identity no longer matches the hosted repository",
+            ));
+        }
+        pinned.verify_open(expected)
     }
 
     /// Resolves `requested` naming either a repository root or its store
@@ -2377,7 +2531,7 @@ impl Registry {
 
     /// Restores outstanding uncertain push guards from durable plan state.
     fn restore_uncertain_pushes(
-        uncertain_pushes: &mut HashMap<(PathBuf, Oid, Vec<u8>), PlanId>,
+        uncertain_pushes: &mut UncertainPushGuards,
         canonical: &Path,
         store: &Store,
     ) -> Result<(), CoreError> {
@@ -2416,11 +2570,16 @@ impl Registry {
                             ));
                         }
                     };
-                    if !reconciled {
-                        let destination = push_destination(&plan.remote)?;
-                        for update in &plan.updates {
+                    let known_destination = plan.destination_is_known();
+                    if !reconciled || !known_destination {
+                        let legacy_binding =
+                            super::push_job::has_incomplete_legacy_binding(store, plan.id)?;
+                        let destination = (known_destination && !legacy_binding)
+                            .then(|| push_destination(&plan.remote, plan.ssh_identity.as_ref()))
+                            .transpose()?;
+                        for update in plan.updates.iter().chain(&plan.reported_updates) {
                             let key = (canonical.to_path_buf(), destination, update.name.clone());
-                            uncertain_pushes.insert(key, plan.id);
+                            uncertain_pushes.entry(key).or_default().insert(plan.id);
                         }
                     }
                 }
@@ -4481,6 +4640,19 @@ mod tests {
         assert_eq!(read_blob(&forked, seed.blob_a), b"hello fork");
     }
 
+    fn fixture_ssh_identity(remote: &[u8]) -> Option<ruk_core::protocol::PushSshIdentity> {
+        let remote = std::str::from_utf8(remote).ok()?;
+        let ruk_git::transport::net::Endpoint::Ssh { user, port, .. } =
+            ruk_git::transport::net::parse_endpoint(remote).ok()?
+        else {
+            return None;
+        };
+        Some(ruk_core::protocol::PushSshIdentity {
+            user: user.unwrap_or_else(|| "alice".to_owned()),
+            port: std::num::NonZeroU16::new(port.unwrap_or(2222)).expect("fixture port"),
+        })
+    }
+
     #[test]
     fn push_destination_normalizes_transport_aliases_without_credentials() {
         for aliases in [
@@ -4498,19 +4670,33 @@ mod tests {
                 "http://[2001:0db8:0:0:0:0:0:1]:80/repo.git/",
             ][..],
             &[
+                "ssh://mirror.example/repo.git",
                 "ssh://alice@mirror.example/repo.git",
-                "ssh://alice:CANARY@MIRROR.EXAMPLE:22/repo.git",
+                "ssh://alice@mirror.example:2222/repo.git",
+                "ssh://alice:CANARY@MIRROR.EXAMPLE/repo.git",
                 "alice@mirror.example:/repo.git",
+            ][..],
+            &[
+                "ssh://alice@mirror.example:22/repo.git",
+                "ssh://alice:CANARY@MIRROR.EXAMPLE:22/repo.git",
             ][..],
             &[
                 "git://mirror.example/repo.git",
                 "git://MIRROR.EXAMPLE:9418/repo.git",
             ][..],
         ] {
-            let expected = push_destination(aliases[0].as_bytes()).expect("destination parses");
+            let expected = push_destination(
+                aliases[0].as_bytes(),
+                fixture_ssh_identity(aliases[0].as_bytes()).as_ref(),
+            )
+            .expect("destination parses");
             for alias in aliases {
                 assert_eq!(
-                    push_destination(alias.as_bytes()).expect("alias parses"),
+                    push_destination(
+                        alias.as_bytes(),
+                        fixture_ssh_identity(alias.as_bytes()).as_ref()
+                    )
+                    .expect("alias parses"),
                     expected,
                 );
             }
@@ -4518,9 +4704,14 @@ mod tests {
         let relative = b"guard-destination";
         let absolute = std::path::absolute("./guard-destination").expect("absolute path");
         assert_eq!(
-            push_destination(relative).expect("relative destination"),
-            push_destination(absolute.to_str().expect("test path is UTF-8").as_bytes())
-                .expect("absolute destination"),
+            push_destination(relative, fixture_ssh_identity(relative).as_ref())
+                .expect("relative destination"),
+            push_destination(
+                absolute.to_str().expect("test path is UTF-8").as_bytes(),
+                fixture_ssh_identity(absolute.to_str().expect("test path is UTF-8").as_bytes())
+                    .as_ref()
+            )
+            .expect("absolute destination"),
         );
         let destinations = [
             "https://mirror.example/repo.git",
@@ -4530,8 +4721,9 @@ mod tests {
             "https://mirror.example/repo.git?repo=first",
             "https://mirror.example/repo.git?repo=second",
             "http://mirror.example/repo.git",
-            "ssh://mirror.example/repo.git",
             "ssh://alice@mirror.example/repo.git",
+            "ssh://alice@mirror.example:22/repo.git",
+            "ssh://alice@mirror.example:3333/repo.git",
             "ssh://bob@mirror.example/repo.git",
             "alice@mirror.example:repo.git",
             "bob@mirror.example:repo.git",
@@ -4539,11 +4731,20 @@ mod tests {
         ];
         let keys: HashSet<_> = destinations
             .iter()
-            .map(|remote| push_destination(remote.as_bytes()).expect("destination parses"))
+            .map(|remote| {
+                push_destination(
+                    remote.as_bytes(),
+                    fixture_ssh_identity(remote.as_bytes()).as_ref(),
+                )
+                .expect("destination parses")
+            })
             .collect();
         assert_eq!(keys.len(), destinations.len());
-        let err = push_destination(b"https://alice:CANARY@host:bad/repo?token=SECRET")
-            .expect_err("malformed destination fails");
+        let err = push_destination(
+            b"https://alice:CANARY@host:bad/repo?token=SECRET",
+            fixture_ssh_identity(b"https://alice:CANARY@host:bad/repo?token=SECRET").as_ref(),
+        )
+        .expect_err("malformed destination fails");
         assert!(!err.to_string().contains("CANARY"));
         assert!(!err.to_string().contains("SECRET"));
     }
@@ -4553,12 +4754,142 @@ mod tests {
         let root = scratch_root();
         let destination = |relative: &str| {
             let path = root.join(relative);
-            push_destination(path.to_str().expect("test path is UTF-8").as_bytes())
-                .expect("local destination parses")
+            push_destination(
+                path.to_str().expect("test path is UTF-8").as_bytes(),
+                fixture_ssh_identity(path.to_str().expect("test path is UTF-8").as_bytes())
+                    .as_ref(),
+            )
+            .expect("local destination parses")
         };
         assert_ne!(destination("Repo.git"), destination("repo.git"));
         #[cfg(unix)]
         assert_ne!(destination("link/../repo.git"), destination("repo.git"));
+    }
+
+    #[test]
+    fn uncertain_push_guards_preserve_ssh_port_selection() {
+        use ruk_core::change::PlanId;
+        use ruk_core::error::ErrorCode;
+
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("registry opens");
+        let names = vec![b"refs/heads/main".to_vec()];
+        let remote = b"ssh://alice@mirror.example/repo.git";
+        let alias = b"alice@mirror.example:/repo.git";
+        let explicit_default = b"ssh://alice@mirror.example:22/repo.git";
+        let explicit_other = b"ssh://alice@mirror.example:3333/repo.git";
+        let plan = PlanId::generate();
+        registry
+            .note_push_terminal(
+                &root,
+                remote,
+                fixture_ssh_identity(remote).as_ref(),
+                plan,
+                &names,
+                true,
+            )
+            .expect("portless destination blocks");
+        assert_eq!(
+            registry
+                .push_guard_check(
+                    &root,
+                    b"ssh://alice@mirror.example:2222/repo.git",
+                    fixture_ssh_identity(b"ssh://alice@mirror.example:2222/repo.git").as_ref(),
+                    &names,
+                )
+                .expect_err("explicit selected port aliases the frozen implicit port")
+                .code,
+            ErrorCode::EPushUncertain,
+        );
+        for other in [explicit_default.as_slice(), explicit_other.as_slice()] {
+            registry
+                .push_guard_check(&root, other, fixture_ssh_identity(other).as_ref(), &names)
+                .expect("explicit port has an independent destination");
+            registry
+                .note_push_reconciled(
+                    &root,
+                    other,
+                    fixture_ssh_identity(other).as_ref(),
+                    plan,
+                    &names,
+                )
+                .expect("another destination cannot release this plan");
+            assert_eq!(
+                registry
+                    .push_guard_check(&root, alias, fixture_ssh_identity(alias).as_ref(), &names)
+                    .expect_err("portless destination still blocks")
+                    .code,
+                ErrorCode::EPushUncertain,
+            );
+        }
+        registry
+            .note_push_reconciled(
+                &root,
+                alias,
+                fixture_ssh_identity(alias).as_ref(),
+                plan,
+                &names,
+            )
+            .expect("matching port selection reconciles");
+        registry
+            .push_guard_check(&root, remote, fixture_ssh_identity(remote).as_ref(), &names)
+            .expect("portless destination clears");
+    }
+
+    #[test]
+    fn uncertain_ssh_default_port_and_user_spellings_share_frozen_identity() {
+        use ruk_core::change::PlanId;
+        use ruk_core::error::ErrorCode;
+
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("registry opens");
+        let names = vec![b"refs/heads/main".to_vec()];
+        let identity = ruk_core::protocol::PushSshIdentity {
+            user: "alice".to_owned(),
+            port: std::num::NonZeroU16::new(22).expect("port"),
+        };
+        let plan = PlanId::generate();
+        let original = b"ssh://mirror.example/repo.git";
+        registry
+            .note_push_terminal(&root, original, Some(&identity), plan, &names, true)
+            .expect("implicit user and port freeze before sending");
+        for alias in [
+            b"ssh://alice@mirror.example:22/repo.git".as_slice(),
+            b"ssh://alice@mirror.example/repo.git".as_slice(),
+            b"alice@mirror.example:/repo.git".as_slice(),
+        ] {
+            assert_eq!(
+                registry
+                    .push_guard_check(&root, alias, Some(&identity), &names)
+                    .expect_err("same effective SSH target remains blocked")
+                    .code,
+                ErrorCode::EPushUncertain,
+            );
+        }
+        let another_port = ruk_core::protocol::PushSshIdentity {
+            user: "alice".to_owned(),
+            port: std::num::NonZeroU16::new(2222).expect("port"),
+        };
+        registry
+            .push_guard_check(
+                &root,
+                b"ssh://alice@mirror.example:2222/repo.git",
+                Some(&another_port),
+                &names,
+            )
+            .expect("another effective port is independent");
+        registry
+            .note_push_reconciled(
+                &root,
+                b"ssh://alice@mirror.example:22/repo.git",
+                Some(&identity),
+                plan,
+                &names,
+            )
+            .expect("matching effective endpoint releases the original spelling");
+        registry
+            .push_guard_check(&root, original, Some(&identity), &names)
+            .expect("guard released");
     }
 
     #[test]
@@ -4575,62 +4906,174 @@ mod tests {
         let query_remote = b"https://first.example/private.git?repo=SECOND";
         let first = PlanId::generate();
         let second = PlanId::generate();
+        let same_destination = PlanId::generate();
         let query_plan = PlanId::generate();
         registry
-            .note_push_terminal(&root, first_remote, first, &names, true)
+            .note_push_terminal(
+                &root,
+                first_remote,
+                fixture_ssh_identity(first_remote).as_ref(),
+                first,
+                &names,
+                true,
+            )
             .expect("first destination blocks");
         registry
-            .push_guard_check(&root, second_remote, &names)
+            .push_guard_check(
+                &root,
+                second_remote,
+                fixture_ssh_identity(second_remote).as_ref(),
+                &names,
+            )
             .expect("other private destination remains independent");
         registry
-            .push_guard_check(&root, query_remote, &names)
+            .push_guard_check(
+                &root,
+                query_remote,
+                fixture_ssh_identity(query_remote).as_ref(),
+                &names,
+            )
             .expect("query-routed destination remains independent");
         let err = registry
-            .push_guard_check(&root, first_alias, &names)
+            .push_guard_check(
+                &root,
+                first_alias,
+                fixture_ssh_identity(first_alias).as_ref(),
+                &names,
+            )
             .expect_err("same destination alias remains blocked");
         assert_eq!(err.code, ErrorCode::EPushUncertain);
         assert!(!err.to_string().contains("FIRST"));
         registry
-            .note_push_terminal(&root, second_remote, second, &names, true)
+            .note_push_terminal(
+                &root,
+                second_remote,
+                fixture_ssh_identity(second_remote).as_ref(),
+                second,
+                &names,
+                true,
+            )
             .expect("second destination blocks independently");
         registry
-            .note_push_terminal(&root, query_remote, query_plan, &names, true)
+            .note_push_terminal(
+                &root,
+                query_remote,
+                fixture_ssh_identity(query_remote).as_ref(),
+                query_plan,
+                &names,
+                true,
+            )
             .expect("query-routed destination blocks independently");
         registry
-            .note_push_reconciled(&root, second_remote, first, &names)
+            .note_push_terminal(
+                &root,
+                first_remote,
+                fixture_ssh_identity(first_remote).as_ref(),
+                same_destination,
+                &names,
+                true,
+            )
+            .expect("a second uncertain plan for the same destination is retained");
+        registry
+            .note_push_reconciled(
+                &root,
+                second_remote,
+                fixture_ssh_identity(second_remote).as_ref(),
+                first,
+                &names,
+            )
             .expect("another plan cannot clear second destination");
         assert_eq!(
             registry
-                .push_guard_check(&root, second_remote, &names)
+                .push_guard_check(
+                    &root,
+                    second_remote,
+                    fixture_ssh_identity(second_remote).as_ref(),
+                    &names
+                )
                 .expect_err("second plan still blocks")
                 .code,
             ErrorCode::EPushUncertain,
         );
         registry
-            .note_push_reconciled(&root, first_alias, first, &names)
+            .note_push_reconciled(
+                &root,
+                first_alias,
+                fixture_ssh_identity(first_alias).as_ref(),
+                first,
+                &names,
+            )
             .expect("first destination reconciles");
+        assert!(
+            registry
+                .push_guard_check(
+                    &root,
+                    first_remote,
+                    fixture_ssh_identity(first_remote).as_ref(),
+                    &names
+                )
+                .expect_err("another uncertain plan still owns this destination")
+                .to_string()
+                .contains(&same_destination.to_string()),
+        );
         registry
-            .push_guard_check(&root, first_remote, &names)
+            .note_push_reconciled(
+                &root,
+                first_alias,
+                fixture_ssh_identity(first_alias).as_ref(),
+                same_destination,
+                &names,
+            )
+            .expect("last plan for the first destination reconciles");
+        registry
+            .push_guard_check(
+                &root,
+                first_remote,
+                fixture_ssh_identity(first_remote).as_ref(),
+                &names,
+            )
             .expect("first destination clears");
         assert_eq!(
             registry
-                .push_guard_check(&root, query_remote, &names)
+                .push_guard_check(
+                    &root,
+                    query_remote,
+                    fixture_ssh_identity(query_remote).as_ref(),
+                    &names
+                )
                 .expect_err("query-routed destination stays blocked")
                 .code,
             ErrorCode::EPushUncertain,
         );
         assert_eq!(
             registry
-                .push_guard_check(&root, second_remote, &names)
+                .push_guard_check(
+                    &root,
+                    second_remote,
+                    fixture_ssh_identity(second_remote).as_ref(),
+                    &names
+                )
                 .expect_err("other destination stays blocked")
                 .code,
             ErrorCode::EPushUncertain,
         );
         registry
-            .note_push_terminal(&root, second_remote, second, &names, false)
+            .note_push_terminal(
+                &root,
+                second_remote,
+                fixture_ssh_identity(second_remote).as_ref(),
+                second,
+                &names,
+                false,
+            )
             .expect("second destination reaches terminal state");
         registry
-            .push_guard_check(&root, second_remote, &names)
+            .push_guard_check(
+                &root,
+                second_remote,
+                fixture_ssh_identity(second_remote).as_ref(),
+                &names,
+            )
             .expect("second destination clears");
     }
 
@@ -4654,6 +5097,7 @@ mod tests {
         let plan_id = PlanId::generate();
         let guarded_ref = b"refs/heads/main".to_vec();
         let unguarded_ref = b"refs/heads/feature".to_vec();
+        let reported_ref = b"refs/changes/7/head".to_vec();
         let updates = vec![PushUpdate {
             name: guarded_ref.clone(),
             old: HashKind::Sha256.zero_oid(),
@@ -4667,6 +5111,11 @@ mod tests {
             PushPlanRecord::prepare(other_plan_id, other_remote.to_vec(), false, updates.clone());
         other.begin_send().expect("other plan starts sending");
         let mut plan = PushPlanRecord::prepare(plan_id, remote.to_vec(), false, updates);
+        plan.reported_updates.push(PushUpdate {
+            name: reported_ref.clone(),
+            old: HashKind::Sha256.zero_oid(),
+            new: HashKind::Sha256.zero_oid(),
+        });
         plan.begin_send().expect("begin_send");
         plan.mark_uncertain();
         let mutation = plan
@@ -4699,36 +5148,314 @@ mod tests {
             .expect("open restores repository and guards");
 
         let err = registry
-            .push_guard_check(&path, alias, std::slice::from_ref(&guarded_ref))
+            .push_guard_check(
+                &path,
+                alias,
+                fixture_ssh_identity(alias).as_ref(),
+                std::slice::from_ref(&guarded_ref),
+            )
             .expect_err("uncertain push plan guards ref after restart");
         assert_eq!(err.code, ErrorCode::EPushUncertain);
         assert!(err.to_string().contains(&plan_id.to_string()));
+        assert_eq!(
+            registry
+                .push_guard_check(
+                    &path,
+                    alias,
+                    fixture_ssh_identity(alias).as_ref(),
+                    std::slice::from_ref(&reported_ref)
+                )
+                .expect_err("reported destination ref is guarded after restart")
+                .code,
+            ErrorCode::EPushUncertain,
+        );
 
         registry
-            .push_guard_check(&path, remote, std::slice::from_ref(&unguarded_ref))
+            .push_guard_check(
+                &path,
+                remote,
+                fixture_ssh_identity(remote).as_ref(),
+                std::slice::from_ref(&unguarded_ref),
+            )
             .expect("unguarded ref passes");
 
         let other_err = registry
-            .push_guard_check(&path, other_remote, std::slice::from_ref(&guarded_ref))
+            .push_guard_check(
+                &path,
+                other_remote,
+                fixture_ssh_identity(other_remote).as_ref(),
+                std::slice::from_ref(&guarded_ref),
+            )
             .expect_err("other destination restores its own sending plan");
         assert!(other_err.to_string().contains(&other_plan_id.to_string()));
         registry
             .push_guard_check(
                 &path,
                 b"https://mirror.example/third.git",
+                fixture_ssh_identity(b"https://mirror.example/third.git").as_ref(),
                 std::slice::from_ref(&guarded_ref),
             )
             .expect("unrelated destination remains unblocked after restart");
 
         registry
-            .note_push_reconciled(&path, remote, plan_id, std::slice::from_ref(&guarded_ref))
+            .note_push_reconciled(
+                &path,
+                remote,
+                fixture_ssh_identity(remote).as_ref(),
+                plan_id,
+                &[guarded_ref.clone(), reported_ref.clone()],
+            )
             .expect("reconcile clears guard");
         registry
-            .push_guard_check(&path, alias, std::slice::from_ref(&guarded_ref))
+            .push_guard_check(
+                &path,
+                alias,
+                fixture_ssh_identity(alias).as_ref(),
+                std::slice::from_ref(&guarded_ref),
+            )
             .expect("cleared ref passes");
+        registry
+            .push_guard_check(
+                &path,
+                alias,
+                fixture_ssh_identity(alias).as_ref(),
+                std::slice::from_ref(&reported_ref),
+            )
+            .expect("observed reported ref clears");
         let other_err = registry
-            .push_guard_check(&path, other_remote, std::slice::from_ref(&guarded_ref))
+            .push_guard_check(
+                &path,
+                other_remote,
+                fixture_ssh_identity(other_remote).as_ref(),
+                std::slice::from_ref(&guarded_ref),
+            )
             .expect_err("reconciling first destination preserves second destination");
         assert!(other_err.to_string().contains(&other_plan_id.to_string()));
+    }
+
+    #[test]
+    fn open_preserves_ambiguous_legacy_push_guards() {
+        use ruk_core::HashKind;
+        use ruk_core::change::PlanId;
+        use ruk_core::error::ErrorCode;
+
+        let root = scratch_root();
+        let repo_path = root.join("repo-a");
+        let store = Store::create(
+            &repo_path.join(".ruk"),
+            HashKind::Sha256,
+            Arc::new(PreparationBudget::reference_defaults()),
+        )
+        .expect("scratch store initializes");
+        let name = b"refs/heads/main";
+        let plans = [PlanId::generate(), PlanId::generate()];
+        let remotes: [&[u8]; 2] = [b"origin", b"ssh://mirror.example/repo.git"];
+        let mut mutations = Vec::new();
+        for (index, remote) in remotes.into_iter().enumerate() {
+            let mut value = vec![1, 5, 2, 0];
+            value.extend_from_slice(
+                &u32::try_from(remote.len())
+                    .expect("fixture remote fits u32")
+                    .to_le_bytes(),
+            );
+            value.extend_from_slice(remote);
+            value.extend_from_slice(&1u32.to_le_bytes());
+            value.extend_from_slice(
+                &u32::try_from(name.len())
+                    .expect("fixture ref fits u32")
+                    .to_le_bytes(),
+            );
+            value.extend_from_slice(name);
+            value.extend_from_slice(&[0; 64]);
+            value.extend_from_slice(&0u32.to_le_bytes());
+            mutations.push(FactMutation {
+                table: FactTable::PushPlans,
+                key: plans[index].as_bytes().to_vec(),
+                expected: FactExpectation::Absent,
+                value: Some(value),
+            });
+        }
+        mutations.push(FactMutation {
+            table: FactTable::RemoteObservations,
+            key: super::super::push_job::reconciliation_marker_key(plans[0]),
+            expected: FactExpectation::Absent,
+            value: Some(vec![0x01]),
+        });
+        #[cfg(unix)]
+        let (raw_path_plan, legacy_raw_path_plan) = {
+            use ruk_git::transport::push::{PushPlanRecord, PushUpdate};
+            use std::os::unix::ffi::OsStrExt as _;
+
+            let destination = root.join(std::ffi::OsStr::from_bytes(b"remote-\xff"));
+            assert!(destination.is_absolute());
+            let bytes = destination.as_os_str().as_encoded_bytes().to_vec();
+            let mut plan = PushPlanRecord::prepare(
+                PlanId::generate(),
+                bytes.clone(),
+                false,
+                vec![PushUpdate {
+                    name: b"refs/heads/raw-path".to_vec(),
+                    old: HashKind::Sha256.zero_oid(),
+                    new: HashKind::Sha256.zero_oid(),
+                }],
+            );
+            plan.begin_send().expect("new local plan starts sending");
+            let encoded = plan.encode(HashKind::Sha256).expect("local plan encodes");
+            let decoded = PushPlanRecord::decode(plan.id, HashKind::Sha256, &encoded)
+                .expect("absolute byte path decodes");
+            assert_eq!(decoded.remote, bytes);
+            assert!(decoded.remote_is_resolved);
+            assert!(decoded.destination_is_known());
+            mutations.push(
+                plan.persist_mutation(HashKind::Sha256, None)
+                    .expect("local plan mutation"),
+            );
+            let mut legacy = plan.clone();
+            legacy.id = PlanId::generate();
+            legacy.remote_is_resolved = false;
+            legacy.updates[0].name = b"refs/heads/legacy-raw-path".to_vec();
+            assert!(!legacy.destination_is_known());
+            mutations.push(
+                legacy
+                    .persist_mutation(HashKind::Sha256, None)
+                    .expect("legacy local plan mutation"),
+            );
+            (plan, legacy)
+        };
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("legacy rows persist");
+        drop(store);
+
+        let registry = Registry::new(vec![root.clone()]).expect("registry opens");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime starts");
+        registry.set_runtime(runtime.handle().clone());
+        let (_handle, path, _coord) = registry
+            .open(repo_path.to_str().expect("scratch path is UTF-8"))
+            .expect("legacy rows restore without guessing their destinations");
+        #[cfg(unix)]
+        {
+            assert!(
+                registry
+                    .push_guard_check(
+                        &path,
+                        &raw_path_plan.remote,
+                        fixture_ssh_identity(&raw_path_plan.remote).as_ref(),
+                        &[raw_path_plan.updates[0].name.clone()]
+                    )
+                    .expect_err("absolute byte path restores its exact local guard")
+                    .to_string()
+                    .contains(&raw_path_plan.id.to_string()),
+            );
+            registry
+                .push_guard_check(
+                    &path,
+                    b"https://original.example/repo.git",
+                    fixture_ssh_identity(b"https://original.example/repo.git").as_ref(),
+                    &[raw_path_plan.updates[0].name.clone()],
+                )
+                .expect("known absolute byte path does not block network destinations");
+            assert!(
+                registry
+                    .push_guard_check(
+                        &path,
+                        b"https://original.example/repo.git",
+                        fixture_ssh_identity(b"https://original.example/repo.git").as_ref(),
+                        &[legacy_raw_path_plan.updates[0].name.clone()]
+                    )
+                    .expect_err("legacy opaque path keeps its conservative wildcard")
+                    .to_string()
+                    .contains(&legacy_raw_path_plan.id.to_string()),
+            );
+        }
+        let names = vec![name.to_vec()];
+        for remote in [
+            b"https://original.example/repo.git".as_slice(),
+            b"https://changed.example/repo.git".as_slice(),
+            b"ssh://alice@mirror.example/repo.git".as_slice(),
+        ] {
+            let err = registry
+                .push_guard_check(&path, remote, fixture_ssh_identity(remote).as_ref(), &names)
+                .expect_err("unknown original destination blocks every destination");
+            assert_eq!(err.code, ErrorCode::EPushUncertain);
+            assert!(err.to_string().contains("finish push.reconcile"));
+            assert!(err.to_string().contains(
+                "supply a verified original_remote only if the saved destination is unknown"
+            ));
+            assert!(
+                plans
+                    .iter()
+                    .any(|plan| err.to_string().contains(&plan.to_string()))
+            );
+            for plan in plans {
+                registry
+                    .note_push_reconciled(
+                        &path,
+                        remote,
+                        fixture_ssh_identity(remote).as_ref(),
+                        plan,
+                        &names,
+                    )
+                    .expect("guessed destination cannot release a legacy guard");
+            }
+            assert_eq!(
+                registry
+                    .push_guard_check(&path, remote, fixture_ssh_identity(remote).as_ref(), &names)
+                    .expect_err("legacy guards remain after guessed reconciliation")
+                    .code,
+                ErrorCode::EPushUncertain,
+            );
+            registry
+                .push_guard_check(
+                    &path,
+                    remote,
+                    fixture_ssh_identity(remote).as_ref(),
+                    &[b"refs/heads/other".to_vec()],
+                )
+                .expect("unrelated refs remain independent");
+        }
+        {
+            let inner = registry.inner.lock().expect("guard lock");
+            assert_eq!(
+                inner
+                    .uncertain_pushes
+                    .get(&(path.clone(), None, name.to_vec())),
+                Some(&HashSet::from(plans)),
+            );
+        }
+        registry
+            .note_legacy_push_reconciled(&path, plans[0], &names)
+            .expect("verified binding releases only its legacy owner");
+        assert!(
+            registry
+                .push_guard_check(
+                    &path,
+                    b"https://original.example/repo.git",
+                    fixture_ssh_identity(b"https://original.example/repo.git").as_ref(),
+                    &names
+                )
+                .expect_err("other ambiguous plan remains blocked")
+                .to_string()
+                .contains(&plans[1].to_string()),
+        );
+        registry
+            .note_legacy_push_reconciled(&path, plans[1], &names)
+            .expect("last verified binding releases the legacy block");
+        registry
+            .push_guard_check(
+                &path,
+                b"https://original.example/repo.git",
+                fixture_ssh_identity(b"https://original.example/repo.git").as_ref(),
+                &names,
+            )
+            .expect("every ambiguous plan was explicitly reconciled");
     }
 }

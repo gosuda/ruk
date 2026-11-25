@@ -7920,13 +7920,14 @@ fn reconciled_push_guard_stays_clear_after_restart() {
     .expect("scratch store initializes");
 
     let plan_id_1 = PlanId::generate();
+    let remote = b"https://mirror.example/repo.git";
     let ref_1 = b"refs/heads/main".to_vec();
     let updates_1 = vec![PushUpdate {
         name: ref_1.clone(),
         old: HashKind::Sha256.zero_oid(),
         new: HashKind::Sha256.zero_oid(),
     }];
-    let mut plan_1 = PushPlanRecord::prepare(plan_id_1, b"origin".to_vec(), false, updates_1);
+    let mut plan_1 = PushPlanRecord::prepare(plan_id_1, remote.to_vec(), false, updates_1);
     plan_1.begin_send().expect("begin_send");
     plan_1.mark_uncertain();
     let mutation_1 = plan_1
@@ -7940,7 +7941,7 @@ fn reconciled_push_guard_stays_clear_after_restart() {
         old: HashKind::Sha256.zero_oid(),
         new: HashKind::Sha256.zero_oid(),
     }];
-    let mut plan_2 = PushPlanRecord::prepare(plan_id_2, b"origin".to_vec(), false, updates_2);
+    let mut plan_2 = PushPlanRecord::prepare(plan_id_2, remote.to_vec(), false, updates_2);
     plan_2.begin_send().expect("begin_send");
     plan_2.mark_uncertain();
     let mutation_2 = plan_2
@@ -7971,13 +7972,13 @@ fn reconciled_push_guard_stays_clear_after_restart() {
         .expect("open restores repository and guards");
 
     let err = registry
-        .push_guard_check(&path, b"origin", std::slice::from_ref(&ref_1))
+        .push_guard_check(&path, remote, None, std::slice::from_ref(&ref_1))
         .expect_err("uncertain un-reconciled push plan guards ref after restart");
     assert_eq!(err.code, ErrorCode::EPushUncertain);
     assert!(err.to_string().contains(&plan_id_1.to_string()));
 
     registry
-        .push_guard_check(&path, b"origin", std::slice::from_ref(&ref_2))
+        .push_guard_check(&path, remote, None, std::slice::from_ref(&ref_2))
         .expect("reconciled push guard stays clear after restart");
 }
 

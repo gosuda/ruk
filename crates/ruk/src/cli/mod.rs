@@ -104,9 +104,9 @@ impl CliEnv {
 ///
 /// `root` holds `.ruk/`; `file_base` is where worktree files are read and
 /// written (`--work-tree` moves it, like `git --work-tree`). A bare
-/// repository refuses worktree verbs the way Git does. Repository-optional
-/// verbs (`init`, `clone`, `hash-object`) run without an open store and open
-/// the stores they need themselves.
+/// repository refuses worktree verbs the way Git does. `init` and `clone`
+/// open their own stores; `hash-object` reads an existing repository's
+/// format header and opens its store only when writing.
 pub(crate) struct Ctx {
     /// The open native store, when the verb needs a repository.
     pub(crate) store: Option<Store>,
@@ -114,7 +114,7 @@ pub(crate) struct Ctx {
     pub(crate) root: PathBuf,
     /// Base directory for worktree file access.
     pub(crate) file_base: PathBuf,
-    /// Object format of the open repository.
+    /// Object format of the selected repository.
     pub(crate) kind: Option<HashKind>,
     /// Process environment snapshot.
     pub(crate) env: CliEnv,
@@ -353,12 +353,15 @@ pub(crate) fn run_inner(
     for global in globals {
         match global {
             Global::ChangeDir(dir) => {
+                let dir = env.cwd.join(dir);
                 if !dir.is_dir() {
                     return Err(GitError::Io {
                         detail: format!("cannot change to {}", dir.display()),
                     });
                 }
-                env.cwd = dir;
+                env.cwd = std::fs::canonicalize(&dir).map_err(|err| GitError::Io {
+                    detail: format!("cannot change to {}: {err}", dir.display()),
+                })?;
             }
             Global::Define(key, value) => cli_config.push((key, value)),
             Global::GitDir(dir) => git_dir = Some(dir),
@@ -371,6 +374,11 @@ pub(crate) fn run_inner(
     {
         git_dir = Some(PathBuf::from(value));
     }
+    env.cwd = std::path::absolute(&env.cwd).map_err(|err| GitError::Io {
+        detail: format!("cannot resolve working directory: {err}"),
+    })?;
+    git_dir = git_dir.map(|dir| env.cwd.join(dir));
+    work_tree = work_tree.map(|dir| env.cwd.join(dir));
     let Some(verb) = verb else {
         return Err(GitError::Invalid {
             detail: "no command given; see 'ruk help'".to_owned(),
@@ -393,20 +401,32 @@ pub(crate) fn run_inner(
     let entry = dispatch::lookup(&verb).ok_or_else(|| GitError::Unsupported {
         command: verb.clone(),
     })?;
-    if verb_args.iter().any(|arg| arg == "--help") {
-        return Ok((dispatch::help_text(Some(entry)), Vec::new()));
+    let help = || (dispatch::help_text(Some(entry)), Vec::new());
+    if verb_args.first().is_some_and(|arg| arg == "--help") {
+        return Ok(help());
     }
-    let mut ctx = open_ctx(
-        env,
-        git_dir,
-        work_tree,
-        bare,
-        cli_config,
-        entry.needs_repo,
-        egress,
-    )?;
-    let stdout = (entry.run)(&mut ctx, &verb_args)?;
-    Ok((stdout, std::mem::take(&mut ctx.stderr)))
+    let hash_only = if entry.name == "hash-object" {
+        match verbs_objects::hash_object_writes(&verb_args) {
+            Ok(write) => !write,
+            Err(GitError::HelpRequested) => return Ok(help()),
+            Err(err) => return Err(err),
+        }
+    } else {
+        false
+    };
+    let mut ctx = if hash_only {
+        open_hash_ctx(env, git_dir, work_tree, bare, cli_config, egress)?
+    } else {
+        let needs_repo = entry.needs_repo || entry.name == "hash-object";
+        open_ctx(
+            env, git_dir, work_tree, bare, cli_config, needs_repo, egress,
+        )?
+    };
+    match (entry.run)(&mut ctx, &verb_args) {
+        Ok(stdout) => Ok((stdout, std::mem::take(&mut ctx.stderr))),
+        Err(GitError::HelpRequested) => Ok(help()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Parsed leading globals: collected options, the verb, and its arguments.
@@ -507,6 +527,52 @@ fn parse_config_env(pair: &str) -> Result<(String, String), GitError> {
         .map_err(|_| GitError::Invalid {
             detail: format!("config-env {var:?} is not set"),
         })
+}
+
+fn open_hash_ctx(
+    env: CliEnv,
+    git_dir: Option<PathBuf>,
+    work_tree: Option<PathBuf>,
+    bare: bool,
+    cli_config: Vec<(String, String)>,
+    egress: ruk_git::transport::net::EgressPolicy,
+) -> Result<Ctx, GitError> {
+    let root = if git_dir.is_some() {
+        Some(find_root(&env.cwd, git_dir.as_deref(), bare)?)
+    } else {
+        discover_root(&env.cwd, bare)
+    };
+    if root.is_some()
+        && let Some(work_tree) = &work_tree
+        && !work_tree.is_dir()
+    {
+        return Err(GitError::Io {
+            detail: format!("work tree {} is not a directory", work_tree.display()),
+        });
+    }
+    let kind = if let Some(root) = &root {
+        let path = root.join(".ruk").join(Store::format_file());
+        let file = std::fs::File::open(&path).map_err(|err| GitError::Io {
+            detail: format!("opening {}: {err}", path.display()),
+        })?;
+        let bytes = tree::read_bounded(file, 128)?;
+        Some(Store::parses_format(&bytes).map_err(GitError::from)?.kind)
+    } else {
+        None
+    };
+    let root = root.unwrap_or_else(|| work_tree.clone().unwrap_or_else(|| env.cwd.clone()));
+    let file_base = work_tree.unwrap_or_else(|| root.clone());
+    Ok(Ctx {
+        store: None,
+        root,
+        file_base,
+        kind,
+        env,
+        bare,
+        cli_config,
+        stderr: Vec::new(),
+        egress,
+    })
 }
 
 /// Discovers the repository root and opens its store.
@@ -628,24 +694,23 @@ fn find_root(start: &Path, git_dir: Option<&Path>, bare: bool) -> Result<PathBuf
             detail: format!("not a ruk repository: {}", dir.display()),
         });
     }
-    if bare {
-        if start.join(".ruk").is_dir() {
-            return Ok(start.to_path_buf());
-        }
-        return Err(GitError::Invalid {
-            detail: "not a ruk repository".to_owned(),
-        });
-    }
-    let mut current = Some(start);
-    while let Some(dir) = current {
-        if dir.join(".ruk").is_dir() {
-            return Ok(dir.to_path_buf());
-        }
-        current = dir.parent();
-    }
-    Err(GitError::Invalid {
-        detail: "not a ruk repository (no .ruk found upward)".to_owned(),
+    discover_root(start, bare).ok_or_else(|| GitError::Invalid {
+        detail: if bare {
+            "not a ruk repository".to_owned()
+        } else {
+            "not a ruk repository (no .ruk found upward)".to_owned()
+        },
     })
+}
+
+fn discover_root(start: &Path, bare: bool) -> Option<PathBuf> {
+    if bare {
+        return start.join(".ruk").is_dir().then(|| start.to_path_buf());
+    }
+    start
+        .ancestors()
+        .find(|dir| dir.join(".ruk").is_dir())
+        .map(Path::to_path_buf)
 }
 
 /// One flag declaration for [`collect`]: its long name, short alias, and
@@ -731,6 +796,9 @@ pub(crate) fn collect(args: &[String], specs: &[FlagSpec]) -> Result<Collected, 
         if arg == "--" {
             out.positionals.extend_from_slice(&args[index + 1..]);
             return Ok(out);
+        }
+        if arg == "--help" {
+            return Err(GitError::HelpRequested);
         }
         if arg.starts_with("--") {
             index = collect_long(args, index, specs, &mut out)?;

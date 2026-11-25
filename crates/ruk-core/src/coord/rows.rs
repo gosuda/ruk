@@ -30,14 +30,15 @@ use serde::{Deserialize, Serialize};
 use crate::MAX_CONTROL_FRAME_BYTES;
 use crate::bytes::ByteString;
 use crate::capability::Capabilities;
-use crate::change::{ClaimId, OperationId, RequestId, SessionId, WorkspaceId};
+use crate::change::{ClaimId, OperationId, PlanId, RequestId, SessionId, WorkspaceId};
 use crate::commit::ProvenanceClaims;
 use crate::coord::policy::Principal;
 use crate::error::{CoreError, ErrorCode};
 use crate::index::RepoPath;
 use crate::protocol::{
-    ClaimAcquireReply, ClaimMode, ClaimRecord, ClaimReleaseReply, IdentityClaim, Method,
-    MutationOutcome, OperationEntry, ReceiptRef, Reply, SessionAuthority, Timestamp, Validate,
+    BoundedList, ClaimAcquireReply, ClaimMode, ClaimRecord, ClaimReleaseReply, IdentityClaim,
+    Method, MutationOutcome, OperationEntry, PushReconcileReply, PushState, ReceiptRef,
+    ReconcileObservation, Reply, SessionAuthority, Timestamp, Validate,
 };
 use crate::store::types::FactTable;
 use crate::store::{Store, StoreError};
@@ -289,10 +290,40 @@ pub(crate) fn decode_session(
 // Receipt Row
 // ---------------------------------------------------------------------------
 
-/// Stored row for [`FactTable::Receipts`]. Transparently wraps a mutation [`Reply`].
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
+/// Stored row for [`FactTable::Receipts`]. Reconciliation replies carry a format tag;
+/// other mutation replies retain their original encoding.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ReceiptRow(Reply);
+
+const RECONCILE_RECEIPT_V2_TAG: u32 = u32::MAX;
+const RECONCILE_RECEIPT_TAG: u32 = u32::MAX - 1;
+
+impl Serialize for ReceiptRow {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if matches!(self.0, Reply::PushReconcile(_)) {
+            (RECONCILE_RECEIPT_TAG, &self.0).serialize(serializer)
+        } else {
+            self.0.serialize(serializer)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyPushReconcileReply {
+    outcome: MutationOutcome,
+    plan: PlanId,
+    state: PushState,
+    observations: BoundedList<ReconcileObservation>,
+}
+
+#[derive(Deserialize)]
+struct PushReconcileReplyV2 {
+    outcome: MutationOutcome,
+    plan: PlanId,
+    state: PushState,
+    rewritten: bool,
+    observations: BoundedList<ReconcileObservation>,
+}
 
 impl ReceiptRow {
     /// Wraps a completed mutation reply into a durable receipt record.
@@ -390,9 +421,57 @@ pub(crate) fn decode_receipt(
     // new-shape row must fail the strict legacy decode and latch quarantine
     // instead of mistranslating, so the restored byte is never trusted as a
     // value on its own.
-    let reply: Reply = match crate::store::decode("receipt row", b) {
-        Ok(reply) => reply,
-        Err(_) => decode_legacy_claim_receipt(store, b)?,
+    let reply: Reply = match postcard::take_from_bytes::<u32>(b) {
+        Ok((RECONCILE_RECEIPT_TAG, rest)) => {
+            let reply: Reply = decode(store, "reconciliation receipt row", rest)?;
+            if !matches!(reply, Reply::PushReconcile(_)) {
+                return corrupt(
+                    store,
+                    "reconciliation receipt row",
+                    "format tag names another method",
+                );
+            }
+            reply
+        }
+        Ok((RECONCILE_RECEIPT_V2_TAG, rest)) => {
+            let (method, previous): (Method, PushReconcileReplyV2) =
+                decode(store, "version-2 reconciliation receipt row", rest)?;
+            if method != Method::PushReconcile {
+                return corrupt(
+                    store,
+                    "version-2 reconciliation receipt row",
+                    "format tag names another method",
+                );
+            }
+            Reply::PushReconcile(Box::new(PushReconcileReply {
+                outcome: previous.outcome,
+                plan: previous.plan,
+                state: previous.state,
+                rewritten: previous.rewritten,
+                observations: previous.observations,
+                reported_observations: BoundedList::default(),
+                next: None,
+            }))
+        }
+        _ => match postcard::take_from_bytes::<Method>(b) {
+            Ok((Method::PushReconcile, rest)) => {
+                let legacy: LegacyPushReconcileReply =
+                    decode(store, "legacy reconciliation receipt row", rest)?;
+                Reply::PushReconcile(Box::new(PushReconcileReply {
+                    outcome: legacy.outcome,
+                    plan: legacy.plan,
+                    state: legacy.state,
+                    rewritten: false,
+                    observations: legacy.observations,
+                    reported_observations: BoundedList::default(),
+                    next: None,
+                }))
+            }
+            _ => match crate::store::decode("receipt row", b) {
+                Ok(reply) => reply,
+                Err(_) => decode_legacy_claim_receipt(store, b)?,
+            },
+        },
     };
     let mut s_bytes = [0_u8; 16];
     s_bytes.copy_from_slice(&key[..16]);
@@ -1302,6 +1381,183 @@ mod tests {
         assert_eq!(replay_outcome.receipt.session, s);
         assert_eq!(replay_outcome.receipt.request_id, r);
         assert_eq!(replay_outcome.operation, Some(OperationId(1)));
+    }
+
+    #[test]
+    fn reconciliation_receipts_preserve_versions_and_reject_truncation() {
+        use crate::protocol::{PushReconcileCursor, ReportedReconcileObservation};
+
+        let (_temp, store) = test_store("reconcile-receipt");
+        let s = SessionId::from_bytes([1; 16]);
+        let r = RequestId::from_bytes([2; 16]);
+        let plan = PlanId::from_bytes([4; 16]);
+        let key = receipt_key(s, r);
+        let outcome = MutationOutcome {
+            receipt: ReceiptRef {
+                session: s,
+                request_id: r,
+                digest: RequestDigest::from_bytes([3; 32]),
+                replayed: false,
+                retained_until: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+            },
+            operation: Some(OperationId(1)),
+            heads: empty_bounded_list(),
+            stamps: empty_bounded_list(),
+            warnings: empty_bounded_list(),
+            merge: None,
+            provenance: empty_bounded_list(),
+            identity: None,
+        };
+        let tip = crate::Oid::from_hex(&"12".repeat(32)).expect("tip");
+        let observations = BoundedList::complete(vec![ReconcileObservation {
+            remote_ref: crate::refdata::RefName::new(b"refs/heads/main".to_vec()).expect("ref"),
+            observed: Some(tip),
+            verdict: crate::protocol::ReconcileVerdict::EqualNew,
+        }])
+        .expect("observations fit");
+        let old = encode(
+            "legacy receipt",
+            &(
+                Method::PushReconcile,
+                &outcome,
+                plan,
+                PushState::Uncertain,
+                &observations,
+            ),
+        )
+        .expect("old four-field receipt encodes");
+        let ReceiptRow(legacy) =
+            decode_receipt(&store, &key, &old).expect("legacy receipt remains readable");
+        let Reply::PushReconcile(legacy) = legacy else {
+            panic!("reconciliation receipt");
+        };
+        assert!(!legacy.rewritten);
+        assert_eq!(legacy.outcome, outcome);
+        assert_eq!(legacy.observations, observations);
+        assert_eq!(legacy.reported_observations, BoundedList::default());
+        assert_eq!(legacy.next, None);
+
+        let previous = encode(
+            "version-2 receipt",
+            &(
+                RECONCILE_RECEIPT_V2_TAG,
+                Method::PushReconcile,
+                &outcome,
+                plan,
+                PushState::Uncertain,
+                true,
+                &observations,
+            ),
+        )
+        .expect("published five-field receipt encodes");
+        let ReceiptRow(previous_reply) =
+            decode_receipt(&store, &key, &previous).expect("version-2 receipt remains readable");
+        let Reply::PushReconcile(previous_reply) = previous_reply else {
+            panic!("version-2 reconciliation receipt");
+        };
+        assert!(previous_reply.rewritten);
+        assert_eq!(previous_reply.outcome, outcome);
+        assert_eq!(previous_reply.observations, observations);
+        assert_eq!(previous_reply.reported_observations, BoundedList::default());
+        assert_eq!(previous_reply.next, None);
+
+        let reported = BoundedList::excerpt(
+            vec![ReportedReconcileObservation {
+                remote_ref: crate::refdata::RefName::new(b"refs/heads/main".to_vec())
+                    .expect("reported ref"),
+                old: None,
+                new: Some(tip),
+                observed: Some(tip),
+                verdict: crate::protocol::ReconcileVerdict::EqualNew,
+            }],
+            2,
+        )
+        .expect("reported observations fit");
+        let reply = Reply::PushReconcile(Box::new(PushReconcileReply {
+            outcome: outcome.clone(),
+            plan,
+            state: PushState::Uncertain,
+            rewritten: true,
+            observations: observations.clone(),
+            reported_observations: reported,
+            next: Some(PushReconcileCursor {
+                session: s,
+                request: r,
+                page: 1,
+            }),
+        }));
+        let row = ReceiptRow::new(s, r, reply.clone()).expect("new receipt validates");
+        let bytes = encode("receipt", &row).expect("new receipt encodes");
+        assert_eq!(
+            postcard::take_from_bytes::<u32>(&bytes).expect("tag").0,
+            RECONCILE_RECEIPT_TAG
+        );
+        for method in Method::ALL {
+            let encoded = postcard::to_allocvec(method).expect("method encodes");
+            let tag = postcard::from_bytes::<u32>(&encoded).expect("method tag");
+            assert_ne!(tag, RECONCILE_RECEIPT_V2_TAG);
+            assert_ne!(tag, RECONCILE_RECEIPT_TAG);
+        }
+        assert_eq!(
+            decode_receipt(&store, &key, &bytes)
+                .expect("new receipt decodes")
+                .0,
+            reply
+        );
+        store
+            .fact(FactTable::OpHead, OP_HEAD_KEY)
+            .expect("valid rows leave store usable");
+
+        let mut missing_paged_fields =
+            postcard::to_allocvec(&RECONCILE_RECEIPT_TAG).expect("new tag");
+        missing_paged_fields.extend_from_slice(
+            postcard::take_from_bytes::<u32>(&previous)
+                .expect("previous tag")
+                .1,
+        );
+        let mut missing_rewrite =
+            postcard::to_allocvec(&RECONCILE_RECEIPT_V2_TAG).expect("previous tag");
+        missing_rewrite.extend_from_slice(&old);
+        let wrong_method = encode(
+            "wrong tagged method",
+            &(
+                RECONCILE_RECEIPT_V2_TAG,
+                Method::Push,
+                &outcome,
+                plan,
+                PushState::Uncertain,
+                true,
+                &observations,
+            ),
+        )
+        .expect("wrong method fixture");
+        let mut partial_tag = postcard::to_allocvec(&RECONCILE_RECEIPT_TAG).expect("new tag");
+        partial_tag.pop().expect("tag ends");
+        for (case, malformed) in [
+            ("truncated-v2", previous[..previous.len() - 1].to_vec()),
+            ("truncated-v3", bytes[..bytes.len() - 1].to_vec()),
+            ("missing-paged-fields", missing_paged_fields),
+            ("missing-rewrite", missing_rewrite),
+            ("wrong-tagged-method", wrong_method),
+            ("partial-format-tag", partial_tag),
+        ] {
+            let (_temp, damaged) = test_store(case);
+            assert_eq!(
+                decode_receipt(&damaged, &key, &malformed)
+                    .expect_err("tagged corruption never retries another row version")
+                    .code,
+                ErrorCode::ECorrupt,
+                "{case}"
+            );
+            assert_eq!(
+                damaged
+                    .fact(FactTable::OpHead, OP_HEAD_KEY)
+                    .expect_err("malformed committed row quarantines")
+                    .code(),
+                ErrorCode::ECorrupt,
+                "{case}"
+            );
+        }
     }
 
     #[test]

@@ -974,7 +974,6 @@ pub mod test_support {
     use super::super::fetch::{FetchWireRequest, ReceivedPack};
     use super::*;
     use std::io::Cursor;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// An in-memory duplex stream: reads serve `script`, writes accumulate
     /// in `written` for exact request assertions.
@@ -1018,13 +1017,10 @@ pub mod test_support {
         }
     }
 
-    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-
     /// A fresh empty store in a unique scratch directory.
     pub fn test_store(kind: HashKind) -> Store {
-        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir =
-            std::env::temp_dir().join(format!("ruk-transport-test-{}-{id}", std::process::id()));
+        let id = ruk_core::change::StoreId::generate();
+        let dir = std::env::temp_dir().join(format!("ruk-transport-test-{id}"));
         Store::create(&dir, kind, default_budget()).expect("test store")
     }
 

@@ -182,7 +182,7 @@ enum Target {
     /// A local repository root holding `.ruk`.
     Local(PathBuf),
     /// An SSH, git-daemon or HTTP endpoint.
-    Net(Endpoint),
+    Net { endpoint: Endpoint, url: String },
 }
 
 /// Resolves a remote name or URL: configured names read their URL first,
@@ -199,7 +199,7 @@ fn resolve_target(ctx: &Ctx, target: &str) -> Result<Target, GitError> {
     match net::parse_endpoint(&url)? {
         Endpoint::Local { .. } => Ok(Target::Local(remote_root(ctx, target)?)),
         endpoint @ (Endpoint::Ssh { .. } | Endpoint::Git { .. } | Endpoint::Http { .. }) => {
-            Ok(Target::Net(endpoint))
+            Ok(Target::Net { endpoint, url })
         }
     }
 }
@@ -402,7 +402,7 @@ pub(crate) fn run_fetch(
             let advertised = advertise(&src)?;
             (FetchSource::Local(Box::new(src)), advertised)
         }
-        Target::Net(endpoint) => match endpoint {
+        Target::Net { endpoint, .. } => match endpoint {
             Endpoint::Http { url, .. } => {
                 ruk_git::transport::credentials::refuse_url_userinfo(&url, &plan.auth)?;
                 let base = ruk_git::transport::smart_http::normalize_base(&url)?;
@@ -1443,6 +1443,9 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
     };
     match resolve_target(ctx, target)? {
         Target::Local(dest_root) => {
+            let dest_root = std::path::absolute(dest_root).map_err(|err| GitError::Io {
+                detail: format!("resolve local push destination: {err}"),
+            })?;
             let dest = open_store_at(&dest_root)?;
             if dest.hash_kind() != kind {
                 return Err(GitError::ObjectFormat {
@@ -1450,7 +1453,7 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
                 });
             }
             if flags.mirror {
-                return push_mirror(ctx, &dest, target, &flags, &remote_label);
+                return push_mirror(ctx, &dest, target, &dest_root, &flags, &remote_label);
             }
             // Scoped borrows: the store borrow ends before the LFS upload
             // reborrows `ctx` mutably for stderr.
@@ -1494,13 +1497,18 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
                 push_lfs_upload(ctx, &updates, &remote_label, &flags.auth)?;
             }
             let store = ctx.store()?;
-            let mut outcomes = push_local(store, &dest, target, kind, &flags, updates)?;
+            let mut outcomes = push_local(
+                store,
+                &dest,
+                dest_root.as_os_str().as_encoded_bytes(),
+                kind,
+                &flags,
+                updates,
+            )?;
             outcomes.extend(early);
             push_outcomes(outcomes)
         }
-        Target::Net(endpoint) => {
-            push_net(ctx, &endpoint, target, &spec_texts, &flags, &remote_label)
-        }
+        Target::Net { url, .. } => push_net(ctx, &url, &spec_texts, &flags, &remote_label),
     }
 }
 
@@ -1590,7 +1598,7 @@ fn build_push_updates(
 fn push_local(
     src: &Store,
     dest: &Store,
-    target: &str,
+    destination: &[u8],
     kind: HashKind,
     flags: &PushFlags,
     updates: Vec<PushUpdate>,
@@ -1601,7 +1609,7 @@ fn push_local(
     };
     let mut plan = ruk_git::transport::push::PushPlanRecord::prepare(
         PlanId::generate(),
-        target.as_bytes().to_vec(),
+        destination.to_vec(),
         flags.atomic,
         updates,
     );
@@ -1616,14 +1624,15 @@ fn push_local(
 /// Oracle: `git/builtin/push.c`.
 fn push_net(
     ctx: &mut Ctx,
-    endpoint: &Endpoint,
-    target: &str,
+    url: &str,
     spec_texts: &[String],
     flags: &PushFlags,
     remote_label: &str,
 ) -> Result<Vec<u8>, GitError> {
     let kind = ctx.kind()?;
     let tls_roots = tls_roots_for(ctx)?;
+    let destination = net::freeze_push_destination(url, &ctx.egress, &flags.interrupt)?;
+    let endpoint = &destination.endpoint;
     // Discovery plus the update list under one scoped store borrow, so the
     // LFS upload below can reborrow `ctx` mutably for stderr.
     let (updates, early, http_adv) = {
@@ -1707,9 +1716,6 @@ fn push_net(
         (updates, early, http_adv)
     };
     if !flags.no_verify {
-        let url = ctx
-            .config_get(&format!("remote.{target}.url"))
-            .unwrap_or_else(|| target.to_owned());
         let store = ctx.store()?;
         let lines = if flags.mirror {
             super::verbs_hooks::pre_push_mirror_stdin(&updates)
@@ -1719,7 +1725,7 @@ fn push_net(
             let locals = push_spec_locals(store, spec_texts);
             super::verbs_hooks::pre_push_stdin(&locals, &updates)
         };
-        super::verbs_hooks::run_pre_push(ctx, remote_label, &url, &lines)?;
+        super::verbs_hooks::run_pre_push(ctx, remote_label, url, &lines)?;
     }
     if flags.mirror && updates.is_empty() {
         return Ok(Vec::new());
@@ -1736,10 +1742,11 @@ fn push_net(
     };
     let mut plan = ruk_git::transport::push::PushPlanRecord::prepare(
         PlanId::generate(),
-        target.as_bytes().to_vec(),
+        url.as_bytes().to_vec(),
         flags.atomic,
         updates,
     );
+    plan.ssh_identity = destination.ssh_identity;
     let mut outcomes = match &http_adv {
         Some((base, adv, extra_headers)) => ruk_git::transport::smart_http::push_pack(
             base,
@@ -1807,6 +1814,7 @@ fn push_mirror(
     ctx: &mut Ctx,
     dest: &Store,
     target: &str,
+    destination: &std::path::Path,
     flags: &PushFlags,
     remote_label: &str,
 ) -> Result<Vec<u8>, GitError> {
@@ -1837,7 +1845,7 @@ fn push_mirror(
     };
     let mut plan = ruk_git::transport::push::PushPlanRecord::prepare(
         PlanId::generate(),
-        target.as_bytes().to_vec(),
+        destination.as_os_str().as_encoded_bytes().to_vec(),
         flags.atomic,
         updates,
     );
@@ -4366,7 +4374,7 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
             let src = open_store_at(&root)?;
             advertise(&src)?
         }
-        Target::Net(endpoint) => {
+        Target::Net { endpoint, .. } => {
             // Over v2, ls-remote is ls-refs: one `Git-Protocol` GET
             // parses caps or the v0 refs, with no second round trip. A
             // server answering `info/refs` without the smart advertisement

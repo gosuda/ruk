@@ -77,6 +77,8 @@ pub enum GitError {
         /// What the caller must fix.
         detail: String,
     },
+    #[error("command help requested")]
+    HelpRequested,
     /// A configured resource limit rejected the request.
     #[error("limit: {detail}")]
     Limit {
@@ -169,6 +171,7 @@ impl GitError {
             Self::InvalidOid { .. } | Self::Invalid { .. } | Self::Usage { .. } => {
                 ErrorCode::EInvalid
             }
+            Self::HelpRequested => ErrorCode::EInvalid,
             Self::ObjectFormat { .. } => ErrorCode::EObjectFormat,
             Self::Corrupt { .. } => ErrorCode::ECorrupt,
             Self::Io { .. } => ErrorCode::EIo,

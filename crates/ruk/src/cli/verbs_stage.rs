@@ -46,6 +46,9 @@ enum AddFill {
     Intent,
 }
 
+#[cfg(test)]
+mod tests;
+
 /// Adds worktree files to stage-zero index rows.
 ///
 /// Oracle: `git/builtin/add.c`.
@@ -124,7 +127,10 @@ fn collect_add_targets(
     if opts.is_set("all") {
         let mut out = Vec::new();
         for entry in walk_worktree(&ctx.file_base)? {
-            out.push(repo_path_of(ctx, &entry.path)?);
+            out.push(
+                RepoPath::new(entry.path)
+                    .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?,
+            );
         }
         for positional in &opts.positionals {
             let path = repo_path_of(ctx, positional.as_bytes())?;
@@ -261,11 +267,13 @@ pub(crate) fn repo_path_of(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitError> 
     } else {
         ctx.env.cwd.join(text)
     };
-    let relative = joined
-        .strip_prefix(&ctx.file_base)
-        .map_err(|_| GitError::Invalid {
-            detail: format!("pathspec {text:?} is outside the repository"),
-        })?;
+    let joined = normalize_staging_path(&joined)?;
+    let base = std::fs::canonicalize(&ctx.file_base).map_err(|err| GitError::Io {
+        detail: format!("resolving worktree {}: {err}", ctx.file_base.display()),
+    })?;
+    let relative = joined.strip_prefix(&base).map_err(|_| GitError::Invalid {
+        detail: format!("pathspec {text:?} is outside the repository"),
+    })?;
     let mut parts: Vec<u8> = Vec::new();
     for component in relative.components() {
         match component {
@@ -283,6 +291,38 @@ pub(crate) fn repo_path_of(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitError> 
         }
     }
     RepoPath::new(parts).map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))
+}
+
+fn normalize_staging_path(path: &std::path::Path) -> Result<std::path::PathBuf, GitError> {
+    let bad_path = || GitError::Invalid {
+        detail: format!("bad pathspec {:?}", path.as_os_str()),
+    };
+    let path_error = |err: std::io::Error| GitError::Io {
+        detail: format!("resolving pathspec {}: {err}", path.display()),
+    };
+    let (mut parent, name) = path.parent().zip(path.file_name()).ok_or_else(bad_path)?;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(parent) {
+            Ok(mut resolved) => {
+                for part in missing.into_iter().rev() {
+                    resolved.push(part);
+                }
+                resolved.push(name);
+                return Ok(resolved);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(parent) {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => return Err(path_error(err)),
+                    Err(err) => return Err(path_error(err)),
+                }
+                missing.push(parent.file_name().ok_or_else(bad_path)?.to_os_string());
+                parent = parent.parent().ok_or_else(bad_path)?;
+            }
+            Err(err) => return Err(path_error(err)),
+        }
+    }
 }
 
 /// Renders a path for diagnostics.

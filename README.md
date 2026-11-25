@@ -68,6 +68,9 @@ To import an existing Git repository into a co-located `.ruk` store without modi
 | `ruk mcp --repo <path>` | Serve the typed operation table over stdio as a Model Context Protocol (JSON-RPC 2.0) server. |
 | `ruk serve --config <path.toml>` | Run the hosted multi-repository Unix-socket daemon. |
 
+See [Recover an uncertain push](docs/push-recovery.md) for destination
+verification, legacy plans, and server-reported ref changes.
+
 ---
 
 ## Capacity benchmarks (dev-scale)
