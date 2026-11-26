@@ -1,7 +1,7 @@
 diff --git a/crates/ruk/src/cli/verbs_stage.rs b/crates/ruk/src/cli/verbs_stage.rs
 --- a/crates/ruk/src/cli/verbs_stage.rs
 +++ b/crates/ruk/src/cli/verbs_stage.rs
-@@ -348,48 +348,51 @@
+@@ -348,48 +348,59 @@
      let text = std::str::from_utf8(raw).map_err(|_| GitError::Invalid {
          detail: "pathspec is not valid UTF-8".to_owned(),
      })?;
@@ -61,7 +61,14 @@ diff --git a/crates/ruk/src/cli/verbs_stage.rs b/crates/ruk/src/cli/verbs_stage.
 +    })?;
 +    let mut physical = std::path::PathBuf::new();
 +    for component in prefix.components().chain(operand.components()) {
-+        if physical.is_absolute() && !physical.starts_with(&base) {
++        if matches!(
++            component,
++            std::path::Component::CurDir
++                | std::path::Component::ParentDir
++                | std::path::Component::Normal(_)
++        ) && physical.is_absolute()
++            && !physical.starts_with(&base)
++        {
 +            let metadata = std::fs::metadata(&physical).map_err(|err| GitError::Io {
 +                detail: format!("reading pathspec prefix {}: {err}", physical.display()),
 +            })?;
@@ -87,7 +94,8 @@ diff --git a/crates/ruk/src/cli/verbs_stage.rs b/crates/ruk/src/cli/verbs_stage.
 +            }
 +            std::path::Component::Normal(part) => physical.push(part),
 +        }
-+        if physical.is_absolute()
++        if !matches!(component, std::path::Component::Prefix(_))
++            && physical.is_absolute()
 +            && !physical.starts_with(&base)
 +            && let Ok(resolved) = std::fs::canonicalize(&physical)
 +        {
@@ -111,7 +119,7 @@ diff --git a/crates/ruk/src/cli/tests/lexical_paths.rs b/crates/ruk/src/cli/test
 new file mode 100644
 --- /dev/null
 +++ b/crates/ruk/src/cli/tests/lexical_paths.rs
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,209 @@
 +use super::{
 +    Ctx, index_stages, repo_ctx, run, seeded_repo, verbs_branch, verbs_history, verbs_stage,
 +};
@@ -123,15 +131,14 @@ new file mode 100644
 +    let mut ctx = repo_ctx(&root, env);
 +    std::fs::write(root.join("seed.txt"), b"staged change\n").expect("staged content");
 +    run(verbs_stage::add, &mut ctx, &["seed.txt"]).expect("stage change");
-+    let before = super::super::state::scan_index(
-+        ctx.store().expect("store"),
-+        ctx.kind().expect("kind"),
-+    )
-+    .expect("index before");
++    let before =
++        super::super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
++            .expect("index before");
 +    let outside = base.join("build.log");
 +    std::fs::write(&outside, b"outside file\n").expect("outside file");
 +    let reject = |ctx: &mut Ctx, prefix: &std::path::Path| {
 +        let operand = format!("{}/../repo/seed.txt", prefix.display());
++        #[cfg(unix)]
 +        assert!(std::fs::canonicalize(&operand).is_err());
 +        let error = run(
 +            verbs_branch::restore,
@@ -140,11 +147,9 @@ new file mode 100644
 +        )
 +        .expect_err("untraversable outside prefix must fail");
 +        assert!(error.to_string().contains("prefix"), "{error:?}");
-+        let after = super::super::state::scan_index(
-+            ctx.store().expect("store"),
-+            ctx.kind().expect("kind"),
-+        )
-+        .expect("index after");
++        let after =
++            super::super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
++                .expect("index after");
 +        assert_eq!(before, after);
 +        assert_eq!(index_stages(ctx, "seed.txt"), vec![0]);
 +        assert_eq!(
@@ -300,7 +305,9 @@ new file mode 100644
 +        .expect("relative staged restore through a junction");
 +        let (diff, _) = run_argv(
 +            env.clone(),
-+            &["ruk", "-C", root_text, "diff", "HEAD~1", "HEAD", "--", operand],
++            &[
++                "ruk", "-C", root_text, "diff", "HEAD~1", "HEAD", "--", operand,
++            ],
 +        )
 +        .expect("relative historical diff through a junction");
 +        let text = String::from_utf8(diff).expect("diff text");
