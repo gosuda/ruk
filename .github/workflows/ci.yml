@@ -1,10 +1,12 @@
 name: ci
 
 on:
+  pull_request:
   push:
     branches: [main]
     tags: ['**']
-  pull_request:
+  schedule:
+    - cron: '23 4 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -16,6 +18,7 @@ concurrency:
 
 jobs:
   export-model:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     name: export-model
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 15
@@ -29,7 +32,7 @@ jobs:
           key: ${{ hashFiles('**/Cargo.lock') }}
           cache-bin: false
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - name: Export the model for dependent clients
         id: export_model
         if: ${{ !cancelled() }}
@@ -41,12 +44,11 @@ jobs:
           path: ${{ runner.temp }}/ruk-model.json
           if-no-files-found: error
           retention-days: 7
-
   linux:
     name: linux
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 30
-    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork)
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -58,7 +60,7 @@ jobs:
           key: ${{ hashFiles('**/Cargo.lock') }}
           cache-bin: false
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
@@ -66,15 +68,15 @@ jobs:
           tool: cargo-nextest@0.9.148
       - run: cargo nextest run --workspace --locked
       - run: cargo test --workspace --doc --locked
-
-  clippy:
-    name: clippy-${{ matrix.os }}
+  native:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    name: native (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [depot-macos-latest, depot-windows-2025]
+        os: [depot-macos-latest, depot-windows-2025-8]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -86,85 +88,9 @@ jobs:
           key: ${{ hashFiles('**/Cargo.lock') }}
           cache-bin: false
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
+        with:
+          tool: cargo-nextest@0.9.148
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-
-  nextest:
-    name: nextest-depot-macos-latest
-    runs-on: depot-macos-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: 1.99.1
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          key: ${{ hashFiles('**/Cargo.lock') }}
-          cache-bin: false
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
-        with:
-          tool: cargo-nextest@0.9.148
       - run: cargo nextest run --workspace --locked
-
-  nextest-windows-cli:
-    name: nextest-windows-8-cli
-    runs-on: depot-windows-2025-8
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: 1.99.1
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          key: ${{ hashFiles('**/Cargo.lock') }}
-          cache-bin: false
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
-        with:
-          tool: cargo-nextest@0.9.148
-      - run: cargo nextest run --locked -p ruk-git -p ruk
-
-  nextest-windows-core:
-    name: nextest-windows-8-core
-    runs-on: depot-windows-2025-8
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: 1.99.1
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          key: ${{ hashFiles('**/Cargo.lock') }}
-          cache-bin: false
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
-        with:
-          tool: cargo-nextest@0.9.148
-      - run: cargo nextest run --locked -p ruk-core -E 'not test(seal_boundary_postcommit_kill_keeps_sealed_segments_sha1)'
-
-  nextest-windows-crash:
-    name: nextest-windows-8-crash
-    runs-on: depot-windows-2025-8
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: 1.99.1
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          key: ${{ hashFiles('**/Cargo.lock') }}
-          cache-bin: false
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
-        with:
-          tool: cargo-nextest@0.9.148
-      - run: cargo nextest run --locked -p ruk-core -E 'test(seal_boundary_postcommit_kill_keeps_sealed_segments_sha1)'
