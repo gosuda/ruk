@@ -339,7 +339,8 @@ fn normalize_staging_path(path: &std::path::Path) -> Result<std::path::PathBuf, 
 /// `diff`, staged restores): a worktree parent obstructed by a regular file
 /// must not fail the conversion of a stored path. Only the worktree-root
 /// boundary is resolved against the filesystem, so a symlinked `-C`
-/// directory keeps working; `..` above the root is outside the repository.
+/// directory keeps working. Normalize `..` before locating that boundary so
+/// a path may leave and re-enter the worktree without reading stored parents.
 /// The returned name is literal: no component is resolved or rejected.
 pub(crate) fn repo_path_lexical(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitError> {
     let text = std::str::from_utf8(raw).map_err(|_| GitError::Invalid {
@@ -350,10 +351,24 @@ pub(crate) fn repo_path_lexical(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitEr
     } else {
         ctx.env.cwd.join(text)
     };
+    let mut normalized = std::path::PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(GitError::Invalid {
+                        detail: format!("pathspec {text:?} is outside the repository"),
+                    });
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
     let base = std::fs::canonicalize(&ctx.file_base).map_err(|err| GitError::Io {
         detail: format!("resolving worktree {}: {err}", ctx.file_base.display()),
     })?;
-    let Some((_, suffix)) = split_at_worktree_root(&joined, &base) else {
+    let Some((_, suffix)) = split_at_worktree_root(&normalized, &base) else {
         return Err(GitError::Invalid {
             detail: format!("pathspec {text:?} is outside the repository"),
         });

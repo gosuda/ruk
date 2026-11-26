@@ -3174,6 +3174,7 @@ fn reset_paths_intent(ctx: &Ctx, paths: &[String], tree: Oid) -> Result<(), GitE
     let (workspace, raw) = load_or_default(store)?;
     let mut mutations = Vec::new();
     let mut needs_empty = false;
+    let mut selected = std::collections::BTreeSet::new();
     let mut planned: std::collections::BTreeSet<Vec<u8>> = scan_index(store, kind)?
         .into_iter()
         .filter(|(_, stage, _)| *stage == Stage::Zero)
@@ -3200,11 +3201,15 @@ fn reset_paths_intent(ctx: &Ctx, paths: &[String], tree: Oid) -> Result<(), GitE
             }
         };
         planned.insert(path.as_bytes().to_vec());
+        selected.insert(path.as_bytes().to_vec());
         mutations.extend(path_row_mutations(&path, &before, &after)?);
     }
     for path in &planned {
         for (offset, byte) in path.iter().enumerate() {
-            if *byte == b'/' && planned.contains(&path[..offset]) {
+            if *byte == b'/'
+                && planned.contains(&path[..offset])
+                && (selected.contains(path) || selected.contains(&path[..offset]))
+            {
                 return Err(GitError::Invalid {
                     detail: format!(
                         "reset would conflict with staged paths {:?} and {:?}",

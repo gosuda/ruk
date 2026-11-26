@@ -10280,12 +10280,15 @@ fn reset_intent_accepts_symlinked_parent_for_stored_path() {
     let outside = root.parent().expect("parent").join("outside-target");
     std::fs::create_dir_all(&outside).expect("outside");
     std::os::unix::fs::symlink(&outside, root.join("docs")).expect("symlink parent");
-    run(
-        verbs_branch::reset,
-        &mut ctx,
-        &["-N", "--", "docs/intro.md"],
-    )
-    .expect("intent under symlinked parent for stored path");
+    let reentry = root.join("../repo/docs/intro.md");
+    for path in [
+        "docs/intro.md",
+        "../repo/docs/intro.md",
+        reentry.to_str().expect("utf8"),
+    ] {
+        run(verbs_branch::reset, &mut ctx, &["-N", "--", path])
+            .expect("intent under symlinked parent for stored path");
+    }
     assert!(
         std::fs::symlink_metadata(root.join("docs"))
             .expect("meta")
@@ -10293,6 +10296,15 @@ fn reset_intent_accepts_symlinked_parent_for_stored_path() {
             .is_symlink()
     );
     assert!(run(verbs_branch::reset, &mut ctx, &["-N", "--", "docs/new.md"],).is_err());
+    assert!(
+        run(
+            verbs_branch::reset,
+            &mut ctx,
+            &["-N", "--", "../outside-target/intro.md"],
+        )
+        .is_err()
+    );
+    assert!(!outside.join("intro.md").exists());
     assert_eq!(index_stages(&mut ctx, "docs/intro.md"), vec![0]);
     assert!(
         run(verbs_history::diff, &mut ctx, &["--cached"])
@@ -10315,6 +10327,41 @@ fn reset_intent_accepts_a_path_that_reenters_the_worktree() {
     )
     .expect("reenter worktree");
     assert_eq!(index_stages(&mut ctx, "new.txt"), vec![0]);
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn reset_intent_preserves_unrelated_staged_path_collisions() {
+    let (root, env) = seeded_repo("reset-unrelated-collision", "seed.txt", b"seed\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::create_dir(root.join("docs")).expect("docs directory");
+    std::fs::write(root.join("docs/intro.md"), b"nested\n").expect("nested file");
+    run(verbs_stage::add, &mut ctx, &["docs/intro.md"]).expect("stage nested file");
+    run(verbs_history::commit, &mut ctx, &["-m", "nested file"]).expect("commit nested file");
+    run(verbs_stage::rm, &mut ctx, &["docs/intro.md"]).expect("remove nested file");
+    std::fs::remove_dir(root.join("docs")).expect("remove docs directory");
+    std::fs::write(root.join("docs"), b"parent\n").expect("parent file");
+    run(verbs_stage::add, &mut ctx, &["docs"]).expect("stage parent file");
+    run(verbs_history::commit, &mut ctx, &["-m", "parent file"]).expect("commit parent file");
+    run(verbs_branch::reset, &mut ctx, &["-N", "HEAD~1"]).expect("whole-tree reset");
+    assert_eq!(index_stages(&mut ctx, "docs"), vec![0]);
+    assert_eq!(index_stages(&mut ctx, "docs/intro.md"), vec![0]);
+    let before = super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+        .expect("index before");
+    std::fs::write(root.join("other.txt"), b"other\n").expect("unrelated file");
+    run(verbs_branch::reset, &mut ctx, &["-N", "--", "other.txt"]).expect("unrelated path reset");
+    assert_eq!(index_stages(&mut ctx, "other.txt"), vec![0]);
+    let after: Vec<_> =
+        super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+            .expect("index after")
+            .into_iter()
+            .filter(|(path, _, _)| path.as_bytes() != b"other.txt")
+            .collect();
+    assert_eq!(before, after);
+    assert_eq!(
+        std::fs::read(root.join("docs")).expect("parent intact"),
+        b"parent\n"
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
