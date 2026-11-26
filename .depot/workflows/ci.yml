@@ -1,65 +1,48 @@
 name: ci
 
 on:
+  pull_request:
+  merge_group:
   push:
     branches: [main]
     tags: ['**']
-  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
-  fmt:
-    name: fmt
+  linux:
+    name: linux
     runs-on: depot-ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 30
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        id: rust
         with:
           toolchain: 1.99.1
-          components: rustfmt
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-bin: false
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - run: cargo fmt --all -- --check
-
-  clippy:
-    name: clippy-ubuntu-latest
-    runs-on: depot-ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: 1.99.1
-          components: clippy
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-
-  nextest:
-    name: nextest-ubuntu-latest
-    runs-on: depot-ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: 1.99.1
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+      - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
+        id: nextest
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         with:
           tool: cargo-nextest@0.9.148
       - run: cargo nextest run --workspace --locked
-
-  test:
-    name: test-ubuntu-latest
-    runs-on: depot-ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: 1.99.1
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' && steps.nextest.outcome == 'success' }}
       - run: cargo test --workspace --doc --locked
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
