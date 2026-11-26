@@ -2927,13 +2927,27 @@ fn validate_combined_restore(
                 detail: format!("pathspec did not match: {positional:?}"),
             });
         }
-        validate_worktree_parent(ctx, path)?;
+        validate_worktree_destination(ctx, path)?;
     }
     Ok(())
 }
 
-fn validate_worktree_parent(ctx: &Ctx, path: &RepoPath) -> Result<(), GitError> {
+fn validate_worktree_destination(ctx: &Ctx, path: &RepoPath) -> Result<(), GitError> {
     let full = super::tree::join_base(&ctx.file_base, path.as_bytes())?;
+    match std::fs::metadata(&full) {
+        Ok(meta) if meta.is_dir() => {
+            return Err(GitError::Io {
+                detail: format!("writing {}: destination is a directory", full.display()),
+            });
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(GitError::Io {
+                detail: format!("resolving {}: {err}", full.display()),
+            });
+        }
+    }
     let mut dir = full.parent();
     while let Some(candidate) = dir {
         if candidate == ctx.file_base {

@@ -7565,7 +7565,8 @@ fn reset_intent_accepts_obstructed_parent() {
     std::fs::write(root.join("docs/intro.md"), b"one\n").expect("one");
     run(verbs_stage::add, &mut ctx, &["docs/intro.md"]).expect("add");
     run(verbs_history::commit, &mut ctx, &["-m", "docs"]).expect("commit");
-    std::fs::remove_file(root.join("docs/intro.md")).expect("remove");
+    run(verbs_stage::rm, &mut ctx, &["docs/intro.md"]).expect("remove from index");
+    assert!(index_stages(&mut ctx, "docs/intro.md").is_empty());
     std::fs::remove_dir(root.join("docs")).expect("rmdir");
     std::fs::write(root.join("docs"), b"BLOCK\n").expect("block");
     run(
@@ -7577,6 +7578,40 @@ fn reset_intent_accepts_obstructed_parent() {
     assert_eq!(
         std::fs::read(root.join("docs")).expect("block intact"),
         b"BLOCK\n"
+    );
+    assert_eq!(index_stages(&mut ctx, "docs/intro.md"), vec![0]);
+    assert!(
+        run(verbs_history::diff, &mut ctx, &["--cached"])
+            .expect("staged diff")
+            .is_empty()
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn combined_restore_directory_destination_leaves_index_unchanged() {
+    let (root, env) = seeded_repo("restore-directory", "f.txt", b"committed\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"staged\n").expect("staged content");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("stage content");
+    std::fs::remove_file(root.join("f.txt")).expect("remove file");
+    std::fs::create_dir(root.join("f.txt")).expect("directory destination");
+    std::fs::write(root.join("f.txt/keep"), b"keep\n").expect("directory content");
+    let before = super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+        .expect("index before");
+    let err = run(
+        verbs_branch::restore,
+        &mut ctx,
+        &["--staged", "--worktree", "--", "f.txt"],
+    )
+    .expect_err("directory blocks restore");
+    assert!(err.to_string().contains("directory"), "{err:?}");
+    let after = super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+        .expect("index after");
+    assert_eq!(before, after);
+    assert_eq!(
+        std::fs::read(root.join("f.txt/keep")).expect("kept"),
+        b"keep\n"
     );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
