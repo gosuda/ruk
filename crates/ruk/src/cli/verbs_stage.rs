@@ -339,8 +339,8 @@ fn normalize_staging_path(path: &std::path::Path) -> Result<std::path::PathBuf, 
 /// `diff`, staged restores): a worktree parent obstructed by a regular file
 /// must not fail the conversion of a stored path. Only the worktree-root
 /// boundary is resolved against the filesystem, so a symlinked `-C`
-/// directory keeps working. Normalize `..` before locating that boundary so
-/// a path may leave and re-enter the worktree without reading stored parents.
+/// directory keeps working. Outside the root, parent traversal follows the
+/// filesystem; inside it, stored path components remain lexical.
 /// The returned name is literal: no component is resolved or rejected.
 pub(crate) fn repo_path_lexical(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitError> {
     let text = std::str::from_utf8(raw).map_err(|_| GitError::Invalid {
@@ -351,44 +351,38 @@ pub(crate) fn repo_path_lexical(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitEr
     } else {
         ctx.env.cwd.join(text)
     };
-    let mut normalized = std::path::PathBuf::new();
-    for component in joined.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(GitError::Invalid {
-                        detail: format!("pathspec {text:?} is outside the repository"),
-                    });
-                }
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
     let base = std::fs::canonicalize(&ctx.file_base).map_err(|err| GitError::Io {
         detail: format!("resolving worktree {}: {err}", ctx.file_base.display()),
     })?;
-    let Some((_, suffix)) = split_at_worktree_root(&normalized, &base) else {
+    let mut prefix = std::path::PathBuf::new();
+    let mut inside = false;
+    let mut stack: Vec<std::ffi::OsString> = Vec::new();
+    for component in joined.components() {
+        if !inside {
+            prefix.push(component.as_os_str());
+            inside = std::fs::canonicalize(&prefix).is_ok_and(|resolved| resolved == base);
+            continue;
+        }
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if stack.pop().is_none() {
+                    prefix.clone_from(&base);
+                    if !prefix.pop() {
+                        return Err(GitError::Invalid {
+                            detail: format!("pathspec {text:?} is outside the repository"),
+                        });
+                    }
+                    inside = false;
+                }
+            }
+            other => stack.push(other.as_os_str().to_os_string()),
+        }
+    }
+    if !inside {
         return Err(GitError::Invalid {
             detail: format!("pathspec {text:?} is outside the repository"),
         });
-    };
-    let dot = std::ffi::OsStr::new(".");
-    let dotdot = std::ffi::OsStr::new("..");
-    let mut stack: Vec<std::ffi::OsString> = Vec::new();
-    for part in suffix {
-        if part.as_os_str() == dot {
-            continue;
-        }
-        if part.as_os_str() == dotdot {
-            if stack.pop().is_none() {
-                return Err(GitError::Invalid {
-                    detail: format!("pathspec {text:?} is outside the repository"),
-                });
-            }
-            continue;
-        }
-        stack.push(part);
     }
     let mut parts: Vec<u8> = Vec::new();
     for part in &stack {

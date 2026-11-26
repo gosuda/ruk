@@ -10268,50 +10268,53 @@ fn diff_no_index_help_probe_leaves_output_alone() {
 #[cfg(unix)]
 #[test]
 fn reset_intent_accepts_symlinked_parent_for_stored_path() {
-    let (root, env) = seeded_repo("reset-intent-symlink", "seed.txt", b"seed\n");
-    let mut ctx = repo_ctx(&root, env);
-    std::fs::create_dir(root.join("docs")).expect("docs dir");
-    std::fs::write(root.join("docs/intro.md"), b"one\n").expect("one");
-    run(verbs_stage::add, &mut ctx, &["docs/intro.md"]).expect("add");
-    run(verbs_history::commit, &mut ctx, &["-m", "docs"]).expect("commit");
-    run(verbs_stage::rm, &mut ctx, &["docs/intro.md"]).expect("remove from index");
-    assert!(index_stages(&mut ctx, "docs/intro.md").is_empty());
-    std::fs::remove_dir(root.join("docs")).expect("rmdir");
-    let outside = root.parent().expect("parent").join("outside-target");
-    std::fs::create_dir_all(&outside).expect("outside");
-    std::os::unix::fs::symlink(&outside, root.join("docs")).expect("symlink parent");
-    let reentry = root.join("../repo/docs/intro.md");
-    for path in [
-        "docs/intro.md",
-        "../repo/docs/intro.md",
-        reentry.to_str().expect("utf8"),
-    ] {
+    for form in ["direct", "relative", "absolute"] {
+        let (root, env) = seeded_repo("reset-intent-symlink", "seed.txt", b"seed\n");
+        let mut ctx = repo_ctx(&root, env);
+        std::fs::create_dir(root.join("docs")).expect("docs dir");
+        std::fs::write(root.join("docs/intro.md"), b"one\n").expect("one");
+        run(verbs_stage::add, &mut ctx, &["docs/intro.md"]).expect("add");
+        run(verbs_history::commit, &mut ctx, &["-m", "docs"]).expect("commit");
+        run(verbs_stage::rm, &mut ctx, &["docs/intro.md"]).expect("remove from index");
+        assert!(index_stages(&mut ctx, "docs/intro.md").is_empty());
+        std::fs::remove_dir(root.join("docs")).expect("rmdir");
+        let outside = root.parent().expect("parent").join("outside-target");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, root.join("docs")).expect("symlink parent");
+        let reentry = root.join("../repo/docs/intro.md");
+        let path = match form {
+            "direct" => "docs/intro.md",
+            "relative" => "../repo/docs/intro.md",
+            "absolute" => reentry.to_str().expect("utf8"),
+            _ => unreachable!(),
+        };
         run(verbs_branch::reset, &mut ctx, &["-N", "--", path])
             .expect("intent under symlinked parent for stored path");
+        assert_eq!(index_stages(&mut ctx, "docs/intro.md"), vec![0], "{form}");
+        assert!(
+            std::fs::symlink_metadata(root.join("docs"))
+                .expect("meta")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(run(verbs_branch::reset, &mut ctx, &["-N", "--", "docs/new.md"],).is_err());
+        assert!(
+            run(
+                verbs_branch::reset,
+                &mut ctx,
+                &["-N", "--", "../outside-target/intro.md"],
+            )
+            .is_err()
+        );
+        assert!(!outside.join("intro.md").exists());
+        assert_eq!(index_stages(&mut ctx, "docs/intro.md"), vec![0]);
+        assert!(
+            run(verbs_history::diff, &mut ctx, &["--cached"])
+                .expect("staged diff")
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
     }
-    assert!(
-        std::fs::symlink_metadata(root.join("docs"))
-            .expect("meta")
-            .file_type()
-            .is_symlink()
-    );
-    assert!(run(verbs_branch::reset, &mut ctx, &["-N", "--", "docs/new.md"],).is_err());
-    assert!(
-        run(
-            verbs_branch::reset,
-            &mut ctx,
-            &["-N", "--", "../outside-target/intro.md"],
-        )
-        .is_err()
-    );
-    assert!(!outside.join("intro.md").exists());
-    assert_eq!(index_stages(&mut ctx, "docs/intro.md"), vec![0]);
-    assert!(
-        run(verbs_history::diff, &mut ctx, &["--cached"])
-            .expect("staged diff")
-            .is_empty()
-    );
-    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
 #[test]
@@ -10328,6 +10331,46 @@ fn reset_intent_accepts_a_path_that_reenters_the_worktree() {
     .expect("reenter worktree");
     assert_eq!(index_stages(&mut ctx, "new.txt"), vec![0]);
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[cfg(unix)]
+#[test]
+fn stored_paths_resolve_external_symlinks_before_parent_traversal() {
+    let (root, env) = seeded_repo("stored-external-link", "seed.txt", b"first\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("seed.txt"), b"second\n").expect("second revision");
+    run(verbs_stage::add, &mut ctx, &["seed.txt"]).expect("stage revision");
+    run(verbs_history::commit, &mut ctx, &["-m", "second"]).expect("commit revision");
+    let base = root.parent().expect("parent");
+    std::fs::create_dir(base.join("build")).expect("build directory");
+    std::fs::create_dir(base.join("links")).expect("links directory");
+    std::os::unix::fs::symlink(base.join("build"), base.join("links/jump"))
+        .expect("external directory link");
+    let through_link = base.join("links/jump/../repo/seed.txt");
+    let path = through_link.to_str().expect("utf8");
+    let out = run(
+        verbs_history::diff,
+        &mut ctx,
+        &["HEAD~1", "HEAD", "--", path],
+    )
+    .expect("historical diff through external link");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(text.contains("+second"), "{text:?}");
+    run(verbs_stage::rm, &mut ctx, &["--cached", "seed.txt"]).expect("remove index row");
+    assert!(index_stages(&mut ctx, "seed.txt").is_empty());
+    run(verbs_branch::restore, &mut ctx, &["--staged", "--", path])
+        .expect("staged restore through external link");
+    assert_eq!(index_stages(&mut ctx, "seed.txt"), vec![0]);
+    assert!(
+        run(verbs_history::diff, &mut ctx, &["--cached"])
+            .expect("staged diff")
+            .is_empty()
+    );
+    assert_eq!(
+        std::fs::read(root.join("seed.txt")).expect("worktree"),
+        b"second\n"
+    );
+    let _ = std::fs::remove_dir_all(base);
 }
 
 #[test]
