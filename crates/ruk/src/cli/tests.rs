@@ -10349,3 +10349,19 @@ fn reset_intent_rejects_a_staged_symlink_parent_without_changing_index() {
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
+#[test]
+fn diff_no_index_probe_rejects_before_reading_operands() {
+    let (root, env) = seeded_repo("diff-probe-input", "seed.txt", b"seed\n");
+    let mut ctx = repo_ctx(&root, env);
+    ctx.store = None;
+    ctx.kind = None;
+    let err = run(
+        verbs_history::diff,
+        &mut ctx,
+        &["--no-index", "--output", "--help", "missing-a", "missing-b"],
+    )
+    .expect_err("probe has no repository");
+    assert!(matches!(err, ruk_git::GitError::Invalid { .. }), "{err:?}");
+    assert!(!root.join("--help").exists());
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}

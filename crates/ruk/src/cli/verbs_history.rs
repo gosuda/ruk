@@ -7383,6 +7383,7 @@ pub(crate) fn diff(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         },
     );
     if opts.is_set("no-index") {
+        ctx.store()?;
         if opts.is_set("cached") || opts.is_set("staged") {
             return Err(GitError::Invalid {
                 detail: "--cached/--staged combine with revisions, not with --no-index".to_owned(),
