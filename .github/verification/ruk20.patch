@@ -1,0 +1,521 @@
+diff --git a/crates/ruk/src/cli/verbs_stage.rs b/crates/ruk/src/cli/verbs_stage.rs
+--- a/crates/ruk/src/cli/verbs_stage.rs
++++ b/crates/ruk/src/cli/verbs_stage.rs
+@@ -366,46 +366,50 @@
+         detail: format!("resolving worktree {}: {err}", ctx.file_base.display()),
+     })?;
+     let mut physical = std::path::PathBuf::new();
+-    for component in prefix.components().chain(operand.components()) {
+-        if matches!(
+-            component,
+-            std::path::Component::CurDir
+-                | std::path::Component::ParentDir
+-                | std::path::Component::Normal(_)
+-        ) && physical.is_absolute()
+-            && !physical.starts_with(&base)
+-        {
+-            let metadata = std::fs::metadata(&physical).map_err(|err| GitError::Io {
+-                detail: format!("reading pathspec prefix {}: {err}", physical.display()),
+-            })?;
+-            if !metadata.is_dir() {
+-                return Err(GitError::Invalid {
+-                    detail: format!(
+-                        "pathspec {text:?} crosses a non-directory prefix {}",
+-                        physical.display()
+-                    ),
+-                });
+-            }
+-        }
+-        match component {
+-            std::path::Component::Prefix(prefix) => physical.push(prefix.as_os_str()),
+-            std::path::Component::RootDir => {
+-                physical.push(std::path::Component::RootDir.as_os_str())
+-            }
+-            std::path::Component::CurDir => {}
+-            std::path::Component::ParentDir => {
+-                if !physical.pop() && !physical.has_root() {
+-                    return Err(outside(text));
+-                }
+-            }
+-            std::path::Component::Normal(part) => physical.push(part),
+-        }
+-        if !matches!(component, std::path::Component::Prefix(_))
+-            && physical.is_absolute()
+-            && !physical.starts_with(&base)
+-            && let Ok(resolved) = std::fs::canonicalize(&physical)
+-        {
+-            physical = resolved;
++    let mut root = std::path::PathBuf::new();
++    for component in prefix.components().chain(operand.components()) {
++        if matches!(
++            component,
++            std::path::Component::CurDir
++                | std::path::Component::ParentDir
++                | std::path::Component::Normal(_)
++        ) && physical.is_absolute()
++            && !physical.starts_with(&base)
++        {
++            let metadata = std::fs::metadata(&physical).map_err(|err| GitError::Io {
++                detail: format!("reading pathspec prefix {}: {err}", physical.display()),
++            })?;
++            if !metadata.is_dir() {
++                return Err(GitError::Invalid {
++                    detail: format!(
++                        "pathspec {text:?} crosses a non-directory prefix {}",
++                        physical.display()
++                    ),
++                });
++            }
++        }
++        match component {
++            std::path::Component::Prefix(prefix) => physical.push(prefix.as_os_str()),
++            std::path::Component::RootDir => {
++                physical.push(std::path::Component::RootDir.as_os_str())
++            }
++            std::path::Component::CurDir => {}
++            std::path::Component::ParentDir => {
++                if physical != root && !physical.pop() && !physical.has_root() {
++                    return Err(outside(text));
++                }
++            }
++            std::path::Component::Normal(part) => physical.push(part),
++        }
++        if !matches!(component, std::path::Component::Prefix(_))
++            && physical.is_absolute()
++            && !physical.starts_with(&base)
++            && let Ok(resolved) = std::fs::canonicalize(&physical)
++        {
++            physical = resolved;
++        }
++        if matches!(component, std::path::Component::RootDir) {
++            root = physical.clone();
+         }
+     }
+     let relative = physical.strip_prefix(&base).map_err(|_| outside(text))?;
+diff --git a/crates/ruk/src/cli/mod.rs b/crates/ruk/src/cli/mod.rs
+--- a/crates/ruk/src/cli/mod.rs
++++ b/crates/ruk/src/cli/mod.rs
+@@ -346,101 +346,120 @@
+     let rest = argv.first().map_or(&[][..], |_| &argv[1.min(argv.len())..]);
+     let (globals, verb, verb_args) = split_globals(rest)?;
+     let mut env = env;
+-    let mut cli_config: Vec<(String, String)> = Vec::new();
+-    let mut git_dir: Option<PathBuf> = None;
+-    let mut work_tree: Option<PathBuf> = None;
+-    let mut bare = false;
+-    for global in globals {
+-        match global {
+-            Global::ChangeDir(dir) => {
+-                let dir = env.cwd.join(dir);
+-                if !dir.is_dir() {
+-                    return Err(GitError::Io {
+-                        detail: format!("cannot change to {}", dir.display()),
+-                    });
+-                }
+-                env.cwd = std::fs::canonicalize(&dir).map_err(|err| GitError::Io {
+-                    detail: format!("cannot change to {}: {err}", dir.display()),
+-                })?;
+-            }
+-            Global::Define(key, value) => cli_config.push((key, value)),
+-            Global::GitDir(dir) => git_dir = Some(dir),
+-            Global::WorkTree(dir) => work_tree = Some(dir),
+-            Global::Bare => bare = true,
+-        }
+-    }
+-    if let Some(value) = env.get("GIT_DIR").map(str::to_owned)
+-        && git_dir.is_none()
+-    {
+-        git_dir = Some(PathBuf::from(value));
+-    }
+-    env.cwd = std::path::absolute(&env.cwd).map_err(|err| GitError::Io {
+-        detail: format!("cannot resolve working directory: {err}"),
+-    })?;
+-    git_dir = git_dir.map(|dir| env.cwd.join(dir));
+-    work_tree = work_tree.map(|dir| env.cwd.join(dir));
+-    let Some(verb) = verb else {
+-        return Err(GitError::Invalid {
+-            detail: "no command given; see 'ruk help'".to_owned(),
+-        });
+-    };
+-    if verb == "--help" || verb == "-h" {
+-        return Ok((dispatch::help_text(None), Vec::new()));
+-    }
+-    if verb == "--version" || verb == "-v" {
+-        return Ok((dispatch::version_text(), Vec::new()));
+-    }
+-    // Hidden sidecar verb: `ruk coordinator <repo>` serves one repository's
+-    // commit lane. It stays out of the advertised table (and its count) the
+-    // way git keeps its dashed server commands off `git help`.
+-    if verb == "coordinator" {
+-        let mut ctx = open_ctx(env, git_dir, work_tree, bare, cli_config, false, egress)?;
+-        let stdout = coordinator::serve(&mut ctx, &verb_args)?;
+-        return Ok((stdout, std::mem::take(&mut ctx.stderr)));
+-    }
+-    let entry = dispatch::lookup(&verb).ok_or_else(|| GitError::Unsupported {
+-        command: verb.clone(),
+-    })?;
+-    let help = || (dispatch::help_text(Some(entry)), Vec::new());
+-    if verb_args.first().is_some_and(|arg| arg == "--help") {
+-        return Ok(help());
+-    }
+-    if entry.needs_repo && verb_args.iter().any(|arg| arg == "--help") {
+-        let mut probe = Ctx {
+-            store: None,
+-            root: env.cwd.clone(),
+-            file_base: work_tree.clone().unwrap_or_else(|| env.cwd.clone()),
+-            kind: None,
+-            env: env.clone(),
+-            bare,
+-            cli_config: cli_config.clone(),
+-            stderr: Vec::new(),
+-            egress: egress.clone(),
+-        };
+-        if matches!(
+-            (entry.run)(&mut probe, &verb_args),
+-            Err(GitError::HelpRequested)
+-        ) {
+-            return Ok(help());
+-        }
+-    }
+-    let hash_only = if entry.name == "hash-object" {
+-        match verbs_objects::hash_object_writes(&verb_args) {
+-            Ok(write) => !write,
+-            Err(GitError::HelpRequested) => return Ok(help()),
+-            Err(err) => return Err(err),
+-        }
+-    } else {
+-        false
+-    };
+-    let mut ctx = if hash_only {
+-        open_hash_ctx(env, git_dir, work_tree, bare, cli_config, egress)?
+-    } else {
+-        let needs_repo = entry.needs_repo || entry.name == "hash-object";
+-        open_ctx(
+-            env, git_dir, work_tree, bare, cli_config, needs_repo, egress,
+-        )?
+-    };
++    let mut operand_cwd = env.cwd.clone();
++    let mut cli_config: Vec<(String, String)> = Vec::new();
++    let mut git_dir: Option<PathBuf> = None;
++    let mut work_tree: Option<PathBuf> = None;
++    let mut bare = false;
++    for global in globals {
++        match global {
++            Global::ChangeDir(dir) => {
++                let dir = operand_cwd.join(dir);
++                if !dir.is_dir() {
++                    return Err(GitError::Io {
++                        detail: format!("cannot change to {}", dir.display()),
++                    });
++                }
++                env.cwd = std::fs::canonicalize(&dir).map_err(|err| GitError::Io {
++                    detail: format!("cannot change to {}: {err}", dir.display()),
++                })?;
++                operand_cwd = if cfg!(windows) {
++                    std::path::absolute(&dir).map_err(|err| GitError::Io {
++                        detail: format!("cannot resolve working directory: {err}"),
++                    })?
++                } else {
++                    env.cwd.clone()
++                };
++            }
++            Global::Define(key, value) => cli_config.push((key, value)),
++            Global::GitDir(dir) => git_dir = Some(dir),
++            Global::WorkTree(dir) => work_tree = Some(dir),
++            Global::Bare => bare = true,
++        }
++    }
++    if let Some(value) = env.get("GIT_DIR").map(str::to_owned)
++        && git_dir.is_none()
++    {
++        git_dir = Some(PathBuf::from(value));
++    }
++    env.cwd = std::path::absolute(&env.cwd).map_err(|err| GitError::Io {
++        detail: format!("cannot resolve working directory: {err}"),
++    })?;
++    if cfg!(windows) {
++        operand_cwd = std::path::absolute(&operand_cwd).map_err(|err| GitError::Io {
++            detail: format!("cannot resolve operand directory: {err}"),
++        })?;
++    }
++    git_dir = git_dir.map(|dir| env.cwd.join(dir));
++    work_tree = work_tree.map(|dir| env.cwd.join(dir));
++    let Some(verb) = verb else {
++        return Err(GitError::Invalid {
++            detail: "no command given; see 'ruk help'".to_owned(),
++        });
++    };
++    if verb == "--help" || verb == "-h" {
++        return Ok((dispatch::help_text(None), Vec::new()));
++    }
++    if verb == "--version" || verb == "-v" {
++        return Ok((dispatch::version_text(), Vec::new()));
++    }
++    // Hidden sidecar verb: `ruk coordinator <repo>` serves one repository's
++    // commit lane. It stays out of the advertised table (and its count) the
++    // way git keeps its dashed server commands off `git help`.
++    if verb == "coordinator" {
++        let mut ctx = open_ctx(env, git_dir, work_tree, bare, cli_config, false, egress)?;
++        if cfg!(windows) {
++            ctx.env.cwd = operand_cwd;
++        }
++        let stdout = coordinator::serve(&mut ctx, &verb_args)?;
++        return Ok((stdout, std::mem::take(&mut ctx.stderr)));
++    }
++    let entry = dispatch::lookup(&verb).ok_or_else(|| GitError::Unsupported {
++        command: verb.clone(),
++    })?;
++    let help = || (dispatch::help_text(Some(entry)), Vec::new());
++    if verb_args.first().is_some_and(|arg| arg == "--help") {
++        return Ok(help());
++    }
++    if entry.needs_repo && verb_args.iter().any(|arg| arg == "--help") {
++        let mut probe = Ctx {
++            store: None,
++            root: env.cwd.clone(),
++            file_base: work_tree.clone().unwrap_or_else(|| env.cwd.clone()),
++            kind: None,
++            env: env.clone(),
++            bare,
++            cli_config: cli_config.clone(),
++            stderr: Vec::new(),
++            egress: egress.clone(),
++        };
++        if matches!(
++            (entry.run)(&mut probe, &verb_args),
++            Err(GitError::HelpRequested)
++        ) {
++            return Ok(help());
++        }
++    }
++    let hash_only = if entry.name == "hash-object" {
++        match verbs_objects::hash_object_writes(&verb_args) {
++            Ok(write) => !write,
++            Err(GitError::HelpRequested) => return Ok(help()),
++            Err(err) => return Err(err),
++        }
++    } else {
++        false
++    };
++    let mut ctx = if hash_only {
++        open_hash_ctx(env, git_dir, work_tree, bare, cli_config, egress)?
++    } else {
++        let needs_repo = entry.needs_repo || entry.name == "hash-object";
++        open_ctx(
++            env, git_dir, work_tree, bare, cli_config, needs_repo, egress,
++        )?
++    };
++    if cfg!(windows) {
++        ctx.env.cwd = operand_cwd;
++    }
+     match (entry.run)(&mut ctx, &verb_args) {
+         Ok(stdout) => Ok((stdout, std::mem::take(&mut ctx.stderr))),
+         Err(GitError::HelpRequested) => Ok(help()),
+diff --git a/crates/ruk/src/cli/tests/lexical_paths.rs b/crates/ruk/src/cli/tests/lexical_paths.rs
+--- a/crates/ruk/src/cli/tests/lexical_paths.rs
++++ b/crates/ruk/src/cli/tests/lexical_paths.rs
+@@ -171,75 +171,135 @@
+     #[test]
+     fn staged_restore_accepts_a_missing_file_at_drive_root() {
+         let base = temp_base("lexical-drive-root");
+-        let drive = SubstDrive::new(&base);
+-        let root = &drive.root;
+-        let root_text = root.to_str().expect("root text");
+-        run_argv(test_env(&base), &["ruk", "init", root_text]).expect("init drive-root worktree");
+-        let mut ctx = repo_ctx(root, test_env(root));
+-        std::fs::write(root.join("seed.txt"), b"seed\n").expect("seed file");
+-        run(verbs_stage::add, &mut ctx, &["seed.txt"]).expect("stage seed");
+-        run(verbs_history::commit, &mut ctx, &["-m", "seed"]).expect("commit seed");
+-        run(verbs_stage::rm, &mut ctx, &["seed.txt"]).expect("remove tracked file");
+-        assert!(!root.join("seed.txt").exists());
+-        assert!(index_stages(&mut ctx, "seed.txt").is_empty());
+-        let operand = format!("{root_text}seed.txt");
+-        run(
+-            verbs_branch::restore,
+-            &mut ctx,
+-            &["--staged", "--", operand.as_str()],
+-        )
+-        .expect("restore missing tracked path at drive root");
+-        assert_eq!(index_stages(&mut ctx, "seed.txt"), vec![0]);
+-        assert!(!root.join("seed.txt").exists());
+-        assert!(
+-            run(verbs_history::diff, &mut ctx, &["--cached"])
+-                .expect("restored index")
+-                .is_empty()
+-        );
+-        drop(ctx);
+-        let nested = drive.root.join("repo");
+-        let nested_text = nested.to_str().expect("nested root text");
+-        run_argv(test_env(&drive.root), &["ruk", "init", nested_text])
+-            .expect("init nested worktree on substituted drive");
+-        let mut ctx = repo_ctx(&nested, test_env(&nested));
+-        std::fs::write(nested.join("seed.txt"), b"first\n").expect("nested first content");
+-        run(verbs_stage::add, &mut ctx, &["seed.txt"]).expect("stage nested first");
+-        run(verbs_history::commit, &mut ctx, &["-m", "first"]).expect("commit nested first");
+-        std::fs::write(nested.join("seed.txt"), b"second\n").expect("nested second content");
+-        run(verbs_stage::add, &mut ctx, &["seed.txt"]).expect("stage nested second");
+-        run(verbs_history::commit, &mut ctx, &["-m", "second"]).expect("commit nested second");
+-        run(verbs_stage::rm, &mut ctx, &["seed.txt"]).expect("remove nested tracked file");
+-        let rooted = r"\repo\seed.txt";
+-        run(verbs_branch::restore, &mut ctx, &["--staged", "--", rooted])
+-            .expect("rooted restore retains the substituted cwd drive");
+-        assert_eq!(index_stages(&mut ctx, "seed.txt"), vec![0]);
+-        assert!(!nested.join("seed.txt").exists());
+-        assert!(
+-            run(verbs_history::diff, &mut ctx, &["--cached"])
+-                .expect("nested restored index")
+-                .is_empty()
+-        );
+-        run(verbs_branch::reset, &mut ctx, &["HEAD~1", "--", rooted])
+-            .expect("rooted reset retains the substituted cwd drive");
+-        let staged = run(verbs_history::diff, &mut ctx, &["--cached"]).expect("nested reset index");
+-        assert!(
+-            String::from_utf8(staged)
+-                .expect("staged text")
+-                .contains("+first")
+-        );
+-        let diff = run(
+-            verbs_history::diff,
+-            &mut ctx,
+-            &["HEAD~1", "HEAD", "--", rooted],
+-        )
+-        .expect("rooted historical diff retains the substituted cwd drive");
+-        assert!(
+-            String::from_utf8(diff)
+-                .expect("diff text")
+-                .contains("+second")
+-        );
+-        assert!(!nested.join("seed.txt").exists());
+-        drop(ctx);
++        let backing = base.join("repo");
++        std::fs::create_dir(&backing).expect("substituted root");
++        let drive = SubstDrive::new(&backing);
++        let root = &drive.root;
++        let root_text = root.to_str().expect("root text");
++        run_argv(test_env(&base), &["ruk", "init", root_text]).expect("init drive-root worktree");
++        let mut ctx = repo_ctx(root, test_env(root));
++        std::fs::write(root.join("seed.txt"), b"seed\n").expect("seed file");
++        run(verbs_stage::add, &mut ctx, &["seed.txt"]).expect("stage seed");
++        run(verbs_history::commit, &mut ctx, &["-m", "seed"]).expect("commit seed");
++        run(verbs_stage::rm, &mut ctx, &["seed.txt"]).expect("remove tracked file");
++        assert!(!root.join("seed.txt").exists());
++        assert!(index_stages(&mut ctx, "seed.txt").is_empty());
++        let operand = format!("{root_text}seed.txt");
++        run(
++            verbs_branch::restore,
++            &mut ctx,
++            &["--staged", "--", operand.as_str()],
++        )
++        .expect("restore missing tracked path at drive root");
++        assert_eq!(index_stages(&mut ctx, "seed.txt"), vec![0]);
++        assert!(!root.join("seed.txt").exists());
++        assert!(
++            run(verbs_history::diff, &mut ctx, &["--cached"])
++                .expect("restored index")
++                .is_empty()
++        );
++
++        let nested = drive.root.join("repo");
++        std::fs::create_dir(&nested).expect("nested path");
++        std::fs::write(root.join("seed.txt"), b"root baseline\n").expect("root baseline");
++        std::fs::write(nested.join("seed.txt"), b"nested baseline\n").expect("nested baseline");
++        run(verbs_stage::add, &mut ctx, &["seed.txt", "repo/seed.txt"]).expect("stage baselines");
++        run(verbs_history::commit, &mut ctx, &["-m", "distinct paths"]).expect("commit baselines");
++        std::fs::write(root.join("seed.txt"), b"root staged\n").expect("root staged content");
++        std::fs::write(nested.join("seed.txt"), b"nested staged\n").expect("nested staged content");
++        run(verbs_stage::add, &mut ctx, &["seed.txt", "repo/seed.txt"]).expect("stage both paths");
++        let root_before = run(verbs_history::diff, &mut ctx, &["--cached", "--", "seed.txt"])
++            .expect("root row before");
++        assert!(!root_before.is_empty());
++        assert!(!run(verbs_history::diff, &mut ctx, &["--cached", "--", "repo/seed.txt"])
++            .expect("nested row before")
++            .is_empty());
++        let clamped = r"\..\repo\seed.txt";
++        run(verbs_branch::restore, &mut ctx, &["--staged", "--", clamped])
++            .expect("restore clamps parents at the substituted drive root");
++        assert_eq!(
++            run(verbs_history::diff, &mut ctx, &["--cached", "--", "seed.txt"])
++                .expect("root row after"),
++            root_before,
++            "root staged row must remain unchanged",
++        );
++        assert!(run(verbs_history::diff, &mut ctx, &["--cached", "--", "repo/seed.txt"])
++            .expect("intended nested row restored")
++            .is_empty());
++        run(verbs_stage::add, &mut ctx, &["repo/seed.txt"]).expect("stage nested path again");
++        drop(ctx);
++        run_argv(
++            test_env(&base),
++            &["ruk", "-C", root_text, "restore", "--staged", "--", clamped],
++        )
++        .expect("CLI restore clamps parents at the substituted drive root");
++        let mut ctx = repo_ctx(root, test_env(root));
++        assert_eq!(
++            run(verbs_history::diff, &mut ctx, &["--cached", "--", "seed.txt"])
++                .expect("root row after CLI"),
++            root_before,
++            "CLI restore must preserve the other staged row",
++        );
++        assert!(run(verbs_history::diff, &mut ctx, &["--cached", "--", "repo/seed.txt"])
++            .expect("intended nested row restored through CLI")
++            .is_empty());
++        assert_eq!(std::fs::read(root.join("seed.txt")).expect("root file"), b"root staged\n");
++        assert_eq!(std::fs::read(nested.join("seed.txt")).expect("nested file"), b"nested staged\n");
++        drop(ctx);
++
++        let nested_text = nested.to_str().expect("nested root text");
++        run_argv(test_env(&drive.root), &["ruk", "init", nested_text])
++            .expect("init nested worktree on substituted drive");
++        let mut ctx = repo_ctx(&nested, test_env(&nested));
++        std::fs::write(nested.join("seed.txt"), b"first\n").expect("nested first content");
++        run(verbs_stage::add, &mut ctx, &["seed.txt"]).expect("stage nested first");
++        run(verbs_history::commit, &mut ctx, &["-m", "first"]).expect("commit nested first");
++        std::fs::write(nested.join("seed.txt"), b"second\n").expect("nested second content");
++        run(verbs_stage::add, &mut ctx, &["seed.txt"]).expect("stage nested second");
++        run(verbs_history::commit, &mut ctx, &["-m", "second"]).expect("commit nested second");
++        run(verbs_stage::rm, &mut ctx, &["seed.txt"]).expect("remove nested tracked file");
++        drop(ctx);
++        let rooted = r"\repo\seed.txt";
++        run_argv(
++            test_env(&base),
++            &["ruk", "-C", nested_text, "restore", "--staged", "--", rooted],
++        )
++        .expect("rooted restore retains the substituted drive through -C");
++        let mut ctx = repo_ctx(&nested, test_env(&nested));
++        assert_eq!(index_stages(&mut ctx, "seed.txt"), vec![0]);
++        assert!(!nested.join("seed.txt").exists());
++        assert!(
++            run(verbs_history::diff, &mut ctx, &["--cached"])
++                .expect("nested restored index")
++                .is_empty()
++        );
++        drop(ctx);
++        run_argv(
++            test_env(&base),
++            &["ruk", "-C", root_text, "-C", "repo", "reset", "HEAD~1", "--", rooted],
++        )
++        .expect("rooted reset retains the substituted drive through repeated -C");
++        let (staged, _) = run_argv(
++            test_env(&base),
++            &["ruk", "-C", nested_text, "diff", "--cached"],
++        )
++        .expect("nested reset index through CLI");
++        assert!(
++            String::from_utf8(staged)
++                .expect("staged text")
++                .contains("+first")
++        );
++        let (diff, _) = run_argv(
++            test_env(&base),
++            &["ruk", "-C", nested_text, "diff", "HEAD~1", "HEAD", "--", rooted],
++        )
++        .expect("rooted historical diff retains the substituted drive through -C");
++        assert!(
++            String::from_utf8(diff)
++                .expect("diff text")
++                .contains("+second")
++        );
++        assert!(!nested.join("seed.txt").exists());
+         drop(drive);
+         std::fs::remove_dir_all(base).expect("cleanup");
+     }

@@ -1,0 +1,11 @@
+{
+  "head": "79704448b042c4b39f2c10d73d9dac275c2f28b6",
+  "base": "bea93392f643e50085a38d0fe1370ecba7be0ee6",
+  "input_tree": "44cf673a6252e676d1b5cb0c0603779aea233cb0",
+  "patch_sha256": "8f6a24d24db7e745ba2f7903485bdaabaa370db8c4543d1fe03016b85a8f4721",
+  "files": {
+    "crates/ruk/src/cli/verbs_stage.rs": "9cf989927ba332d9772d758ca003343f2aa68c4c06c7f8214345cffbb3d1f2ab",
+    "crates/ruk/src/cli/mod.rs": "fd6361cb1f27b4c133f8fff521078a24fe423d389d18dcdf25796a04defacb08",
+    "crates/ruk/src/cli/tests/lexical_paths.rs": "af82151e4fc9dad511de3d063002f3827ddd680871ffde76113a89316c5f8888"
+  }
+}
