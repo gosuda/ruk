@@ -381,13 +381,13 @@ pub(crate) fn repo_path_lexical(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitEr
                 }
             }
             std::path::Component::Normal(part) => {
-                let inside =
-                    !physical.as_os_str().is_empty() && physical.starts_with(&base);
+                let inside = !physical.as_os_str().is_empty() && physical.starts_with(&base);
                 physical.push(part);
-                if !inside && physical.is_absolute() {
-                    if let Ok(resolved) = std::fs::canonicalize(&physical) {
-                        physical = resolved;
-                    }
+                if !inside
+                    && physical.is_absolute()
+                    && let Ok(resolved) = std::fs::canonicalize(&physical)
+                {
+                    physical = resolved;
                 }
             }
         }

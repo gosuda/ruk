@@ -10316,8 +10316,12 @@ fn reset_intent_accepts_symlinked_parent_for_stored_path() {
     // straight through the store before every operand, so a later operand
     // can no longer coast on an earlier one's work: a reentry that returns
     // success without restoring anything fails its own assertion.
-    run(verbs_branch::reset, &mut ctx, &["-N", "--", "docs/intro.md"])
-        .expect("prime entry through the direct spelling");
+    run(
+        verbs_branch::reset,
+        &mut ctx,
+        &["-N", "--", "docs/intro.md"],
+    )
+    .expect("prime entry through the direct spelling");
     for path in [
         "docs/intro.md",
         "../repo/docs/intro.md",
