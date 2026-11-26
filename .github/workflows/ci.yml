@@ -15,28 +15,66 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  fmt:
-    name: fmt
+  export-model:
+    name: export-model
     runs-on: depot-ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.1
-          components: rustfmt
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-bin: false
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Export the model for dependent clients
+        id: export_model
+        if: ${{ !cancelled() }}
+        run: cargo run --locked -p ruk -- model --format json > "$RUNNER_TEMP/ruk-model.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() && steps.export_model.outcome == 'success' }}
+        with:
+          name: ruk-model-${{ github.sha }}
+          path: ${{ runner.temp }}/ruk-model.json
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    name: linux
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 30
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork)
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-bin: false
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
+        with:
+          tool: cargo-nextest@0.9.148
+      - run: cargo nextest run --workspace --locked
+      - run: cargo test --workspace --doc --locked
 
   clippy:
     name: clippy-${{ matrix.os }}
-    runs-on: ${{ matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04' || matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [depot-macos-15, depot-windows-2025]
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.1
@@ -50,14 +88,14 @@ jobs:
 
   nextest:
     name: nextest-${{ matrix.os }}
-    runs-on: ${{ matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04' || matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [depot-macos-15, depot-windows-2025]
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.1
@@ -66,38 +104,7 @@ jobs:
           cache-bin: false
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+      - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
         with:
           tool: cargo-nextest@0.9.148
       - run: cargo nextest run --workspace --locked
-      - name: Export the model for dependent clients
-        id: export_model
-        if: ${{ !cancelled() && runner.os == 'Linux' }}
-        run: cargo run --locked -p ruk -- model --format json > "$RUNNER_TEMP/ruk-model.json"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: ${{ !cancelled() && steps.export_model.outcome == 'success' }}
-        with:
-          name: ruk-model-${{ github.sha }}
-          path: ${{ runner.temp }}/ruk-model.json
-          if-no-files-found: error
-          retention-days: 7
-
-  test:
-    name: test-${{ matrix.os }}
-    runs-on: ${{ matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04' || matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: 1.99.1
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          cache-bin: false
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --workspace --doc --locked
