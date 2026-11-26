@@ -120,3 +120,6 @@ allow_attributes = { level = "deny" }
 
 [profile.release]
 lto = "thin"
+
+[profile.dev]
+debug = "line-tables-only"
