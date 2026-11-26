@@ -333,6 +333,23 @@ fn normalize_staging_path(path: &std::path::Path) -> Result<std::path::PathBuf, 
     }
 }
 
+/// Applies one `..` step without climbing above the seeded drive root.
+///
+/// Returns whether traversal may continue. Staying at the canonicalized
+/// drive root mirrors the OS clamp (`..` at a drive root stays there): the
+/// walk canonicalizes a substituted root before applying `..`, so popping
+/// there would continue the climb on the backing path and let a rooted
+/// operand re-enter the repository naming a different file.
+pub(crate) fn step_parent_within_floor(
+    physical: &mut std::path::PathBuf,
+    floor: Option<&std::path::Path>,
+) -> bool {
+    if floor.is_some_and(|floor| physical == floor) {
+        return true;
+    }
+    physical.pop() || physical.has_root()
+}
+
 /// Converts a CLI operand to a repository path without reading the worktree.
 ///
 /// Pure lexical conversion for index- and tree-only callers (two-revision
@@ -344,6 +361,8 @@ fn normalize_staging_path(path: &std::path::Path) -> Result<std::path::PathBuf, 
 /// re-enter the worktree without reading stored parents. Once the prefix
 /// reaches the root the remainder stays literal: no component is resolved
 /// or rejected.
+/// A `..` step never climbs above the canonicalized drive root the walk
+/// starts from, mirroring the OS clamp at a drive root.
 pub(crate) fn repo_path_lexical(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitError> {
     let text = std::str::from_utf8(raw).map_err(|_| GitError::Invalid {
         detail: "pathspec is not valid UTF-8".to_owned(),
@@ -366,6 +385,10 @@ pub(crate) fn repo_path_lexical(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitEr
         detail: format!("resolving worktree {}: {err}", ctx.file_base.display()),
     })?;
     let mut physical = std::path::PathBuf::new();
+    // The canonicalized drive root traversal starts from. A `..` step clamps
+    // there instead of popping: resolving a substituted root first would let
+    // the climb continue on the backing path.
+    let mut floor: Option<std::path::PathBuf> = None;
     for component in prefix.components().chain(operand.components()) {
         if matches!(
             component,
@@ -390,11 +413,14 @@ pub(crate) fn repo_path_lexical(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitEr
         match component {
             std::path::Component::Prefix(prefix) => physical.push(prefix.as_os_str()),
             std::path::Component::RootDir => {
-                physical.push(std::path::Component::RootDir.as_os_str())
+                physical.push(std::path::Component::RootDir.as_os_str());
+                // Remember the drive context `..` must not escape, resolving
+                // the seeded root (a substituted drive) once up front.
+                floor = std::fs::canonicalize(&physical).ok();
             }
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                if !physical.pop() && !physical.has_root() {
+                if !step_parent_within_floor(&mut physical, floor.as_deref()) {
                     return Err(outside(text));
                 }
             }

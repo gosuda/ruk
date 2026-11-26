@@ -113,6 +113,106 @@ fn stored_paths_clamp_parent_steps_at_the_filesystem_root() {
     std::fs::remove_dir_all(base).expect("cleanup");
 }
 
+#[test]
+fn parent_steps_clamp_at_the_seeded_drive_root() {
+    // Pins the extracted `..` decision behind the drive-root floor: staying
+    // at the canonicalized drive root is the same step the walk takes on
+    // every platform, with synthetic paths standing in for spellings (a
+    // substituted drive and its backing path) Linux cannot parse.
+    let floor = std::path::Path::new("/srv/share");
+    let mut physical = std::path::PathBuf::from("/srv/share");
+    assert!(verbs_stage::step_parent_within_floor(
+        &mut physical,
+        Some(floor)
+    ));
+    assert_eq!(physical, floor);
+    let mut above = std::path::PathBuf::from("/srv/share/sub");
+    assert!(verbs_stage::step_parent_within_floor(
+        &mut above,
+        Some(floor)
+    ));
+    assert_eq!(above, floor);
+    let mut at_root = std::path::PathBuf::from("/");
+    assert!(verbs_stage::step_parent_within_floor(
+        &mut at_root,
+        Some(std::path::Path::new("/"))
+    ));
+    assert_eq!(at_root, std::path::Path::new("/"));
+    let mut relative = std::path::PathBuf::new();
+    assert!(!verbs_stage::step_parent_within_floor(&mut relative, None));
+}
+
+#[cfg(unix)]
+#[test]
+fn absolute_operands_clamp_parent_steps_at_the_filesystem_root() {
+    // Absolute spelling of the filesystem-root clamp: excess `..` above `/`
+    // stays at `/`, then the walk re-descends into the repository. Pins the
+    // seeded-root floor on the platform where the floor is `/` itself.
+    let (root, env) = seeded_repo("lexical-absolute-root", "seed.txt", b"first\n");
+    let base = root.parent().expect("parent");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("seed.txt"), b"second\n").expect("second content");
+    run(verbs_stage::add, &mut ctx, &["seed.txt"]).expect("stage second");
+    run(verbs_history::commit, &mut ctx, &["-m", "second"]).expect("commit second");
+    run(verbs_stage::rm, &mut ctx, &["seed.txt"]).expect("remove tracked file");
+    let canonical = std::fs::canonicalize(&root).expect("canonical worktree");
+    let tail: Vec<_> = canonical
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .collect();
+    let mut operand = std::path::PathBuf::from("/");
+    for _ in 0..tail.len() + 2 {
+        operand.push("..");
+    }
+    for part in tail {
+        operand.push(part);
+    }
+    operand.push("seed.txt");
+    let operand = operand.to_str().expect("operand text").to_owned();
+    run(
+        verbs_branch::restore,
+        &mut ctx,
+        &["--staged", "--", operand.as_str()],
+    )
+    .expect("absolute staged restore clamps parent steps at the filesystem root");
+    assert_eq!(index_stages(&mut ctx, "seed.txt"), vec![0]);
+    assert!(!root.join("seed.txt").exists());
+    drop(ctx);
+    std::fs::remove_dir_all(base).expect("cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn absolute_climb_above_the_filesystem_root_cannot_escape_the_repo() {
+    // Contrast: climbing above `/` and re-descending outside the repository
+    // fails instead of resolving elsewhere, leaving staged state untouched.
+    let (root, env) = seeded_repo("lexical-absolute-escape", "seed.txt", b"first\n");
+    let base = root.parent().expect("parent");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("seed.txt"), b"second\n").expect("second content");
+    run(verbs_stage::add, &mut ctx, &["seed.txt"]).expect("stage second");
+    let before =
+        super::super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+            .expect("index before");
+    let error = run(
+        verbs_branch::restore,
+        &mut ctx,
+        &["--staged", "--", "/../lexical-no-such-entry.txt"],
+    )
+    .expect_err("climb above the root to a missing path must fail");
+    assert!(error.to_string().contains("outside"), "{error:?}");
+    let after =
+        super::super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+            .expect("index after");
+    assert_eq!(before, after);
+    assert_eq!(index_stages(&mut ctx, "seed.txt"), vec![0]);
+    drop(ctx);
+    std::fs::remove_dir_all(base).expect("cleanup");
+}
+
 #[cfg(windows)]
 mod windows {
     use std::path::{Path, PathBuf};
@@ -305,6 +405,65 @@ mod windows {
         drop(ctx);
         std::fs::remove_dir(&jump).expect("remove owned junction");
         assert!(target.is_dir());
+        std::fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn rooted_climb_above_the_subst_root_cannot_reenter_the_repo() {
+        // Thread PRRT_kwDOVOGZ-868XrPT: a rooted `\..\` operand climbs above
+        // the substituted drive root through the backing path and re-descends
+        // into the repository, so staged restore would overwrite a different
+        // file's staged changes. The OS clamps `..` at the drive root, so
+        // both spellings must fail and leave staged rows untouched.
+        let base = temp_base("lexical-subst-climb");
+        let drive = SubstDrive::new(&base);
+        let root = drive.root.join("repo");
+        std::fs::create_dir(&root).expect("nested repo dir");
+        std::fs::create_dir(base.join("sub")).expect("backing sub dir");
+        let root_text = root.to_str().expect("root text");
+        run_argv(test_env(&base), &["ruk", "init", root_text]).expect("init nested worktree");
+        let mut ctx = repo_ctx(&root, test_env(&root));
+        for name in ["seed.txt", "other.txt"] {
+            std::fs::write(root.join(name), b"first\n").expect("first content");
+            run(verbs_stage::add, &mut ctx, &[name]).expect("stage first");
+        }
+        run(verbs_history::commit, &mut ctx, &["-m", "first"]).expect("commit first");
+        for name in ["seed.txt", "other.txt"] {
+            std::fs::write(root.join(name), b"second\n").expect("second content");
+            run(verbs_stage::add, &mut ctx, &[name]).expect("stage second");
+        }
+        let basename = base
+            .file_name()
+            .expect("base name")
+            .to_str()
+            .expect("base text");
+        // Climbs from S:\repo above the substituted root through the backing
+        // path, then re-descends through the backing spelling of this very
+        // repository naming a different file than the caller holds.
+        let direct = format!(r"\..\{basename}\repo\other.txt");
+        // Variant: the alias resolves below the root first, then the climb
+        // continues from the backing spelling of the drive root.
+        let via_sub = format!(r"\sub\..\..\{basename}\repo\other.txt");
+        for rooted in [direct.as_str(), via_sub.as_str()] {
+            let error = run(verbs_branch::restore, &mut ctx, &["--staged", "--", rooted])
+                .expect_err("climb above the substituted root must fail");
+            assert!(error.to_string().contains("outside"), "{error:?}");
+        }
+        assert_eq!(index_stages(&mut ctx, "seed.txt"), vec![0]);
+        assert_eq!(index_stages(&mut ctx, "other.txt"), vec![0]);
+        assert_eq!(
+            std::fs::read(root.join("other.txt")).expect("other intact"),
+            b"second\n"
+        );
+        let staged = run(verbs_history::diff, &mut ctx, &["--cached"]).expect("staged diff");
+        assert!(
+            String::from_utf8(staged)
+                .expect("staged text")
+                .contains("+second"),
+            "staged rows for both files must survive the rejected operands"
+        );
+        drop(ctx);
+        drop(drive);
         std::fs::remove_dir_all(base).expect("cleanup");
     }
 }
