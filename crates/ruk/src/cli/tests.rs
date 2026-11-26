@@ -7605,7 +7605,10 @@ fn combined_restore_directory_destination_leaves_index_unchanged() {
         &["--staged", "--worktree", "--", "f.txt"],
     )
     .expect_err("directory blocks restore");
-    assert!(err.to_string().contains("destination is a directory"), "{err:?}");
+    assert!(
+        err.to_string().contains("destination is a directory"),
+        "{err:?}"
+    );
     let after = super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
         .expect("index after");
     assert_eq!(before, after);
@@ -7636,7 +7639,10 @@ fn combined_restore_symlink_to_directory_leaves_index_unchanged() {
         &["--staged", "--worktree", "--", "f.txt"],
     )
     .expect_err("directory symlink blocks restore");
-    assert!(err.to_string().contains("destination is a directory"), "{err:?}");
+    assert!(
+        err.to_string().contains("destination is a directory"),
+        "{err:?}"
+    );
     let after = super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
         .expect("index after");
     assert_eq!(before, after);
