@@ -38,6 +38,8 @@ use super::verbs_transport;
 use super::verbs_worktree;
 use super::{CliEnv, Ctx, collect};
 
+mod lexical_paths;
+
 /// `(request head, body)` smart-http request log.
 type HttpRequests = Vec<(String, Vec<u8>)>;
 /// `(request paths, PUT body)` LFS upload observation.

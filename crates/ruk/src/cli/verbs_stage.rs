@@ -348,10 +348,11 @@ pub(crate) fn repo_path_lexical(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitEr
     let text = std::str::from_utf8(raw).map_err(|_| GitError::Invalid {
         detail: "pathspec is not valid UTF-8".to_owned(),
     })?;
-    let joined = if std::path::Path::new(text).is_absolute() {
-        std::path::PathBuf::from(text)
+    let operand = std::path::Path::new(text);
+    let prefix = if operand.is_absolute() {
+        std::path::Path::new("")
     } else {
-        ctx.env.cwd.join(text)
+        ctx.env.cwd.as_path()
     };
     let outside = |text: &str| GitError::Invalid {
         detail: format!("pathspec {text:?} is outside the repository"),
@@ -359,16 +360,28 @@ pub(crate) fn repo_path_lexical(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitEr
     let base = std::fs::canonicalize(&ctx.file_base).map_err(|err| GitError::Io {
         detail: format!("resolving worktree {}: {err}", ctx.file_base.display()),
     })?;
-    // Walks the spelling one component at a time, canonicalizing the prefix
-    // best-effort while it is still outside the worktree root. Collapsing
-    // `..` against the resolved prefix (rather than the raw spelling) keeps
-    // traversal through a jump (`/links/jump` -> `/projects/build`) from
-    // skipping its target: `/links/jump/../repo/file` pops
-    // `/projects/build`, not `/links/jump`. Missing tails stay lexical, and
-    // once the prefix reaches the root the remainder stays literal, so an
-    // obstructed or symlinked worktree parent cannot fail the conversion.
     let mut physical = std::path::PathBuf::new();
-    for component in joined.components() {
+    for component in prefix.components().chain(operand.components()) {
+        if matches!(
+            component,
+            std::path::Component::CurDir
+                | std::path::Component::ParentDir
+                | std::path::Component::Normal(_)
+        ) && physical.is_absolute()
+            && !physical.starts_with(&base)
+        {
+            let metadata = std::fs::metadata(&physical).map_err(|err| GitError::Io {
+                detail: format!("reading pathspec prefix {}: {err}", physical.display()),
+            })?;
+            if !metadata.is_dir() {
+                return Err(GitError::Invalid {
+                    detail: format!(
+                        "pathspec {text:?} crosses a non-directory prefix {}",
+                        physical.display()
+                    ),
+                });
+            }
+        }
         match component {
             std::path::Component::Prefix(prefix) => physical.push(prefix.as_os_str()),
             std::path::Component::RootDir => {
@@ -380,16 +393,14 @@ pub(crate) fn repo_path_lexical(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitEr
                     return Err(outside(text));
                 }
             }
-            std::path::Component::Normal(part) => {
-                let inside = !physical.as_os_str().is_empty() && physical.starts_with(&base);
-                physical.push(part);
-                if !inside
-                    && physical.is_absolute()
-                    && let Ok(resolved) = std::fs::canonicalize(&physical)
-                {
-                    physical = resolved;
-                }
-            }
+            std::path::Component::Normal(part) => physical.push(part),
+        }
+        if !matches!(component, std::path::Component::Prefix(_))
+            && physical.is_absolute()
+            && !physical.starts_with(&base)
+            && let Ok(resolved) = std::fs::canonicalize(&physical)
+        {
+            physical = resolved;
         }
     }
     let relative = physical.strip_prefix(&base).map_err(|_| outside(text))?;
