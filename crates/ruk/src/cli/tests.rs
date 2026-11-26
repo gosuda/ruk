@@ -4395,6 +4395,37 @@ fn index_stages(ctx: &mut Ctx, file: &str) -> Vec<u8> {
         .collect()
 }
 
+/// Removes every stored stage row for one path, straight through the store.
+///
+/// No CLI pathspec conversion runs, so a test can return an entry to absent
+/// before proving that one spelling restores it.
+#[cfg(unix)]
+fn drop_index_path(ctx: &mut Ctx, file: &str) {
+    let store = ctx.store().expect("store");
+    let kind = ctx.kind().expect("kind");
+    let path = ruk_core::index::RepoPath::new(file.as_bytes().to_vec()).expect("repo path");
+    let before = super::state::read_path_rows(store, kind, &path).expect("read rows");
+    assert!(!before.is_empty(), "expected a staged row for {file}");
+    let (workspace, raw) = super::state::load_or_default(store).expect("workspace");
+    let mut mutations = super::state::path_row_mutations(&path, &before, &[]).expect("drop rows");
+    let next = workspace.mutate_index(workspace.stamp).expect("stamp");
+    mutations.push(super::state::workspace_mutation(raw.as_deref(), &next).expect("workspace"));
+    store
+        .publish(
+            Vec::new(),
+            &mutations,
+            ruk_core::store::EventSource::LocalPush,
+            &ruk_core::store::EventContext::default(),
+        )
+        .expect("publish");
+    assert!(
+        super::state::read_path_rows(store, kind, &path)
+            .expect("reread")
+            .is_empty(),
+        "entry for {file} survived the drop"
+    );
+}
+
 #[test]
 fn merge_three_way_clean_makes_two_parent_commit() {
     let (root, env) = seeded_repo("lane-clean", "f.txt", b"a\nb\nc\n");
@@ -10281,13 +10312,25 @@ fn reset_intent_accepts_symlinked_parent_for_stored_path() {
     std::fs::create_dir_all(&outside).expect("outside");
     std::os::unix::fs::symlink(&outside, root.join("docs")).expect("symlink parent");
     let reentry = root.join("../repo/docs/intro.md");
+    // Each spelling must restore the entry on its own. The row is dropped
+    // straight through the store before every operand, so a later operand
+    // can no longer coast on an earlier one's work: a reentry that returns
+    // success without restoring anything fails its own assertion.
+    run(verbs_branch::reset, &mut ctx, &["-N", "--", "docs/intro.md"])
+        .expect("prime entry through the direct spelling");
     for path in [
         "docs/intro.md",
         "../repo/docs/intro.md",
         reentry.to_str().expect("utf8"),
     ] {
+        drop_index_path(&mut ctx, "docs/intro.md");
         run(verbs_branch::reset, &mut ctx, &["-N", "--", path])
             .expect("intent under symlinked parent for stored path");
+        assert_eq!(
+            index_stages(&mut ctx, "docs/intro.md"),
+            vec![0],
+            "operand {path:?} did not restore the entry"
+        );
     }
     assert!(
         std::fs::symlink_metadata(root.join("docs"))
