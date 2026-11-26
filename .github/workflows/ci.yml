@@ -104,3 +104,5 @@ jobs:
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
       - run: cargo nextest run --workspace --locked
         if: ${{ !cancelled() && steps.rust.outcome == 'success' && steps.nextest.outcome == 'success' }}
+      - run: cargo test --workspace --locked --doc --no-fail-fast
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
