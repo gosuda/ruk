@@ -1,0 +1,78 @@
+name: Verify stored path and restore reviews
+on:
+  push:
+    branches: [ci/verify-ruk-review8-20261126]
+permissions:
+  contents: read
+concurrency:
+  group: verify-ruk-review8
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash
+jobs:
+  verify:
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pr: 19
+            candidate: 2b05f475e618e8eb88f679e52a2cf1198f66f4c4
+          - pr: 20
+            candidate: d1c3d8a3559070b31d045845c44870dacb382d50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ matrix.candidate }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        id: rust
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          cache-bin: false
+          save-if: 'false'
+      - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e
+        with:
+          tool: cargo-nextest@0.9.148
+      - name: Prove the external-link counterexample
+        if: matrix.pr == 20
+        run: |
+          mkdir -p "$RUNNER_TEMP/ruk-review"
+          trap 'git restore --source HEAD --worktree -- crates/ruk/src/cli/verbs_stage.rs' EXIT
+          git show 8eac73fc869df830df19b66205c3d3176ef82587:crates/ruk/src/cli/verbs_stage.rs > crates/ruk/src/cli/verbs_stage.rs
+          if cargo nextest run --workspace --locked -E 'test(stored_paths_resolve_external_symlinks_before_parent_traversal)' > "$RUNNER_TEMP/ruk-review/baseline.log" 2>&1; then
+            echo 'Original implementation unexpectedly passed' >&2
+            exit 1
+          fi
+          grep -q 'historical diff through external link' "$RUNNER_TEMP/ruk-review/baseline.log"
+      - name: Format
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: cargo fmt --all -- --check
+      - name: Lint
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ruk-review"
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings 2>&1 | tee "$RUNNER_TEMP/ruk-review/clippy.log"
+      - name: Full test suite
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: cargo nextest run --workspace --locked 2>&1 | tee "$RUNNER_TEMP/ruk-review/nextest.log"
+      - name: Documentation tests and source identity
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: |
+          cargo test --workspace --doc --locked 2>&1 | tee "$RUNNER_TEMP/ruk-review/doctests.log"
+          git diff --exit-code
+          git rev-parse HEAD > "$RUNNER_TEMP/ruk-review/source.txt"
+          sha256sum crates/ruk/src/cli/tests.rs crates/ruk/src/cli/verbs_stage.rs > "$RUNNER_TEMP/ruk-review/source.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: ruk-review8-pr-${{ matrix.pr }}
+          path: ${{ runner.temp }}/ruk-review
+          if-no-files-found: error
+          retention-days: 7
