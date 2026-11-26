@@ -26,9 +26,10 @@ jobs:
           toolchain: 1.99.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          key: ${{ hashFiles('**/Cargo.lock') }}
           cache-bin: false
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true # TEMP: warm the branch cache for measurement; reverted next
       - name: Export the model for dependent clients
         id: export_model
         if: ${{ !cancelled() }}
@@ -54,9 +55,10 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          key: ${{ hashFiles('**/Cargo.lock') }}
           cache-bin: false
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true # TEMP: warm the branch cache for measurement; reverted next
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
@@ -81,9 +83,10 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          key: ${{ hashFiles('**/Cargo.lock') }}
           cache-bin: false
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true # TEMP: warm the branch cache for measurement; reverted next
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   nextest:
@@ -97,22 +100,19 @@ jobs:
           toolchain: 1.99.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          key: ${{ hashFiles('**/Cargo.lock') }}
           cache-bin: false
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true # TEMP: warm the branch cache for measurement; reverted next
       - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
         with:
           tool: cargo-nextest@0.9.148
       - run: cargo nextest run --workspace --locked
 
-  nextest-windows:
-    name: nextest-depot-windows-2025-${{ matrix.shard }}
-    runs-on: depot-windows-2025
+  nextest-windows-cli:
+    name: nextest-windows-8-cli
+    runs-on: depot-windows-2025-8
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: ["1/3", "2/3", "3/3"]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -120,10 +120,51 @@ jobs:
           toolchain: 1.99.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          key: ${{ hashFiles('**/Cargo.lock') }}
           cache-bin: false
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true # TEMP: warm the branch cache for measurement; reverted next
       - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
         with:
           tool: cargo-nextest@0.9.148
-      - run: cargo nextest run --workspace --locked --partition hash:${{ matrix.shard }}
+      - run: cargo nextest run --locked -p ruk-git -p ruk
+
+  nextest-windows-core:
+    name: nextest-windows-8-core
+    runs-on: depot-windows-2025-8
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ hashFiles('**/Cargo.lock') }}
+          cache-bin: false
+          cache-on-failure: true
+          save-if: true # TEMP: warm the branch cache for measurement; reverted next
+      - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
+        with:
+          tool: cargo-nextest@0.9.148
+      - run: cargo nextest run --locked -p ruk-core -E 'not test(seal_boundary_postcommit_kill_keeps_sealed_segments_sha1)'
+
+  nextest-windows-crash:
+    name: nextest-windows-8-crash
+    runs-on: depot-windows-2025-8
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ hashFiles('**/Cargo.lock') }}
+          cache-bin: false
+          cache-on-failure: true
+          save-if: true # TEMP: warm the branch cache for measurement; reverted next
+      - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
+        with:
+          tool: cargo-nextest@0.9.148
+      - run: cargo nextest run --locked -p ruk-core -E 'test(seal_boundary_postcommit_kill_keeps_sealed_segments_sha1)'
