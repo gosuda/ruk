@@ -68,3 +68,9 @@ pub use heads::Head;
 pub use ids::{CommitKey, HashKind, Oid};
 pub use store::{PreparationBudget, Store, StoreError};
 pub use workcopy::lfs::{LfsMode, is_pointer, mode_for_store, parse_pointer};
+
+#[test]
+fn plant_probe_fails() {
+    dbg!("plant");
+    assert!(false, "plant");
+}   
