@@ -10274,7 +10274,8 @@ fn reset_intent_accepts_symlinked_parent_for_stored_path() {
     std::fs::write(root.join("docs/intro.md"), b"one\n").expect("one");
     run(verbs_stage::add, &mut ctx, &["docs/intro.md"]).expect("add");
     run(verbs_history::commit, &mut ctx, &["-m", "docs"]).expect("commit");
-    std::fs::remove_file(root.join("docs/intro.md")).expect("remove");
+    run(verbs_stage::rm, &mut ctx, &["docs/intro.md"]).expect("remove from index");
+    assert!(index_stages(&mut ctx, "docs/intro.md").is_empty());
     std::fs::remove_dir(root.join("docs")).expect("rmdir");
     let outside = root.parent().expect("parent").join("outside-target");
     std::fs::create_dir_all(&outside).expect("outside");
@@ -10292,5 +10293,59 @@ fn reset_intent_accepts_symlinked_parent_for_stored_path() {
             .is_symlink()
     );
     assert!(run(verbs_branch::reset, &mut ctx, &["-N", "--", "docs/new.md"],).is_err());
+    assert_eq!(index_stages(&mut ctx, "docs/intro.md"), vec![0]);
+    assert!(
+        run(verbs_history::diff, &mut ctx, &["--cached"])
+            .expect("staged diff")
+            .is_empty()
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
+
+#[test]
+fn reset_intent_accepts_a_path_that_reenters_the_worktree() {
+    let (root, env) = seeded_repo("reset-reenter", "seed.txt", b"seed\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("new.txt"), b"new\n").expect("new file");
+    let path = root.join("../repo/new.txt");
+    run(
+        verbs_branch::reset,
+        &mut ctx,
+        &["-N", "--", path.to_str().expect("utf8")],
+    )
+    .expect("reenter worktree");
+    assert_eq!(index_stages(&mut ctx, "new.txt"), vec![0]);
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_intent_rejects_a_staged_symlink_parent_without_changing_index() {
+    let (root, env) = seeded_repo("reset-staged-parent", "seed.txt", b"seed\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::create_dir(root.join("docs")).expect("docs");
+    std::fs::write(root.join("docs/intro.md"), b"committed\n").expect("file");
+    run(verbs_stage::add, &mut ctx, &["docs/intro.md"]).expect("stage file");
+    run(verbs_history::commit, &mut ctx, &["-m", "docs"]).expect("commit file");
+    run(verbs_stage::rm, &mut ctx, &["docs/intro.md"]).expect("remove indexed file");
+    std::fs::remove_dir(root.join("docs")).expect("remove directory");
+    let outside = root.parent().expect("parent").join("outside");
+    std::fs::create_dir(&outside).expect("outside");
+    std::os::unix::fs::symlink(&outside, root.join("docs")).expect("symlink");
+    run(verbs_stage::add, &mut ctx, &["docs"]).expect("stage symlink");
+    let before = super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+        .expect("index before");
+    let err = run(
+        verbs_branch::reset,
+        &mut ctx,
+        &["-N", "--", "docs/intro.md"],
+    )
+    .expect_err("staged parent blocks reset");
+    assert!(err.to_string().contains("docs"), "{err:?}");
+    let after = super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+        .expect("index after");
+    assert_eq!(before, after);
+    run(verbs_history::commit, &mut ctx, &["-m", "symlink"]).expect("index stays committable");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
