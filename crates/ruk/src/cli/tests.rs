@@ -7616,6 +7616,41 @@ fn combined_restore_directory_destination_leaves_index_unchanged() {
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
+#[cfg(unix)]
+#[test]
+fn combined_restore_symlink_to_directory_leaves_index_unchanged() {
+    let (root, env) = seeded_repo("restore-directory-link", "f.txt", b"committed\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"staged\n").expect("staged content");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("stage content");
+    std::fs::remove_file(root.join("f.txt")).expect("remove file");
+    let outside = root.parent().expect("parent").join("directory-target");
+    std::fs::create_dir(&outside).expect("target directory");
+    std::fs::write(outside.join("keep"), b"keep\n").expect("target content");
+    std::os::unix::fs::symlink(&outside, root.join("f.txt")).expect("directory symlink");
+    let before = super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+        .expect("index before");
+    let err = run(
+        verbs_branch::restore,
+        &mut ctx,
+        &["--staged", "--worktree", "--", "f.txt"],
+    )
+    .expect_err("directory symlink blocks restore");
+    assert!(err.to_string().contains("directory"), "{err:?}");
+    let after = super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+        .expect("index after");
+    assert_eq!(before, after);
+    assert_eq!(
+        std::fs::read_link(root.join("f.txt")).expect("link intact"),
+        outside
+    );
+    assert_eq!(
+        std::fs::read(outside.join("keep")).expect("target intact"),
+        b"keep\n"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
 // ---------------------------------------------------------------------------
 // Wave J (DiffFlags): diff/show flag parity -- each flag must alter bytes,
 // selected pairs, file output, or status, or fail loudly.
