@@ -1,0 +1,66 @@
+name: Verify stored-path traversal
+
+on:
+  push:
+    branches: [ci/verify-ruk20-paths-20261126]
+    paths:
+      - .github/workflows/verify-ruk20-paths.yml
+      - .github/verification/ruk20*
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [depot-ubuntu-24.04-8, depot-windows-2025-8]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '4'
+      CARGO_TERM_COLOR: never
+      RUSTC_WRAPPER: ''
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: 'false'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: probe
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 6e427cb35f1f03d8e4f0c3fe4d62f59d945e4c32
+          path: candidate
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: candidate -> target
+          cache-bin: false
+          save-if: false
+      - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e
+        with:
+          tool: cargo-nextest@0.9.148
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d
+        with:
+          enable-cache: false
+      - name: Run exact gates and original-walker controls
+        run: |
+          set -euo pipefail
+          uv run --no-project --python 3.13 probe/.github/verification/ruk20-gates.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: ${{ !cancelled() }}
+        with:
+          name: ruk20-path-proof-${{ runner.os }}-${{ github.sha }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7
