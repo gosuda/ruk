@@ -1,5 +1,6 @@
 use super::{
-    Ctx, index_stages, repo_ctx, run, seeded_repo, verbs_branch, verbs_history, verbs_stage,
+    Ctx, index_stages, repo_ctx, run, run_argv, seeded_repo, verbs_branch, verbs_history,
+    verbs_stage,
 };
 
 #[test]
@@ -51,6 +52,63 @@ fn staged_restore_rejects_untraversable_outside_prefixes() {
     }
     let staged = run(verbs_history::diff, &mut ctx, &["--cached"]).expect("staged diff");
     assert!(String::from_utf8_lossy(&staged).contains("+staged change"));
+    drop(ctx);
+    std::fs::remove_dir_all(base).expect("cleanup");
+}
+
+#[test]
+fn stored_paths_clamp_parent_steps_at_the_filesystem_root() {
+    let (root, env) = seeded_repo("lexical-root-parent", "seed.txt", b"first\n");
+    let base = root.parent().expect("parent");
+    let mut ctx = repo_ctx(&root, env.clone());
+    std::fs::write(root.join("seed.txt"), b"second\n").expect("second content");
+    run(verbs_stage::add, &mut ctx, &["seed.txt"]).expect("stage second");
+    run(verbs_history::commit, &mut ctx, &["-m", "second"]).expect("commit second");
+    run(verbs_stage::rm, &mut ctx, &["seed.txt"]).expect("remove tracked file");
+    drop(ctx);
+    let canonical = std::fs::canonicalize(&root).expect("canonical worktree");
+    let tail: Vec<_> = canonical
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .collect();
+    let mut operand = std::path::PathBuf::new();
+    for _ in 0..tail.len() + 2 {
+        operand.push("..");
+    }
+    for part in tail {
+        operand.push(part);
+    }
+    operand.push("seed.txt");
+    let operand = operand.to_str().expect("operand text");
+    let root_text = root.to_str().expect("root text");
+    run_argv(
+        env.clone(),
+        &["ruk", "-C", root_text, "restore", "--staged", "--", operand],
+    )
+    .expect("staged restore clamps parent steps at the filesystem root");
+    let (diff, _) = run_argv(
+        env.clone(),
+        &[
+            "ruk", "-C", root_text, "diff", "HEAD~1", "HEAD", "--", operand,
+        ],
+    )
+    .expect("historical diff clamps parent steps at the filesystem root");
+    assert!(
+        String::from_utf8(diff)
+            .expect("diff text")
+            .contains("+second")
+    );
+    let mut ctx = repo_ctx(&root, env);
+    assert_eq!(index_stages(&mut ctx, "seed.txt"), vec![0]);
+    assert!(!root.join("seed.txt").exists());
+    assert!(
+        run(verbs_history::diff, &mut ctx, &["--cached"])
+            .expect("restored index")
+            .is_empty()
+    );
     drop(ctx);
     std::fs::remove_dir_all(base).expect("cleanup");
 }
@@ -138,6 +196,49 @@ mod windows {
                 .expect("restored index")
                 .is_empty()
         );
+        drop(ctx);
+        let nested = drive.root.join("repo");
+        let nested_text = nested.to_str().expect("nested root text");
+        run_argv(test_env(&drive.root), &["ruk", "init", nested_text])
+            .expect("init nested worktree on substituted drive");
+        let mut ctx = repo_ctx(&nested, test_env(&nested));
+        std::fs::write(nested.join("seed.txt"), b"first\n").expect("nested first content");
+        run(verbs_stage::add, &mut ctx, &["seed.txt"]).expect("stage nested first");
+        run(verbs_history::commit, &mut ctx, &["-m", "first"]).expect("commit nested first");
+        std::fs::write(nested.join("seed.txt"), b"second\n").expect("nested second content");
+        run(verbs_stage::add, &mut ctx, &["seed.txt"]).expect("stage nested second");
+        run(verbs_history::commit, &mut ctx, &["-m", "second"]).expect("commit nested second");
+        run(verbs_stage::rm, &mut ctx, &["seed.txt"]).expect("remove nested tracked file");
+        let rooted = r"\repo\seed.txt";
+        run(verbs_branch::restore, &mut ctx, &["--staged", "--", rooted])
+            .expect("rooted restore retains the substituted cwd drive");
+        assert_eq!(index_stages(&mut ctx, "seed.txt"), vec![0]);
+        assert!(!nested.join("seed.txt").exists());
+        assert!(
+            run(verbs_history::diff, &mut ctx, &["--cached"])
+                .expect("nested restored index")
+                .is_empty()
+        );
+        run(verbs_branch::reset, &mut ctx, &["HEAD~1", "--", rooted])
+            .expect("rooted reset retains the substituted cwd drive");
+        let staged = run(verbs_history::diff, &mut ctx, &["--cached"]).expect("nested reset index");
+        assert!(
+            String::from_utf8(staged)
+                .expect("staged text")
+                .contains("+first")
+        );
+        let diff = run(
+            verbs_history::diff,
+            &mut ctx,
+            &["HEAD~1", "HEAD", "--", rooted],
+        )
+        .expect("rooted historical diff retains the substituted cwd drive");
+        assert!(
+            String::from_utf8(diff)
+                .expect("diff text")
+                .contains("+second")
+        );
+        assert!(!nested.join("seed.txt").exists());
         drop(ctx);
         drop(drive);
         std::fs::remove_dir_all(base).expect("cleanup");

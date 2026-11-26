@@ -348,14 +348,19 @@ pub(crate) fn repo_path_lexical(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitEr
     let text = std::str::from_utf8(raw).map_err(|_| GitError::Invalid {
         detail: "pathspec is not valid UTF-8".to_owned(),
     })?;
+    let outside = |text: &str| GitError::Invalid {
+        detail: format!("pathspec {text:?} is outside the repository"),
+    };
     let operand = std::path::Path::new(text);
     let prefix = if operand.is_absolute() {
         std::path::Path::new("")
+    } else if operand.has_root() {
+        match ctx.env.cwd.components().next() {
+            Some(std::path::Component::Prefix(prefix)) => std::path::Path::new(prefix.as_os_str()),
+            _ => return Err(outside(text)),
+        }
     } else {
         ctx.env.cwd.as_path()
-    };
-    let outside = |text: &str| GitError::Invalid {
-        detail: format!("pathspec {text:?} is outside the repository"),
     };
     let base = std::fs::canonicalize(&ctx.file_base).map_err(|err| GitError::Io {
         detail: format!("resolving worktree {}: {err}", ctx.file_base.display()),
@@ -389,7 +394,7 @@ pub(crate) fn repo_path_lexical(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitEr
             }
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                if !physical.pop() {
+                if !physical.pop() && !physical.has_root() {
                     return Err(outside(text));
                 }
             }
