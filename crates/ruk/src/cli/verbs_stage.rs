@@ -385,9 +385,6 @@ pub(crate) fn repo_path_lexical(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitEr
         detail: format!("resolving worktree {}: {err}", ctx.file_base.display()),
     })?;
     let mut physical = std::path::PathBuf::new();
-    // The canonicalized drive root traversal starts from. A `..` step clamps
-    // there instead of popping: resolving a substituted root first would let
-    // the climb continue on the backing path.
     let mut floor: Option<std::path::PathBuf> = None;
     for component in prefix.components().chain(operand.components()) {
         if matches!(
@@ -414,8 +411,6 @@ pub(crate) fn repo_path_lexical(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitEr
             std::path::Component::Prefix(prefix) => physical.push(prefix.as_os_str()),
             std::path::Component::RootDir => {
                 physical.push(std::path::Component::RootDir.as_os_str());
-                // Remember the drive context `..` must not escape, resolving
-                // the seeded root (a substituted drive) once up front.
                 floor = std::fs::canonicalize(&physical).ok();
             }
             std::path::Component::CurDir => {}
