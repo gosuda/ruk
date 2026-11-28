@@ -1411,6 +1411,9 @@ fn write_output_file(
     let Some(path) = opts.single("output")? else {
         return Ok(bytes);
     };
+    if ctx.store.is_none() {
+        return Ok(Vec::new());
+    }
     let full = ctx.env.cwd.join(&path);
     std::fs::write(&full, &bytes).map_err(|err| GitError::Io {
         detail: format!("writing --output {}: {err}", full.display()),
@@ -7380,6 +7383,7 @@ pub(crate) fn diff(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         },
     );
     if opts.is_set("no-index") {
+        ctx.store()?;
         if opts.is_set("cached") || opts.is_set("staged") {
             return Err(GitError::Invalid {
                 detail: "--cached/--staged combine with revisions, not with --no-index".to_owned(),

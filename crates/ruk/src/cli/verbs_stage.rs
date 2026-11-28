@@ -333,54 +333,118 @@ fn normalize_staging_path(path: &std::path::Path) -> Result<std::path::PathBuf, 
     }
 }
 
+/// Applies one `..` step without climbing above the seeded drive root.
+///
+/// Returns whether traversal may continue. Staying at the canonicalized
+/// drive root mirrors the OS clamp (`..` at a drive root stays there): the
+/// walk canonicalizes a substituted root before applying `..`, so popping
+/// there would continue the climb on the backing path and let a rooted
+/// operand re-enter the repository naming a different file.
+pub(crate) fn step_parent_within_floor(
+    physical: &mut std::path::PathBuf,
+    floor: Option<&std::path::Path>,
+) -> bool {
+    if floor.is_some_and(|floor| physical == floor) {
+        return true;
+    }
+    physical.pop() || physical.has_root()
+}
+
 /// Converts a CLI operand to a repository path without reading the worktree.
 ///
 /// Pure lexical conversion for index- and tree-only callers (two-revision
 /// `diff`, staged restores): a worktree parent obstructed by a regular file
-/// must not fail the conversion of a stored path. Only the worktree-root
-/// boundary is resolved against the filesystem, so a symlinked `-C`
-/// directory keeps working; `..` above the root is outside the repository.
-/// The returned name is literal: no component is resolved or rejected.
+/// must not fail the conversion of a stored path. Symlinks are resolved
+/// while the walked prefix is still outside the worktree root, so a
+/// symlinked `-C` directory keeps working and `..` pops the resolved
+/// target instead of the symlink spelling. A path may therefore leave and
+/// re-enter the worktree without reading stored parents. Once the prefix
+/// reaches the root the remainder stays literal: no component is resolved
+/// or rejected.
+/// A `..` step never climbs above the canonicalized drive root the walk
+/// starts from, mirroring the OS clamp at a drive root.
 pub(crate) fn repo_path_lexical(ctx: &Ctx, raw: &[u8]) -> Result<RepoPath, GitError> {
     let text = std::str::from_utf8(raw).map_err(|_| GitError::Invalid {
         detail: "pathspec is not valid UTF-8".to_owned(),
     })?;
-    let joined = if std::path::Path::new(text).is_absolute() {
-        std::path::PathBuf::from(text)
+    let outside = |text: &str| GitError::Invalid {
+        detail: format!("pathspec {text:?} is outside the repository"),
+    };
+    let operand = std::path::Path::new(text);
+    let prefix = if operand.is_absolute() {
+        std::path::Path::new("")
+    } else if operand.has_root() {
+        match ctx.env.cwd.components().next() {
+            Some(std::path::Component::Prefix(prefix)) => std::path::Path::new(prefix.as_os_str()),
+            _ => return Err(outside(text)),
+        }
     } else {
-        ctx.env.cwd.join(text)
+        ctx.env.cwd.as_path()
     };
     let base = std::fs::canonicalize(&ctx.file_base).map_err(|err| GitError::Io {
         detail: format!("resolving worktree {}: {err}", ctx.file_base.display()),
     })?;
-    let Some((_, suffix)) = split_at_worktree_root(&joined, &base) else {
-        return Err(GitError::Invalid {
-            detail: format!("pathspec {text:?} is outside the repository"),
-        });
-    };
-    let dot = std::ffi::OsStr::new(".");
-    let dotdot = std::ffi::OsStr::new("..");
-    let mut stack: Vec<std::ffi::OsString> = Vec::new();
-    for part in suffix {
-        if part.as_os_str() == dot {
-            continue;
-        }
-        if part.as_os_str() == dotdot {
-            if stack.pop().is_none() {
+    let mut physical = std::path::PathBuf::new();
+    let mut floor: Option<std::path::PathBuf> = None;
+    for component in prefix.components().chain(operand.components()) {
+        if matches!(
+            component,
+            std::path::Component::CurDir
+                | std::path::Component::ParentDir
+                | std::path::Component::Normal(_)
+        ) && physical.is_absolute()
+            && !physical.starts_with(&base)
+        {
+            let metadata = std::fs::metadata(&physical).map_err(|err| GitError::Io {
+                detail: format!("reading pathspec prefix {}: {err}", physical.display()),
+            })?;
+            if !metadata.is_dir() {
                 return Err(GitError::Invalid {
-                    detail: format!("pathspec {text:?} is outside the repository"),
+                    detail: format!(
+                        "pathspec {text:?} crosses a non-directory prefix {}",
+                        physical.display()
+                    ),
                 });
             }
-            continue;
         }
-        stack.push(part);
+        match component {
+            std::path::Component::Prefix(prefix) => physical.push(prefix.as_os_str()),
+            std::path::Component::RootDir => {
+                physical.push(std::path::Component::RootDir.as_os_str());
+                floor = std::fs::canonicalize(&physical).ok();
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !step_parent_within_floor(&mut physical, floor.as_deref()) {
+                    return Err(outside(text));
+                }
+            }
+            std::path::Component::Normal(part) => physical.push(part),
+        }
+        if !matches!(component, std::path::Component::Prefix(_))
+            && physical.is_absolute()
+            && !physical.starts_with(&base)
+            && let Ok(resolved) = std::fs::canonicalize(&physical)
+        {
+            physical = resolved;
+        }
     }
+    let relative = physical.strip_prefix(&base).map_err(|_| outside(text))?;
     let mut parts: Vec<u8> = Vec::new();
-    for part in &stack {
-        if !parts.is_empty() {
-            parts.push(b'/');
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                if !parts.is_empty() {
+                    parts.push(b'/');
+                }
+                parts.extend_from_slice(part.as_encoded_bytes());
+            }
+            _ => {
+                return Err(GitError::Invalid {
+                    detail: format!("bad pathspec {text:?}"),
+                });
+            }
         }
-        parts.extend_from_slice(part.as_encoded_bytes());
     }
     RepoPath::new(parts).map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))
 }

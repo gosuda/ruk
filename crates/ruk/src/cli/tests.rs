@@ -38,6 +38,8 @@ use super::verbs_transport;
 use super::verbs_worktree;
 use super::{CliEnv, Ctx, collect};
 
+mod lexical_paths;
+
 /// `(request head, body)` smart-http request log.
 type HttpRequests = Vec<(String, Vec<u8>)>;
 /// `(request paths, PUT body)` LFS upload observation.
@@ -4393,6 +4395,37 @@ fn index_stages(ctx: &mut Ctx, file: &str) -> Vec<u8> {
         .filter(|(path, _, _)| path.as_bytes() == file.as_bytes())
         .map(|(_, stage, _)| stage.as_u8())
         .collect()
+}
+
+/// Removes every stored stage row for one path, straight through the store.
+///
+/// No CLI pathspec conversion runs, so a test can return an entry to absent
+/// before proving that one spelling restores it.
+#[cfg(unix)]
+fn drop_index_path(ctx: &mut Ctx, file: &str) {
+    let store = ctx.store().expect("store");
+    let kind = ctx.kind().expect("kind");
+    let path = ruk_core::index::RepoPath::new(file.as_bytes().to_vec()).expect("repo path");
+    let before = super::state::read_path_rows(store, kind, &path).expect("read rows");
+    assert!(!before.is_empty(), "expected a staged row for {file}");
+    let (workspace, raw) = super::state::load_or_default(store).expect("workspace");
+    let mut mutations = super::state::path_row_mutations(&path, &before, &[]).expect("drop rows");
+    let next = workspace.mutate_index(workspace.stamp).expect("stamp");
+    mutations.push(super::state::workspace_mutation(raw.as_deref(), &next).expect("workspace"));
+    store
+        .publish(
+            Vec::new(),
+            &mutations,
+            ruk_core::store::EventSource::LocalPush,
+            &ruk_core::store::EventContext::default(),
+        )
+        .expect("publish");
+    assert!(
+        super::state::read_path_rows(store, kind, &path)
+            .expect("reread")
+            .is_empty(),
+        "entry for {file} survived the drop"
+    );
 }
 
 #[test]
@@ -10233,4 +10266,293 @@ fn two_revision_diff_survives_obstructed_worktree_parent() {
         "unexpected diff: {text:?}"
     );
     std::fs::remove_dir_all(base).expect("cleanup");
+}
+
+#[test]
+fn diff_no_index_help_probe_leaves_output_alone() {
+    let base = temp_base("diff-noindex-probe-output");
+    std::fs::write(base.join("a.txt"), b"alpha\n").expect("a");
+    std::fs::write(base.join("b.txt"), b"beta\n").expect("b");
+    std::fs::write(base.join("--help"), b"before\n").expect("output file");
+    let err = run_argv(
+        test_env(&base),
+        &[
+            "ruk",
+            "diff",
+            "--no-index",
+            "--output",
+            "--help",
+            "a.txt",
+            "b.txt",
+        ],
+    )
+    .expect_err("discovery fails outside a repository");
+    assert!(
+        matches!(err, ruk_git::GitError::Invalid { ref detail } if detail.contains("not a ruk repository")),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(base.join("--help")).expect("output intact"),
+        b"before\n"
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_intent_accepts_symlinked_parent_for_stored_path() {
+    let (root, env) = seeded_repo("reset-intent-symlink", "seed.txt", b"seed\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::create_dir(root.join("docs")).expect("docs dir");
+    std::fs::write(root.join("docs/intro.md"), b"one\n").expect("one");
+    run(verbs_stage::add, &mut ctx, &["docs/intro.md"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "docs"]).expect("commit");
+    run(verbs_stage::rm, &mut ctx, &["docs/intro.md"]).expect("remove from index");
+    assert!(index_stages(&mut ctx, "docs/intro.md").is_empty());
+    std::fs::remove_dir(root.join("docs")).expect("rmdir");
+    let outside = root.parent().expect("parent").join("outside-target");
+    std::fs::create_dir_all(&outside).expect("outside");
+    std::os::unix::fs::symlink(&outside, root.join("docs")).expect("symlink parent");
+    let reentry = root.join("../repo/docs/intro.md");
+    // Each spelling must restore the entry on its own. The row is dropped
+    // straight through the store before every operand, so a later operand
+    // can no longer coast on an earlier one's work: a reentry that returns
+    // success without restoring anything fails its own assertion.
+    run(
+        verbs_branch::reset,
+        &mut ctx,
+        &["-N", "--", "docs/intro.md"],
+    )
+    .expect("prime entry through the direct spelling");
+    for path in [
+        "docs/intro.md",
+        "../repo/docs/intro.md",
+        reentry.to_str().expect("utf8"),
+    ] {
+        drop_index_path(&mut ctx, "docs/intro.md");
+        run(verbs_branch::reset, &mut ctx, &["-N", "--", path])
+            .expect("intent under symlinked parent for stored path");
+        assert_eq!(
+            index_stages(&mut ctx, "docs/intro.md"),
+            vec![0],
+            "operand {path:?} did not restore the entry"
+        );
+    }
+    assert!(
+        std::fs::symlink_metadata(root.join("docs"))
+            .expect("meta")
+            .file_type()
+            .is_symlink()
+    );
+    assert!(run(verbs_branch::reset, &mut ctx, &["-N", "--", "docs/new.md"],).is_err());
+    assert!(
+        run(
+            verbs_branch::reset,
+            &mut ctx,
+            &["-N", "--", "../outside-target/intro.md"],
+        )
+        .is_err()
+    );
+    assert!(!outside.join("intro.md").exists());
+    assert_eq!(index_stages(&mut ctx, "docs/intro.md"), vec![0]);
+    assert!(
+        run(verbs_history::diff, &mut ctx, &["--cached"])
+            .expect("staged diff")
+            .is_empty()
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn reset_intent_accepts_a_path_that_reenters_the_worktree() {
+    let (root, env) = seeded_repo("reset-reenter", "seed.txt", b"seed\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("new.txt"), b"new\n").expect("new file");
+    let path = root.join("../repo/new.txt");
+    run(
+        verbs_branch::reset,
+        &mut ctx,
+        &["-N", "--", path.to_str().expect("utf8")],
+    )
+    .expect("reenter worktree");
+    assert_eq!(index_stages(&mut ctx, "new.txt"), vec![0]);
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[cfg(unix)]
+#[test]
+fn staged_restore_resolves_dotdot_through_outside_symlink() {
+    // `/links/jump` points at a real directory outside the worktree, so the
+    // absolute spelling `<links>/jump/../repo/seed.txt` names the stored path
+    // `seed.txt`. Staged restores convert pathspecs lexically with no
+    // fallback: collapsing `..` before resolving the jump used to check
+    // `<links>/repo` instead of the worktree and fail as outside.
+    let base = temp_base("lexical-outside-jump");
+    let env = test_env(&base);
+    let mut ctx = Ctx {
+        store: None,
+        root: base.clone(),
+        file_base: base.clone(),
+        kind: None,
+        env: env.clone(),
+        bare: false,
+        cli_config: Vec::new(),
+        stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
+    };
+    verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
+    let root = base.join("repo");
+    std::fs::write(root.join("seed.txt"), b"seed\n").expect("seed file");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_stage::add, &mut ctx, &["seed.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "seed"]).expect("commit");
+    run(verbs_stage::rm, &mut ctx, &["seed.txt"]).expect("remove from index");
+    assert!(index_stages(&mut ctx, "seed.txt").is_empty());
+    std::fs::create_dir_all(base.join("build")).expect("build dir");
+    std::fs::create_dir_all(base.join("links")).expect("links dir");
+    std::os::unix::fs::symlink(base.join("build"), base.join("links/jump")).expect("jump");
+    let spelling = format!("{}/jump/../repo/seed.txt", base.join("links").display());
+    run(
+        verbs_branch::restore,
+        &mut ctx,
+        &["--staged", "--", spelling.as_str()],
+    )
+    .expect("staged restore through outside symlink");
+    assert_eq!(index_stages(&mut ctx, "seed.txt"), vec![0]);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+#[test]
+fn two_revision_diff_resolves_nested_symlink_jump() {
+    // Chained jumps (`links/jump1` into `mid`, `mid/jump2` into `build`) with
+    // a `..` re-entry must still name the stored path. Two-revision diffs
+    // convert pathspecs lexically with no fallback, so the same collapse
+    // fault used to reject this spelling as outside the repository.
+    let base = temp_base("lexical-nested-jump");
+    let env = test_env(&base);
+    let mut ctx = Ctx {
+        store: None,
+        root: base.clone(),
+        file_base: base.clone(),
+        kind: None,
+        env: env.clone(),
+        bare: false,
+        cli_config: Vec::new(),
+        stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
+    };
+    verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
+    let root = base.join("repo");
+    std::fs::write(root.join("seed.txt"), b"first\n").expect("seed file");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_stage::add, &mut ctx, &["seed.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "first"]).expect("commit first");
+    std::fs::write(root.join("seed.txt"), b"second\n").expect("revise file");
+    run(verbs_stage::add, &mut ctx, &["seed.txt"]).expect("stage revision");
+    run(verbs_history::commit, &mut ctx, &["-m", "second"]).expect("commit second");
+    std::fs::create_dir_all(base.join("build")).expect("build dir");
+    std::fs::create_dir_all(base.join("mid")).expect("mid dir");
+    std::fs::create_dir_all(base.join("links")).expect("links dir");
+    std::os::unix::fs::symlink(base.join("mid"), base.join("links/jump1")).expect("jump1");
+    std::os::unix::fs::symlink(base.join("build"), base.join("mid/jump2")).expect("jump2");
+    let spelling = format!(
+        "{}/jump1/jump2/../repo/seed.txt",
+        base.join("links").display()
+    );
+    let out = run(
+        verbs_history::diff,
+        &mut ctx,
+        &["HEAD~1", "HEAD", "--", spelling.as_str()],
+    )
+    .expect("historical diff through nested symlink jump");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(
+        text.contains("seed.txt") && text.contains("+second"),
+        "unexpected diff: {text:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn reset_intent_preserves_unrelated_staged_path_collisions() {
+    let (root, env) = seeded_repo("reset-unrelated-collision", "seed.txt", b"seed\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::create_dir(root.join("docs")).expect("docs directory");
+    std::fs::write(root.join("docs/intro.md"), b"nested\n").expect("nested file");
+    run(verbs_stage::add, &mut ctx, &["docs/intro.md"]).expect("stage nested file");
+    run(verbs_history::commit, &mut ctx, &["-m", "nested file"]).expect("commit nested file");
+    run(verbs_stage::rm, &mut ctx, &["docs/intro.md"]).expect("remove nested file");
+    std::fs::remove_dir(root.join("docs")).expect("remove docs directory");
+    std::fs::write(root.join("docs"), b"parent\n").expect("parent file");
+    run(verbs_stage::add, &mut ctx, &["docs"]).expect("stage parent file");
+    run(verbs_history::commit, &mut ctx, &["-m", "parent file"]).expect("commit parent file");
+    run(verbs_branch::reset, &mut ctx, &["-N", "HEAD~1"]).expect("whole-tree reset");
+    assert_eq!(index_stages(&mut ctx, "docs"), vec![0]);
+    assert_eq!(index_stages(&mut ctx, "docs/intro.md"), vec![0]);
+    let before = super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+        .expect("index before");
+    std::fs::write(root.join("other.txt"), b"other\n").expect("unrelated file");
+    run(verbs_branch::reset, &mut ctx, &["-N", "--", "other.txt"]).expect("unrelated path reset");
+    assert_eq!(index_stages(&mut ctx, "other.txt"), vec![0]);
+    let after: Vec<_> =
+        super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+            .expect("index after")
+            .into_iter()
+            .filter(|(path, _, _)| path.as_bytes() != b"other.txt")
+            .collect();
+    assert_eq!(before, after);
+    assert_eq!(
+        std::fs::read(root.join("docs")).expect("parent intact"),
+        b"parent\n"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_intent_rejects_a_staged_symlink_parent_without_changing_index() {
+    let (root, env) = seeded_repo("reset-staged-parent", "seed.txt", b"seed\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::create_dir(root.join("docs")).expect("docs");
+    std::fs::write(root.join("docs/intro.md"), b"committed\n").expect("file");
+    run(verbs_stage::add, &mut ctx, &["docs/intro.md"]).expect("stage file");
+    run(verbs_history::commit, &mut ctx, &["-m", "docs"]).expect("commit file");
+    run(verbs_stage::rm, &mut ctx, &["docs/intro.md"]).expect("remove indexed file");
+    std::fs::remove_dir(root.join("docs")).expect("remove directory");
+    let outside = root.parent().expect("parent").join("outside");
+    std::fs::create_dir(&outside).expect("outside");
+    std::os::unix::fs::symlink(&outside, root.join("docs")).expect("symlink");
+    run(verbs_stage::add, &mut ctx, &["docs"]).expect("stage symlink");
+    let before = super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+        .expect("index before");
+    let err = run(
+        verbs_branch::reset,
+        &mut ctx,
+        &["-N", "--", "docs/intro.md"],
+    )
+    .expect_err("staged parent blocks reset");
+    assert!(err.to_string().contains("docs"), "{err:?}");
+    let after = super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+        .expect("index after");
+    assert_eq!(before, after);
+    run(verbs_history::commit, &mut ctx, &["-m", "symlink"]).expect("index stays committable");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn diff_no_index_probe_rejects_before_reading_operands() {
+    let (root, env) = seeded_repo("diff-probe-input", "seed.txt", b"seed\n");
+    let mut ctx = repo_ctx(&root, env);
+    ctx.store = None;
+    ctx.kind = None;
+    let err = run(
+        verbs_history::diff,
+        &mut ctx,
+        &["--no-index", "--output", "--help", "missing-a", "missing-b"],
+    )
+    .expect_err("probe has no repository");
+    assert!(matches!(err, ruk_git::GitError::Invalid { .. }), "{err:?}");
+    assert!(!root.join("--help").exists());
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
