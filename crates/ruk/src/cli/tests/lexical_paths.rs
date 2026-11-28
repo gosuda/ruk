@@ -231,24 +231,31 @@ mod windows {
 
     impl SubstDrive {
         fn new(target: &Path) -> Self {
-            let letter = (b'D'..=b'Z')
-                .rev()
-                .find(|letter| !Path::new(&format!("{}:\\", char::from(*letter))).exists())
-                .expect("unused drive letter");
-            let label = format!("{}:", char::from(letter));
-            let root = PathBuf::from(format!("{label}\\"));
-            let output = Command::new("subst.exe")
-                .arg(&label)
-                .arg(target)
-                .output()
-                .expect("map owned test directory");
-            assert!(
-                output.status.success(),
-                "map test drive: {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            Self { label, root }
+            for _ in 0..8 {
+                let letter = (b'D'..=b'Z')
+                    .rev()
+                    .find(|letter| !Path::new(&format!("{}:\\", char::from(*letter))).exists())
+                    .expect("unused drive letter");
+                let label = format!("{}:", char::from(letter));
+                let root = PathBuf::from(format!("{label}\\"));
+                let output = Command::new("subst.exe")
+                    .arg(&label)
+                    .arg(target)
+                    .output()
+                    .expect("map owned test directory");
+                if output.status.success() {
+                    return Self { label, root };
+                }
+                if Path::new(&format!("{label}\\")).exists() {
+                    continue;
+                }
+                panic!(
+                    "map test drive: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            panic!("test drive mapping kept colliding with a parallel fixture");
         }
     }
 
@@ -447,7 +454,7 @@ mod windows {
         for rooted in [direct.as_str(), via_sub.as_str()] {
             let error = run(verbs_branch::restore, &mut ctx, &["--staged", "--", rooted])
                 .expect_err("climb above the substituted root must fail");
-            assert!(error.to_string().contains("outside"), "{error:?}");
+            assert!(error.to_string().contains("prefix"), "{error:?}");
         }
         assert_eq!(index_stages(&mut ctx, "seed.txt"), vec![0]);
         assert_eq!(index_stages(&mut ctx, "other.txt"), vec![0]);
