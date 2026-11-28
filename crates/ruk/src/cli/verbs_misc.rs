@@ -192,6 +192,42 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     }
     go(pattern.as_bytes(), text.as_bytes())
 }
+/// Rewrites a native separator in an exclusion or ignore pattern to the
+/// slash form the worktree walk emits, leaving glob escapes intact: a
+/// backslash before `[`, `]` or `!` quotes that character, and a
+/// doubled backslash spells one separator. Every other backslash is a
+/// separator, so `*` and `?` keep their wildcard meaning. Unix patterns pass
+/// through unchanged.
+fn slash_pattern(pattern: &str) -> String {
+    slash_separators(pattern, std::path::MAIN_SEPARATOR)
+}
+
+fn slash_separators(pattern: &str, separator: char) -> String {
+    if separator == '/' {
+        return pattern.to_owned();
+    }
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(head) = chars.next() {
+        if head != separator {
+            out.push(head);
+            continue;
+        }
+        match chars.clone().next() {
+            Some(next) if next == separator => {
+                out.push('/');
+                chars.next();
+            }
+            Some(next) if matches!(next, '[' | ']' | '!') => {
+                out.push(head);
+                out.push(next);
+                chars.next();
+            }
+            _ => out.push('/'),
+        }
+    }
+    out
+}
 
 /// Peels `oid` through tag objects to its commit, passing commits through.
 fn peel_to_commit(store: &Store, mut oid: Oid) -> Result<Oid, GitError> {
@@ -334,11 +370,11 @@ pub(crate) fn clean(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     let excludes: Vec<String> = opts
         .all("exclude")?
         .iter()
-        .map(|pattern| pattern.replace(std::path::MAIN_SEPARATOR, "/"))
+        .map(|pattern| slash_pattern(pattern))
         .collect();
     let mut ignore_rules = load_ignore_rules(&ctx.file_base)?;
     for rule in &mut ignore_rules {
-        rule.pattern = rule.pattern.replace(std::path::MAIN_SEPARATOR, "/");
+        rule.pattern = slash_pattern(&rule.pattern);
     }
     let limits: Vec<Vec<u8>> = opts
         .positionals
@@ -3753,6 +3789,26 @@ mod tests {
 
     fn stdin_of(ctx: &mut Ctx, input: &[u8]) {
         ctx.env.stdin = Some(input.to_vec());
+    }
+
+    #[test]
+    fn backslash_escapes_survive_separator_normalization() {
+        let windows = |pattern: &str| super::slash_separators(pattern, '\\');
+        assert_eq!(windows(r"build\local.txt"), "build/local.txt");
+        assert_eq!(windows(r"build\\local.txt"), "build/local.txt");
+        assert_eq!(windows(r"keep\[1].txt"), r"keep\[1].txt");
+        assert_eq!(windows(r"src\*.txt"), "src/*.txt");
+        assert_eq!(windows("plain.txt"), "plain.txt");
+        assert!(super::glob_match(&windows(r"keep\[1].txt"), "keep[1].txt"));
+        assert!(super::glob_match(
+            &windows(r"build\\local.txt"),
+            "build/local.txt"
+        ));
+        assert_eq!(
+            super::slash_separators("build/local.txt", '/'),
+            "build/local.txt"
+        );
+        assert!(super::glob_match(&windows(r"src\*.txt"), "src/a.txt"));
     }
 
     #[test]
