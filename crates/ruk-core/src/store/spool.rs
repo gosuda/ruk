@@ -14,10 +14,11 @@
 //! - A spool unlinks only the file it created. If that unlink fails the
 //!   scratch bytes stay charged for the life of the budget: they still
 //!   occupy disk.
-//! - The per-store bucket is keyed by the canonical scratch directory, so a
-//!   same-process reopen of the same store shares one bucket. The first
-//!   registration of a bucket charges the bytes already present in that
-//!   directory (crash leftovers) without deleting or rescanning them.
+//! - The per-store bucket is keyed by the scratch directory itself, so a
+//!   same-process reopen of the same store and a store moved between
+//!   registrations share one bucket. The first registration of a bucket
+//!   charges the bytes already present in that directory (crash leftovers)
+//!   without deleting or rescanning them.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -40,6 +41,36 @@ const MIN_MEMORY_CHUNK: usize = 4096;
 /// Entries one occupancy scan may visit before it fails closed.
 const MAX_SCAN_ENTRIES: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
+
+/// Identity of one scratch directory: device and inode on unix, so a store
+/// moved between registrations keeps its bucket; the canonical path where
+/// the pin gives no descriptor path.
+#[cfg(unix)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct ScratchId {
+    dev: u64,
+    ino: u64,
+}
+/// Identity of one scratch directory where the pin gives no descriptor
+/// path: the canonical path, as before.
+#[cfg(not(unix))]
+type ScratchId = PathBuf;
+
+/// Reads the identity of a canonical scratch directory.
+#[cfg(unix)]
+fn scratch_id(canonical: &Path) -> io::Result<ScratchId> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = fs::metadata(canonical)?;
+    Ok(ScratchId {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+/// Reads the identity of a canonical scratch directory.
+#[cfg(not(unix))]
+fn scratch_id(canonical: &Path) -> io::Result<ScratchId> {
+    Ok(canonical.to_path_buf())
+}
 
 /// A resource refusal that must stay typed while it crosses `std::io`
 /// boundaries (zstd encoders and `io::copy` only carry `io::Error`).
@@ -139,9 +170,9 @@ impl Default for BudgetLimits {
 struct Usage {
     memory: u64,
     scratch: u64,
-    /// Scratch bytes charged per canonical scratch directory, baseline of
+    /// Scratch bytes charged per scratch directory, baseline of
     /// pre-existing files included.
-    roots: HashMap<PathBuf, u64>,
+    roots: HashMap<ScratchId, u64>,
 }
 
 /// Shared preparation reservations. One instance serves every store of a
@@ -179,7 +210,7 @@ impl PreparationBudget {
     }
 
     /// Charges the scratch bytes already present under `store_root/scratch`
-    /// to that store's bucket. Idempotent; the scan runs once per canonical
+    /// to that store's bucket. Idempotent; the scan runs once per scratch
     /// directory and never deletes anything.
     ///
     /// # Errors
@@ -200,8 +231,9 @@ impl PreparationBudget {
 
     #[cfg(test)]
     pub(crate) fn scratch_in_use(&self, store_root: &Path) -> Option<u64> {
-        let key = fs::canonicalize(store_root.join(SCRATCH_DIR)).ok()?;
-        self.usage().roots.get(&key).copied()
+        let canonical = fs::canonicalize(store_root.join(SCRATCH_DIR)).ok()?;
+        let id = scratch_id(&canonical).ok()?;
+        self.usage().roots.get(&id).copied()
     }
 
     /// Reserves `bytes` of prepared memory until the guard drops.
@@ -220,7 +252,7 @@ impl PreparationBudget {
         self.usage.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn acquire(&self, memory: u64, scratch: u64, root: Option<&Path>) -> Result<(), Refusal> {
+    fn acquire(&self, memory: u64, scratch: u64, root: Option<&ScratchId>) -> Result<(), Refusal> {
         let mut usage = self.usage();
         let memory_after = usage
             .memory
@@ -271,7 +303,7 @@ impl PreparationBudget {
         Ok(())
     }
 
-    fn release(&self, memory: u64, scratch: u64, root: Option<&Path>) {
+    fn release(&self, memory: u64, scratch: u64, root: Option<&ScratchId>) {
         let mut usage = self.usage();
         usage.memory = usage.memory.saturating_sub(memory);
         usage.scratch = usage.scratch.saturating_sub(scratch);
@@ -283,31 +315,37 @@ impl PreparationBudget {
         }
     }
 
-    /// Creates the scratch directory if needed and returns its canonical
-    /// path after registering its bucket (baseline scan on first use).
-    /// The directory create and the key probe both travel the pin, so
-    /// a symlink swapped in after open can neither divert the spill
-    /// nor split the bucket; the recorded path serves only the
-    /// no-descriptor fallback.
-    fn open_scratch(&self, pin: &PinnedRoot, store_root: &Path) -> Result<PathBuf, StoreError> {
+    /// Creates the scratch directory if needed and returns its identity and
+    /// canonical path after registering its bucket (baseline scan on first
+    /// use). The directory create and the key probe both travel the pin, so
+    /// a symlink swapped in after open can neither divert the spill nor
+    /// split the bucket; the recorded path serves only the no-descriptor
+    /// fallback. A store moved between registrations keeps its bucket: the
+    /// identity follows the directory, not its name.
+    fn open_scratch(
+        &self,
+        pin: &PinnedRoot,
+        store_root: &Path,
+    ) -> Result<(ScratchId, PathBuf), StoreError> {
         pin.create_dir_all(scratch_dir()).map_err(StoreError::Io)?;
         let probe = pin
             .proc_subpath(SCRATCH_DIR)
             .unwrap_or_else(|| store_root.join(SCRATCH_DIR));
-        let key = fs::canonicalize(&probe)?;
-        if self.usage().roots.contains_key(&key) {
-            return Ok(key);
+        let path = fs::canonicalize(&probe)?;
+        let id = scratch_id(&path)?;
+        if self.usage().roots.contains_key(&id) {
+            return Ok((id, path));
         }
         // Scan outside the lock. No spool of this budget exists in an
         // unregistered bucket, so the sum counts only foreign leftovers; a
         // racing registration wins and this result is discarded.
-        let baseline = scan_occupancy(&key)?;
+        let baseline = scan_occupancy(&path)?;
         let mut usage = self.usage();
-        if !usage.roots.contains_key(&key) {
+        if !usage.roots.contains_key(&id) {
             usage.scratch = usage.scratch.saturating_add(baseline);
-            usage.roots.insert(key.clone(), baseline);
+            usage.roots.insert(id.clone(), baseline);
         }
-        Ok(key)
+        Ok((id, path))
     }
 }
 
@@ -372,7 +410,7 @@ pub(crate) struct PreparationGuard {
     budget: Arc<PreparationBudget>,
     memory: u64,
     scratch: u64,
-    root: Option<PathBuf>,
+    root: Option<ScratchId>,
 }
 
 impl PreparationGuard {
@@ -387,7 +425,7 @@ impl PreparationGuard {
 
     /// Acquires more memory and/or scratch bytes; a refusal changes nothing.
     fn grow(&mut self, memory: u64, scratch: u64) -> Result<(), Refusal> {
-        self.budget.acquire(memory, scratch, self.root.as_deref())?;
+        self.budget.acquire(memory, scratch, self.root.as_ref())?;
         self.memory = self.memory.saturating_add(memory);
         self.scratch = self.scratch.saturating_add(scratch);
         Ok(())
@@ -408,7 +446,7 @@ impl PreparationGuard {
 impl Drop for PreparationGuard {
     fn drop(&mut self) {
         self.budget
-            .release(self.memory, self.scratch, self.root.as_deref());
+            .release(self.memory, self.scratch, self.root.as_ref());
     }
 }
 
@@ -650,8 +688,8 @@ impl fmt::Debug for SpoolWriter {
 impl SpoolWriter {
     /// Starts an empty spool charged to `budget` with scratch files under
     /// `store_root/scratch`. Every scratch create travels `pin`, never
-    /// the recorded path; only the accounting key still uses
-    /// `store_root`. Performs no I/O.
+    /// the recorded path; the accounting identity follows the directory
+    /// itself, so a moved store keeps its bucket. Performs no I/O.
     pub(crate) fn new(
         budget: &Arc<PreparationBudget>,
         store_root: &Path,
@@ -729,12 +767,12 @@ impl SpoolWriter {
     /// the buffered bytes before the file exists; the memory charge is
     /// released only after the copy.
     fn spill(&mut self) -> Result<(), StoreError> {
-        let dir = self
+        let (id, dir) = self
             .spool
             .charge
             .budget
             .open_scratch(&self.pin, &self.store_root)?;
-        self.spool.charge.root = Some(dir.clone());
+        self.spool.charge.root = Some(id);
         self.spool.charge.grow(0, self.spool.len)?;
         let (file, path) = create_spool_file(&self.pin, &dir)?;
         let previous = std::mem::replace(&mut self.spool.storage, Storage::File { file, path });

@@ -696,6 +696,32 @@ fn scratch_registration_is_idempotent_and_never_double_charges() {
     assert_eq!(budget.in_use(), (0, 5000));
 }
 
+#[cfg(unix)]
+#[test]
+fn scratch_registration_after_a_store_move_keeps_one_baseline() {
+    let root = TempRoot::new("register-move");
+    fs::create_dir_all(root.path().join("scratch")).unwrap();
+    fs::write(
+        root.path().join("scratch").join("old.tmp"),
+        vec![1_u8; 5000],
+    )
+    .unwrap();
+    let budget = default_budget();
+    let pin = pin_of(root.path());
+    budget.register_scratch(&pin, root.path()).unwrap();
+    assert_eq!(budget.in_use(), (0, 5000));
+    let stashed = root.path().with_extension("stashed");
+    fs::rename(root.path(), &stashed).expect("move live root");
+    budget.register_scratch(&pin, root.path()).unwrap();
+    assert_eq!(
+        budget.in_use(),
+        (0, 5000),
+        "a moved store keeps one baseline charge"
+    );
+    assert_eq!(budget.scratch_in_use(&stashed), Some(5000));
+    fs::remove_dir_all(&stashed).expect("remove stashed root");
+}
+
 fn base_and_target() -> (Vec<u8>, Vec<u8>) {
     let base = noise(10, 200_000);
     let mut target = base.clone();
