@@ -265,8 +265,9 @@ pub(crate) fn scope_matches(pattern: &str, url: &str) -> bool {
 /// Expands a leading `~/` against the caller map's `HOME`, never the
 /// process environment, as text: a helper program is a command string and
 /// keeps its configured separators. An empty `HOME` resolves the rest
-/// relative to the working directory; a bare `~` without a home is no
-/// program at all.
+/// relative to the working directory; a verbatim Windows home keeps
+/// backslashes through the join, since Windows accepts no forward slash
+/// after a verbatim prefix. A bare `~` without a home is no program at all.
 fn expand_home_in(path: &str, vars: &HashMap<String, String>) -> Option<String> {
     if !path.starts_with('~') {
         return Some(path.to_owned());
@@ -278,6 +279,10 @@ fn expand_home_in(path: &str, vars: &HashMap<String, String>) -> Option<String> 
     let rest = path.strip_prefix("~/")?;
     if home.is_empty() {
         return Some(rest.to_owned());
+    }
+    if home.starts_with(r"\\?\") {
+        let root = home.trim_end_matches(['/', '\\']);
+        return Some(format!("{root}\\{}", rest.replace('/', "\\")));
     }
     Some(format!("{home}/{rest}"))
 }
@@ -1344,6 +1349,61 @@ mod tests {
             None,
             "no HOME in the map means no program"
         );
+    }
+
+    #[test]
+    fn verbatim_windows_home_joins_with_backslashes() {
+        assert_eq!(
+            classify_helper("~/bin/helper", &vars(&[("HOME", r"\\?\C:\users\u")])),
+            Some((r"\\?\C:\users\u\bin\helper".to_owned(), Vec::new())),
+            "a verbatim home keeps backslashes through the join"
+        );
+        assert_eq!(
+            classify_helper("~/bin/helper", &vars(&[("HOME", r"\\?\UNC\share\u")])),
+            Some((r"\\?\UNC\share\u\bin\helper".to_owned(), Vec::new())),
+            "a verbatim UNC home keeps backslashes through the join"
+        );
+        assert_eq!(
+            classify_helper("~/bin/helper", &vars(&[("HOME", r"\\?\C:\u\")])),
+            Some((r"\\?\C:\u\bin\helper".to_owned(), Vec::new())),
+            "a trailing separator on a verbatim home does not double"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_helper_round_trip_returns_credentials() {
+        let dir = std::env::temp_dir().join(format!("ruk-cred-direct-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("helper dir");
+        let script = dir.join("answer.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat > /dev/null\nprintf 'username=direct\\npassword=s3cret\\n'\n",
+        )
+        .expect("helper script");
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("helper is executable");
+        let program = script.to_str().expect("script path").to_owned();
+        let vars = vars(&[("PATH", "/usr/bin:/bin")]);
+        let out = run_helper_in(&program, &[], b"protocol=https\nhost=h\n\n", &vars)
+            .expect("direct helper answers");
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "username=direct\npassword=s3cret\n"
+        );
+        assert_eq!(
+            run_helper_in(
+                "/nonexistent-helper",
+                &[],
+                b"protocol=https\nhost=h\n\n",
+                &vars
+            ),
+            None,
+            "a missing helper is a refusal, not an answer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
